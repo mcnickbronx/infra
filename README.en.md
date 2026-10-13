@@ -47,6 +47,10 @@ git -C /opt/infra checkout -q v1.7.0          # latest version — CHANGELOG.md
 infra init     # server name, Let's Encrypt email, your SSH keys and IPs — then the server is set up
 ```
 
+A step-by-step guide for beginners (SSH key with a passphrase, the key at your hoster, the hoster's
+console as a fallback, a changing IP, S3 with Object Lock, Telegram, domain, all settings) —
+[`START.md`](START.md), in Russian.
+
 After that, log in as `ssh admin@<IP>`; root SSH login is closed. Put the restic password
 (`restic_password` in `/etc/infra/secrets.yml`) into your password manager right away.
 
