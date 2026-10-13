@@ -2,6 +2,8 @@
 
 [Русский](README.md)
 
+> **First server?** Start with [`START.md`](START.md) — a step-by-step guide from scratch (in Russian).
+
 The engine lives on the server itself (`/opt/infra`) and brings it to the state described in one
 file, `/etc/infra/server.yml`: `sudo infra apply`. A server hosts only projects — sites in Docker
 Compose: each gets its own network, its own database in a shared Postgres and its own members,
