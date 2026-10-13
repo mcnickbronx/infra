@@ -1,7 +1,7 @@
 # Управляется Ansible (роль access). Ссылка доступа: https://access.fixture.test/access/<секрет> —
 # страница на 127.0.0.1:8099 (Traefik в сети хоста). Сертификат — Let's Encrypt (le),
-# как у сайтов. Не чаще 10 запросов в минуту с адреса (login-ratelimit): подбирать секрет бессмысленно,
-# а перебор путей CrowdSec банит
+# как у сайтов. Не чаще 10 запросов в минуту с адреса (login-ratelimit): подбирать секрет бессмысленно.
+# В access-лог Traefik этот адрес не пишется: в пути — секрет
 http:
   routers:
     infra-access:
@@ -9,6 +9,8 @@ http:
       entryPoints: [websecure]
       service: infra-access
       middlewares: [login-ratelimit@file]
+      observability:
+        accessLogs: false
   services:
     infra-access:
       loadBalancer:

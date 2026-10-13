@@ -286,9 +286,11 @@ container_shell() {
 
 # ---------- Движок ----------
 # Версии новее текущей — из git движка (подписи — из их CHANGELOG), что нового — до выбора,
-# дальше infra upgrade: предпросмотр и «Применить?». Обновился — меню перезапускается новым
+# дальше infra upgrade: предпросмотр и «Применить?». Обновился — меню перезапускается новым.
+# Версии без подписи ключом из SIGNERS не предлагаются (infra upgrade их и не поставит) — только
+# называются: их мог выпустить кто угодно с доступом к репозиторию
 upgrade() {
-  local out current base tag title items=()
+  local out current base tag title unsigned="" items=()
   if [ ! -d "$ENGINE/.git" ]; then
     say "Движок поставлен копией, не из git (так бывает на тестовом сервере) — новая версия приезжает копией: tools/rollout.sh."
     return
@@ -301,15 +303,20 @@ upgrade() {
   base=$(git -C "$ENGINE" describe --tags --abbrev=0 2>/dev/null || true)
   for tag in $(git -C "$ENGINE" tag -l 'v*' --sort=-v:refname); do
     [ "$tag" != "$base" ] || break                  # дальше — текущая и старее
+    if ! "$INFRA" tag-signed "$tag"; then
+      unsigned+=" $tag"
+      continue
+    fi
     title=$(git -C "$ENGINE" show "$tag:CHANGELOG.md" 2>/dev/null | sed -n "s/^## $tag — //p" | head -1)
     items+=("$tag" "$tag — ${title:-без описания}")
   done
+  [ -z "$unsigned" ] || unsigned="\n\nБез подписи (не ставятся):$unsigned"
   if [ "${#items[@]}" = 0 ]; then
-    say "Новее нет: сейчас $current."
+    say "Новее нет: сейчас $current.$unsigned"
     return
   fi
   BACK=Назад
-  menu "Сейчас $current. До какой версии обновить (сверху — новая)?" "${items[@]}" || return 0
+  menu "Сейчас $current. До какой версии обновить (сверху — новая)?$unsigned" "${items[@]}" || return 0
   tag=$REPLY
   # CHANGELOG от выбранной версии до текущей: там и что сделать на сервере при обновлении
   git -C "$ENGINE" show "$tag:CHANGELOG.md" |

@@ -84,10 +84,11 @@
 # Имя проекта становится именем базы, пользователя базы и compose-проекта. Эти заняты:
 # postgres — суперпользователь Postgres (роль проекта переписала бы его права);
 # template0/1 — шаблоны Postgres; traefik — compose-проект самого Traefik
-# (docker compose down остановил бы все сайты).
+# (docker compose down остановил бы все сайты); all, sameuser, samerole, replication — слова
+# pg_hba.conf: строка проекта all пускала бы его сеть в любую базу любым пользователем.
 - name: Имена проектов не заняты системой
   vars:
-    reserved: [postgres, template0, template1, traefik]
+    reserved: [postgres, template0, template1, traefik, all, sameuser, samerole, replication]
   ansible.builtin.assert:
     that: projects.keys() | intersect(reserved) | length == 0
     fail_msg: "Имя проекта занято системой: {{ projects.keys() | intersect(reserved) }}. Выберите другое"

@@ -44,7 +44,7 @@ Ubuntu: удалили движок — сервер работает дальш
 **Защита**
 - снаружи открыты только 80 и 443, порты контейнеров по умолчанию — на 127.0.0.1;
 - root в контейнере — не root на хосте (userns-remap), `no-new-privileges` для всех контейнеров;
-- CrowdSec банит атакующих в файрволе по логам SSH и Traefik, запрос к `.env` — бан с первого раза;
+- CrowdSec банит атакующих в файрволе по логам SSH и Traefik; ваши IP и IP участников — никогда;
 - обновления безопасности Ubuntu ставятся каждую ночь сами.
 
 **Бэкапы (restic)**
@@ -71,7 +71,7 @@ Ubuntu: удалили движок — сервер работает дальш
   переживает обрыв SSH;
 - меню в терминале `sudo infra` и `infra status` — сервер одним экраном;
 - обновления — `infra update` раз в неделю (Docker, Postgres, Traefik, пакеты), новая версия
-  движка — `infra upgrade`;
+  движка — `infra upgrade`: только подписанная ключом автора, подменить её на GitHub нельзя;
 - свои правки — рядом с файлами движка (`pg_hba.d`, `conf.d`, Traefik `dynamic/`, свои правила ufw):
   их движок не трогает; удалили движок — сервер работает дальше.
 
@@ -82,7 +82,7 @@ Ubuntu: удалили движок — сервер работает дальш
 ```bash
 ssh root@<IP>
 git clone -q https://github.com/mcnickbronx/infra.git /opt/infra
-git -C /opt/infra checkout -q v1.7.0          # последняя версия — CHANGELOG.md
+git -C /opt/infra checkout -q v1.7.1          # последняя версия — CHANGELOG.md
 /opt/infra/install.sh
 infra init     # имя сервера, email для Let's Encrypt, ваши SSH-ключи и IP — и сервер настроится
 ```
@@ -109,7 +109,7 @@ infra init     # имя сервера, email для Let's Encrypt, ваши SSH
 | `sudo infra edit secrets` | то же для `secrets.yml`: ключи S3, ghcr, Telegram |
 | `sudo infra apply [--check]` | применить настройки; `--check` — только показать изменения |
 | `sudo infra update` | обновления: Docker, Postgres, Traefik, пакеты (новое ядро — перезагрузка) |
-| `sudo infra upgrade <версия>` | новая версия движка (git-тег), затем `apply` |
+| `sudo infra upgrade <версия>` | новая версия движка (git-тег, подписанный ключом из `SIGNERS`), затем `apply` |
 | `sudo project-compose <проект> ps` | `docker compose` проекта из его папки и с его `.env` |
 | `sudo project-deploy <проект> rollback` | вернуть версию до последней автовыкладки |
 | `sudo project-backup <проект>` | снимок проекта сейчас; вернуть — `project-restore` (`ADMIN.md`) |
@@ -177,7 +177,8 @@ projects:
   только через SSH-туннель;
 - **на одном сервере — одна команда.** Docker (`docker_users`) равен root, он только
   у доверенных. Автовыкладка — тоже root (её compose запускается от root), поэтому участники
-  проектов с ней — из `docker_users`. Команды, которые не должны видеть друг друга, — на разных
+  проектов с ней — из `docker_users`. И участник без Docker — root, как только его проект
+  запускаете вы: `compose.yml` и `.env` в `web/` пишет он, а `project-compose` выполняет их от root. Команды, которые не должны видеть друг друга, — на разных
   серверах: доступ к серверу и есть доступ к его настройкам и паролям;
 - root в контейнере — не root на хосте (userns-remap): защита от взломанного контейнера;
 - **файл движка помечен «Управляется Ansible»** — его вернёт следующий `apply`; всё остальное
@@ -224,7 +225,7 @@ Ansible работает на самом сервере (`-c local`): коман
 | `docker` | Docker с userns-remap и `no-new-privileges`, сеть на проект, общий `base.yml` для compose, очистка образов | `/etc/docker/daemon.json`, `/srv/infra/compose/base.yml`, `docker-cleanup.timer` |
 | `postgres` | Postgres из PGDG, база и пользователь на проект, лимиты подключений и времени запроса, журнал медленных запросов | `/etc/postgresql/<версия>/main/`: `conf.d/90-ansible.conf`, `pg_hba.conf` (+ свои строки админа в `pg_hba.d/`) |
 | `traefik` | SSL сам, заголовки безопасности, лимиты запросов с одного IP | `/srv/infra/traefik/` |
-| `crowdsec` | бан атакующих по логам SSH и Traefik прямо в файрволе, на всех портах; запрос к `.env` — бан с первого раза (свой сценарий) | `/etc/crowdsec/acquis.d/traefik.yaml`, белый список ваших IP, `/etc/crowdsec/scenarios/infra-http-env.yaml` |
+| `crowdsec` | бан атакующих по логам SSH и Traefik прямо в файрволе, на всех портах; ваши IP и IP участников не банятся | `/etc/crowdsec/acquis.d/traefik.yaml`, `/etc/crowdsec/parsers/s02-enrich/ansible-admin-whitelist.yaml` |
 | `users` | аккаунты участников, SSH-ключи, группы, команда `go` | `/home/<человек>`, блок `Match Group devs` в `/etc/ssh/sshd_config` |
 | `project` | папки проектов и права, лимиты (systemd slice), `project-compose`, `project-db-env`, автовыкладка | `/srv/projects/<проект>/`, `proj-<проект>.slice`, `project-deploy@<проект>.timer` |
 | `access` | ссылка доступа: SSH текущему IP открывшего на сутки; страница без прав, правило ufw — root, по сроку убирает таймер | `/etc/infra-access/config.json`, `infra-access`, `infra-access-web.service`, `infra-access.path`, `infra-access-expire.timer`, `dynamic/infra-access.yml` Traefik |
@@ -287,6 +288,7 @@ Ansible работает на самом сервере (`-c local`): коман
 infra                                 # команда на сервере: init, edit [secrets], status, apply, update, upgrade, run
 infra-menu                            # меню (sudo infra без параметров): пункты — те же команды
 install.sh                            # установка движка на сервер (как установка панели)
+SIGNERS                               # ключи, которыми подписаны версии: infra upgrade ставит только их
 server.yml.example                    # все настройки сервера с пояснениями
 secrets.yml.example                   # образец secrets.yml: пустые строки ключей, которые вписывает админ
 site.yml                              # настройка сервера (запускает infra apply)
@@ -311,7 +313,14 @@ tests/                                # эталоны шаблонов, исп�
 
 Это работа с самим движком; настройки конкретного сервера правятся на нём (ADMIN.md).
 Порядок: правка → `make check` → `tools/rollout.sh <тестовый сервер>` (или `make test-vds`) →
-коммит, тег версии и строка в CHANGELOG → на рабочих серверах `sudo infra upgrade <версия>`.
+коммит, подписанный тег версии и строка в CHANGELOG → на рабочих серверах `sudo infra upgrade <версия>`.
+
+Тег версии подписывается SSH-ключом из `SIGNERS`: без подписи `infra upgrade` версию не поставит,
+и тот, кто получил бы доступ к репозиторию на GitHub, не выпустит её за вас. Один раз в клоне:
+`git config gpg.format ssh && git config user.signingkey ~/.ssh/id_ed25519.pub`, дальше
+`git tag -s vX.Y.Z -m vX.Y.Z` (ключ — из ssh-agent). Проверка — по `SIGNERS` той версии, что уже
+стоит на сервере, поэтому новый ключ в `SIGNERS` действует со следующей версии. Свой форк — свой ключ
+в `SIGNERS`, и теги подписываете им.
 
 Соглашения в коде:
 
@@ -377,6 +386,8 @@ tests/                                # эталоны шаблонов, исп�
 - `docker_users` запускают контейнеры обычным `docker compose`. **Это root на сервере:**
   все пароли баз, ключи бэкапа. Остальным контейнеры перезапускают они или вы:
   `sudo project-compose <проект> up -d` (это `docker compose` в папке проекта с его `.env`).
+  `compose.yml` и `.env` пишет участник, а `project-compose` выполняет их от root: запуская его
+  проект, вы доверяете ему как `docker_users`. Чужой код — сначала посмотреть `compose.yml`.
 - Плейбук не включит файрвол, если IP, с которого вы подключены, нет в белом списке
   (команда `infra` находит IP вашей SSH-сессии сама, из tmux и screen — всех ваших SSH-сессий;
   не нашла — тоже остановка, с консоли хостера проверки нет). Всё же закрыли себе доступ — консоль
@@ -477,7 +488,8 @@ Ubuntu 26.04 — на всех серверах (поддержка до апр�
 ## Ограничения (осознанные)
 
 - **Внутри сервера люди друг от друга не изолированы.** `docker_users` равны администратору.
-  Участник без Docker с сервера достаёт до контейнеров других проектов (их сети и порты
+  Участник без Docker — тоже, как только его проект запускаете вы (`project-compose`, меню, копия
+  базы в `*_dev`): его `compose.yml` выполняется от root. Он же с сервера достаёт до контейнеров других проектов (их сети и порты
   на `127.0.0.1`) и может подменить подпапку своего проекта ссылкой на `web/` другого —
   контейнер смонтирует её при следующем старте. Чужих подрядчиков и другие команды —
   на отдельные серверы.

@@ -11,7 +11,8 @@
 #      Том со своим name: — бэкап громко не удаётся.
 #   3. Проект в Docker: сеть, доступ к базе из .env, вход в свою базу и отказ в чужую, лимиты;
 #      приложение (uid 1000) пишет в папку, которую участник создал, как автовыкладка;
-#      health-check замечает compose без extends и том со своим name:, уведомление (--notify) —
+#      health-check замечает compose без extends, том со своим name:, web/ в контейнере на запись
+#      и SSH мимо белого списка (правило ufw без пометки), уведомление (--notify) —
 #      только о новом и прошедшем (прошедшее — спустя 30 минут), сводка (--summary), при недоступном
 #      Telegram — повтор через час; уведомления — в файл (INFRA_NOTIFY_DRY).
 #   4. Автовыкладка (project-deploy) с локальным реестром: выкладка, отказ подготовки
@@ -28,8 +29,8 @@
 #      в :05 снимаются оба, в :17 — только crm; свежий снимок сразу в S3 (папка на диске вместо
 #      бакета), сбой копии — ошибка; снимок только базы по номеру восстанавливает только базу, без
 #      номера выбирается последний полный снимок; пропуск, пока идёт ночной бэкап; сбой виден
-#      в health-check и infra status. Запрос к .env — бан CrowdSec
-#      с первого раза, к .envrc — нет.
+#      в health-check и infra status. CrowdSec: перебор файлов вроде .env — бан общим сценарием,
+#      один запрос к .env — нет (его можно вызвать с чужого браузера картинкой).
 #   8. Ссылка доступа: просмотр страницы ничего не открывает, кнопка открывает SSH IP посетителя
 #      (повторно — продлевает), уведомление и infra status; IP из белого списка и частный — нет;
 #      срок вышел — закрыто; close all.
@@ -300,7 +301,7 @@
         fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
         quiet: true
 
-    - name: "3. Сервис без extends и с томом со своим name:"
+    - name: "3. Сервис без extends, с томом со своим name: и с web/ на запись"
       ansible.builtin.copy:
         dest: "{{ web }}/verify-bad.yml"
         mode: "0664"
@@ -310,7 +311,7 @@
             bad:
               image: {{ image }}
               command: sleep infinity
-              volumes: [data:/data]
+              volumes: [data:/data, ./:/web]
           volumes:
             data:
               name: verify-foreign
@@ -319,9 +320,11 @@
               name: proj-shop
               external: true
 
+    # Заодно SSH мимо белого списка: правило ufw без пометки (адрес TEST-NET-2 — в интернете его нет)
     - name: "3. Запуск и health-check"
       ansible.builtin.shell: |
         docker compose -f verify-bad.yml up -d --quiet-pull --wait >/dev/null 2>&1 || exit 1
+        ufw allow from 198.51.100.5 to any port 22 proto tcp >/dev/null || exit 1
         /usr/local/bin/health-check.sh
         # Уведомления — в файл, состояние — своё: настоящие уведомления и их состояние не трогаем
         rm -rf /tmp/verify-health && mkdir -m 700 /tmp/verify-health
@@ -334,11 +337,13 @@
       register: bad_health
       changed_when: true
 
-    - name: "3. health-check заметил оба нарушения"
+    - name: "3. health-check заметил все нарушения"
       ansible.builtin.assert:
         that:
           - "'вне лимитов проекта' in bad_health.stdout and 'shop-bad-1' in bad_health.stdout"
           - "'verify-foreign' in bad_health.stdout"
+          - "'смонтирована в контейнер на запись: shop-bad-1' in bad_health.stdout"
+          - "'SSH открыт мимо белого списка, правила ufw: from 198.51.100.5 to any port 22 proto tcp.' in bad_health.stdout"
         fail_msg: "{{ bad_health.stdout }}"
         quiet: true
 
@@ -346,6 +351,7 @@
       ansible.builtin.shell: |
         set -e
         docker compose -f verify-bad.yml down -v >/dev/null 2>&1
+        ufw delete allow from 198.51.100.5 to any port 22 proto tcp >/dev/null
         project-compose shop down >/dev/null 2>&1
         rm -rf compose.yml verify-bad.yml files .env
       args:
@@ -707,7 +713,7 @@
         fail_msg: "{{ r | to_json(ensure_ascii=false) }} — экран меню в /tmp/verify-menu.log"
         quiet: true
 
-    # ================= 7. Частые снимки и бан за .env =================
+    # ================= 7. Частые снимки и баны CrowdSec за перебор файлов =================
     # На тестовом сервере в server.yml: shop — backup_hourly: all (каждые 60 минут),
     # crm — backup_hourly: db, backup_every: 5
     - name: "7. Частые снимки: минута проекта, сразу в S3; пропуск, пока идёт ночной; сбой виден"
@@ -799,34 +805,36 @@
         fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
         quiet: true
 
-    # Строка в access-лог Traefik от имени чужого адреса (TEST-NET-2: в интернете его нет) —
-    # CrowdSec читает лог и банит с первого запроса к .env; к /.envrc — нет
-    - name: "7. Запрос к .env — бан с первого раза, к .envrc — нет"
+    # Строки в access-лог Traefik от имени чужих адресов (TEST-NET-2: в интернете их нет) — CrowdSec
+    # читает лог: перебор .env-файлов — бан общим сценарием http-sensitive-files, один запрос — нет
+    - name: "7. Перебор .env-файлов — бан, один запрос к .env — нет"
       ansible.builtin.shell: |
         set -uo pipefail
         log=/srv/infra/traefik/logs/access.log
         line() { echo "$1 - - [$(LC_ALL=C date -u '+%d/%b/%Y:%H:%M:%S +0000')] \"GET $2 HTTP/1.1\" 404 19 \"-\" \"verify\" 1 \"-\" \"-\" 0ms"; }
-        line 198.51.100.77 '/api/.env.production?x=1' >> "$log"
-        line 198.51.100.78 '/.envrc' >> "$log"
-        for i in $(seq 1 30); do cscli decisions list -i 198.51.100.77 -o raw | grep -q infra/http-env-file && break; sleep 1; done
-        echo "env=$(cscli decisions list -i 198.51.100.77 -o raw | grep -c infra/http-env-file)"
-        echo "envrc=$(cscli decisions list -i 198.51.100.78 -o raw | grep -c infra/http-env-file)"
-        cscli decisions delete -i 198.51.100.77 >/dev/null 2>&1
-        cscli alerts delete -i 198.51.100.77 >/dev/null 2>&1
-        cscli alerts delete -i 198.51.100.78 >/dev/null 2>&1
-        echo "left=$(cscli decisions list -i 198.51.100.77 -o raw | grep -c ban)"
+        for f in .env .env.local .env.prod .env.dev .env.save .env.backup; do line 198.51.100.77 "/$f" >> "$log"; done
+        line 198.51.100.78 '/.env' >> "$log"
+        bans() { cscli decisions list -i "$1" -o raw | grep -c ban; }
+        for i in $(seq 1 30); do [ "$(bans 198.51.100.77)" -gt 0 ] && break; sleep 1; done
+        echo "scan=$(cscli decisions list -i 198.51.100.77 -o raw | grep -c crowdsecurity/http-sensitive-files)"
+        echo "single=$(bans 198.51.100.78)"
+        for ip in 198.51.100.77 198.51.100.78; do
+          cscli decisions delete -i "$ip" >/dev/null 2>&1
+          cscli alerts delete -i "$ip" >/dev/null 2>&1
+        done
+        echo "left=$(bans 198.51.100.77)"
       args:
         executable: /bin/bash
       register: envban
       changed_when: true
 
-    - name: "7. Бан за .env работает и убран"
+    - name: "7. Перебор файлов банится, один запрос — нет, бан убран"
       vars:
         r: "{{ dict(envban.stdout_lines | map('split', '=', 1)) }}"
       ansible.builtin.assert:
         that:
-          - r.env == '1'
-          - r.envrc == '0'
+          - r.scan == '1'
+          - r.single == '0'
           - r.left == '0'
         fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
         quiet: true

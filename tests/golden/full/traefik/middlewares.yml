@@ -43,6 +43,9 @@ http:
         average: 10
         period: 1m
         burst: 5
+        sourceCriterion:
+          ipStrategy:
+            ipv6Subnet: 64
 
     # Служебные панели (Flower, админки): только с admin_ips.
     # В labels сервиса: traefik.http.routers.<имя>.middlewares=admin-only@file

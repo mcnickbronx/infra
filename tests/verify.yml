@@ -108,10 +108,25 @@
       register: cs_scenarios
       changed_when: false
 
-    - name: "CrowdSec знает свой сценарий: запрос к .env — бан"
+    - name: "CrowdSec: сканеры файлов ловит общий сценарий, прежнего своего (.env с первого раза) нет"
       ansible.builtin.assert:
-        that: "'infra/http-env-file' in cs_scenarios.stdout"
-        fail_msg: "Нет сценария infra/http-env-file (/etc/crowdsec/scenarios/infra-http-env.yaml): sudo journalctl -u crowdsec -n 30"
+        that:
+          - "'crowdsecurity/http-sensitive-files' in cs_scenarios.stdout"
+          - "'infra/http-env-file' not in cs_scenarios.stdout"
+        fail_msg: "{{ cs_scenarios.stdout_lines | select('search', 'sensitive|env') | list }}"
+        quiet: true
+
+    - name: Белый список CrowdSec
+      ansible.builtin.slurp:
+        src: /etc/crowdsec/parsers/s02-enrich/ansible-admin-whitelist.yaml
+      register: cs_whitelist
+
+    - name: В белом списке CrowdSec — все IP белого списка SSH (администратор и участники)
+      vars:
+        listed: "{{ (cs_whitelist.content | b64decode | from_yaml).whitelist }}"
+      ansible.builtin.assert:
+        that: ssh_allowed_ips | difference(listed.ip | default([], true) + listed.cidr | default([], true)) | length == 0
+        fail_msg: "нет в белом списке CrowdSec: {{ ssh_allowed_ips | difference(listed.ip | default([], true) + listed.cidr | default([], true)) }}"
         quiet: true
 
     # Только GET: страница показывает форму и ничего не открывает
@@ -122,6 +137,21 @@
         echo "wrong=$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Real-Ip: 1.1.1.1' $url/wrong-token)"
         echo "right=$(curl -s -H 'X-Real-Ip: 1.1.1.1' $url/$TOKEN | grep -c 'Ваш IP: <code>1.1.1.1</code>')"
         echo "route=$(grep -c 'Host(`{{ access_host }}`)' {{ traefik_dir }}/dynamic/infra-access.yml)"
+        # Через Traefik: чужой секрет — тот же ответ, что на несуществующий адрес (код, Server,
+        # Content-Type, текст); адреса с секретом в access-логе нет
+        host={{ access_host }} log={{ traefik_dir }}/logs/access.log tmp=$(mktemp)
+        fp() {
+          curl -sk -o "$tmp" -D "$tmp.h" --resolve "$host:443:127.0.0.1" "https://$host$1"
+          printf '%s|%s|%s|%s' "$(head -1 "$tmp.h" | awk '{print $2}')" "$(grep -ci '^server:' "$tmp.h")" \
+            "$(grep -i '^content-type:' "$tmp.h" | tr -d '\r' | cut -d' ' -f2-)" "$(cat "$tmp")"
+        }
+        before=$(grep -c '/access/' "$log")
+        echo "wrong_via=$(fp /access/wrong-token)"
+        echo "other_via=$(fp /verify-no-such-page)"
+        fp "/access/$TOKEN" >/dev/null
+        sleep 2
+        echo "logged=$(( $(grep -c '/access/' "$log") - before ))"
+        rm -f "$tmp" "$tmp.h"
       args:
         executable: /bin/bash
       environment:
@@ -131,12 +161,15 @@
       no_log: true
       when: access_link
 
-    - name: "Страница ссылки: чужой секрет — 404, верный — форма с IP посетителя; маршрут Traefik на месте"
+    - name: "Страница ссылки: чужой секрет — 404 как у Traefik, верный — форма с IP посетителя; маршрут на месте, в лог не пишется"
       vars:
         r: "{{ dict(access_page.stdout_lines | map('split', '=', 1)) }}"
       ansible.builtin.assert:
-        that: r.wrong == '404' and r.right == '1' and r.route == '1'
-        fail_msg: "{{ r | to_json }}"
+        that:
+          - r.wrong == '404' and r.right == '1' and r.route == '1'
+          - r.wrong_via == r.other_via and r.wrong_via is match('404[|]0[|]')
+          - r.logged == '0'
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
         quiet: true
       when: access_link
 

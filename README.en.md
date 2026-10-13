@@ -26,7 +26,7 @@ and YAML instead of buttons.
 - **People and access:** Linux accounts per person, SSH/SFTP only into their projects' folders; SSH by
   key from an IP allowlist; an access link opens SSH for your current IP for 24 hours.
 - **Security:** only 80/443 open, container ports bound to 127.0.0.1 by default, userns-remap,
-  CrowdSec bans in the firewall, nightly Ubuntu security updates.
+  CrowdSec bans in the firewall (never your IPs or your members'), nightly Ubuntu security updates.
 - **Backups (restic):** nightly per-project snapshots (files, volumes, DB dump) plus `/etc`; frequent
   snapshots every 1–60 minutes straight to S3; three levels — server, your computer, S3 with Object Lock.
 - **Deploys:** push → CI builds an image in ghcr.io → the server picks it up within 15 seconds, runs
@@ -34,8 +34,9 @@ and YAML instead of buttons.
 - **Monitoring:** a health check every 10 minutes, Telegram alerts only for new and resolved problems,
   a morning summary, an audit log in `/var/log/infra.log`.
 - **Management:** one `server.yml` per server, generated passwords, `infra edit` with a diff and
-  «Apply?», a terminal menu, weekly `infra update`, `infra upgrade` to a new engine version; your own
-  files next to the engine's are left alone.
+  «Apply?», a terminal menu, weekly `infra update`, `infra upgrade` to a new engine version (only
+  versions signed by the author's key — a tag forged on GitHub is refused); your own files next to
+  the engine's are left alone.
 
 ## Quick start
 
@@ -44,7 +45,7 @@ A fresh VDS with Ubuntu 26.04 (24.04 works too, see Limitations), root login by 
 ```bash
 ssh root@<IP>
 git clone -q https://github.com/mcnickbronx/infra.git /opt/infra
-git -C /opt/infra checkout -q v1.7.0          # latest version — CHANGELOG.md
+git -C /opt/infra checkout -q v1.7.1          # latest version — CHANGELOG.md
 /opt/infra/install.sh
 infra init     # server name, Let's Encrypt email, your SSH keys and IPs — then the server is set up
 ```
@@ -69,7 +70,7 @@ above its output; you can type the same by hand.
 | `sudo infra edit [secrets]` | edit `server.yml` (or `secrets.yml`): validate, show the diff, ask «Apply?» |
 | `sudo infra apply [--check]` | apply the settings; `--check` only shows the changes |
 | `sudo infra update` | updates: Docker, Postgres, Traefik, packages (a new kernel means a reboot) |
-| `sudo infra upgrade <version>` | another engine version (git tag), then `apply` |
+| `sudo infra upgrade <version>` | another engine version (a git tag signed by a key in `SIGNERS`), then `apply` |
 | `sudo project-compose <project> ps` | `docker compose` of a project, from its folder with its `.env` |
 | `sudo project-deploy <project> rollback` | roll back the last autodeploy |
 | `sudo project-backup <project>` | a project snapshot now; restore — `project-restore` |
@@ -80,7 +81,8 @@ above its output; you can type the same by hand.
 - Ubuntu 26.04 LTS. 24.04 works too (our test server runs it) but is not recommended: production
   servers and release checks are on 26.04. For 24.04 add `ubuntu_version: "24.04"` to `server.yml`.
 - A fixed stack: Docker Compose, Traefik, shared Postgres (PGDG), restic, CrowdSec; autodeploy pulls from ghcr.io.
-- One team per server: `docker_users` are effectively root. Different teams — different servers.
+- One team per server: `docker_users` are effectively root, and so is any project member once you start
+  their project (`project-compose` runs the `compose.yml` they wrote as root). Different teams — different servers.
 - **Everything is in Russian:** docs, messages, task names. This page is the only English one.
 
 ## Status

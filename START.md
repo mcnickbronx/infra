@@ -94,7 +94,7 @@ SSH открыт только с ваших IP — остальной интер
 
 ```bash
 git clone -q https://github.com/mcnickbronx/infra.git /opt/infra
-git -C /opt/infra checkout -q v1.7.0          # последняя версия — CHANGELOG.md
+git -C /opt/infra checkout -q v1.7.1          # последняя версия — CHANGELOG.md
 /opt/infra/install.sh
 infra init
 ```

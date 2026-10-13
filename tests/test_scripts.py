@@ -1,9 +1,14 @@
 """Проверки Python-кода репозитория без сервера: python3 -m unittest discover -s tests
-(запускает tools/check.sh). Нужен только стандартный Python."""
+(запускает tools/check.sh). Нужен только стандартный Python; для проверки подписи — git и ssh-keygen."""
 import importlib.machinery
 import importlib.util
+import os
 import pathlib
+import shutil
+import subprocess
+import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -118,6 +123,94 @@ ufw allow from 9.9.9.9 to any port 22 proto tcp comment 'infra-access manual'
         self.assertEqual(acc.expired(rules, 1759999999), [])
         self.assertEqual(acc.expired(rules, 1760000000), ["1.1.1.1"])
         self.assertEqual(acc.expired(rules, 1760100000), ["1.0.0.1", "1.1.1.1"])
+
+    def test_queue_not_followed_by_root(self):
+        # папки очереди и ответов пишет страница (не root): ссылки и FIFO root не читает и не пишет
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        target = d / "target"
+        target.write_text("чужой файл\n")
+        (d / "ok").write_text("1.1.1.1\n")
+        (d / "link").symlink_to(target)
+        os.mkfifo(d / "fifo")
+        self.assertEqual(acc.read_request(str(d / "ok")), "1.1.1.1\n")
+        with self.assertRaises(OSError):
+            acc.read_request(str(d / "link"))
+        self.assertEqual(acc.read_request(str(d / "fifo")), "")
+        with mock.patch.object(acc, "DONE", str(d)):
+            (d / ("a" * 16)).symlink_to(target)
+            acc.write_answer("a" * 16, "x")
+            acc.write_answer("b" * 16, "готово")
+        self.assertEqual(target.read_text(), "чужой файл\n")
+        self.assertEqual((d / ("b" * 16)).read_text(), "готово\n")
+
+
+@unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
+class SignedUpgrade(unittest.TestCase):
+    """infra tag-signed: infra upgrade ставит только тег, подписанный ключом из SIGNERS текущей версии."""
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.repo = self.dir / "engine"
+        self.repo.mkdir()
+        self.keys = {}
+        for who in ("author", "stranger"):
+            key = self.dir / who
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", who, "-f", key], check=True)
+            self.keys[who] = key
+        self.git("init", "-q")
+        shutil.copy(ROOT / "infra", self.repo / "infra")
+        self.signers("author")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "v1")
+
+    def git(self, *args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "gpg.format=ssh",
+                        *args], cwd=self.repo, check=True, capture_output=True)
+
+    def signers(self, who):
+        public = pathlib.Path(f"{self.keys[who]}.pub").read_text().split()
+        (self.repo / "SIGNERS").write_text(f'# ключи\n{who} namespaces="git" {public[0]} {public[1]}\n')
+
+    def tag(self, name, who=None):
+        if who:
+            self.git("-c", f"user.signingkey={self.keys[who]}", "tag", "-s", name, "-m", name)
+        else:
+            self.git("tag", "-a", name, "-m", name)
+
+    def signed(self, name):
+        return subprocess.run(["bash", str(self.repo / "infra"), "tag-signed", name],
+                              capture_output=True).returncode == 0
+
+    def test_only_author_signature(self):
+        self.tag("v1.0.1", "author")
+        self.tag("v1.0.2", "stranger")
+        self.tag("v1.0.3")
+        self.git("tag", "v1.0.4")                       # лёгкий тег — без подписи
+        self.assertTrue(self.signed("v1.0.1"))
+        self.assertFalse(self.signed("v1.0.2"))
+        self.assertFalse(self.signed("v1.0.3"))
+        self.assertFalse(self.signed("v1.0.4"))
+        self.assertFalse(self.signed("v9.9.9"))         # такой версии нет
+        # подписанная старая версия под новым номером: имя внутри тега другое
+        obj = subprocess.run(["git", "rev-parse", "refs/tags/v1.0.1"], cwd=self.repo, check=True,
+                             capture_output=True, text=True).stdout.strip()
+        self.git("update-ref", "refs/tags/v3.0.0", obj)
+        self.assertFalse(self.signed("v3.0.0"))
+        self.assertFalse(self.signed("v1.0.*"))         # шаблон, а не имя
+
+    def test_new_version_does_not_vouch_for_itself(self):
+        # чужая версия со своим ключом в SIGNERS — проверяется по SIGNERS той, что стоит
+        self.git("checkout", "-q", "-b", "evil")
+        self.signers("stranger")
+        self.git("commit", "-q", "-am", "evil")
+        self.tag("v2.0.0", "stranger")
+        self.git("checkout", "-q", "-")
+        self.assertFalse(self.signed("v2.0.0"))
+        # и правка SIGNERS в рабочей папке без коммита не помогает
+        self.signers("stranger")
+        self.assertFalse(self.signed("v2.0.0"))
 
 
 if __name__ == "__main__":

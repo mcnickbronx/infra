@@ -1,11 +1,20 @@
-# Управляется Ansible. IP администратора (admin_ips) не банятся,
-# даже если вы несколько раз ошиблись с ключом или паролем.
+# Управляется Ansible. IP администратора (admin_ips) и участников проектов этого сервера
+# (ips в people) — те же, что в белом списке SSH, — не банятся: ни за ошибки с ключом, ни за
+# запросы, которые CrowdSec счёл бы сканированием сайта
 name: ansible/admin-whitelist
-description: "Admin IPs from Ansible"
+description: "Admin and people IPs from Ansible"
 whitelist:
-  reason: "admin_ips"
+  reason: "admin_ips and people ips"
   ip:
     - "192.0.2.10"
     - "2001:db8::10"
+    - "192.0.2.21"
+    - "198.51.100.30"
+    - "203.0.113.99"
+    - "203.0.113.40"
+    - "2001:db8::77"
+    - "203.0.113.50"
   cidr:
     - "198.51.100.0/29"
+    - "198.51.100.70/29"
+    - "2001:db8:40::/64"

@@ -58,12 +58,16 @@ running_image() {
 }
 
 # Проект — на версию $1: образ — под именем из .env, его compose.yml — в папку проекта
-# (прежний — в compose.yml.prev, его возвращает restore)
+# (прежний — в compose.yml.prev, его возвращает restore). web/ открыта участникам на запись: файлы
+# там root не открывает на запись по имени — подложенная ссылка направила бы запись в чужой файл.
+# Прежний — жёсткой ссылкой (ln не идёт по ссылкам), новый — с noclobber (O_EXCL: файл или ссылка
+# с этим именем уже есть — отказ, а не запись по ней)
 switch_to() {
-  cp -p compose.yml compose.yml.prev 2>/dev/null || true
+  rm -f compose.yml.prev compose.yml.new
+  [ ! -f compose.yml ] || ln -P compose.yml compose.yml.prev 2>/dev/null || true
   docker pull -q "$1" >/dev/null && docker tag "$1" "$IMAGE" &&
-    docker run --rm --entrypoint cat "$IMAGE" /deploy/compose.yml > compose.yml.new &&
-    mv compose.yml.new compose.yml
+    (set -C; docker run --rm --entrypoint cat "$IMAGE" /deploy/compose.yml > compose.yml.new) &&
+    mv -fT compose.yml.new compose.yml
 }
 
 # Вернуть, как было до switch_to: прежний compose.yml и образ $1 (версия или Id) — и запустить.

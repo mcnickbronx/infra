@@ -1,0 +1,5 @@
+# Ключи, которыми подписаны версии движка (git-теги vX.Y.Z). sudo infra upgrade ставит только
+# версию, подписанную одним из них, и берёт этот файл из версии, которая уже стоит, а не из новой:
+# новая версия не может поручиться сама за себя. Формат — allowed_signers из man ssh-keygen.
+# Свой форк: замените ключ своим и подписывайте теги им (ADMIN.md, «Обновление движка»).
+mcnickbronx namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOb86LGjCvgJDVY3Z1Kt6C+SPv+lLZJEPJ+Oxx3Z9HqF

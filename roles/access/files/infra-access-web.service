@@ -15,6 +15,23 @@ PrivateDevices=yes
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Страницу видно из интернета: взломай её кто-то — дальше 127.0.0.1 и обычных системных вызовов
+# он не уйдёт
+IPAddressAllow=localhost
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+UMask=0077
+TasksMax=128
 MemoryMax=64M
 Restart=on-failure
 

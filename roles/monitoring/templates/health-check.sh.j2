@@ -103,6 +103,20 @@ check_failed_units() {
   fi
 }
 
+# SSH открыт мимо белого списка: разрешение в ufw на порт 22 (или на все порты) без пометки белого
+# списка (ansible-wl) или ссылки доступа (infra-access) — например, ufw allow OpenSSH из образа
+# хостера. Движок такие правила не трогает (удаляет только свои), а белый список с ними ничего не закрывает
+check_ssh_open() {
+  local rules
+  rules=$(ufw show added 2>/dev/null | sed -n 's/^ufw allow //p' | grep -vE "comment '(ansible-wl|infra-access)" |
+    sed -E "s/ comment '.*//" |
+    grep -E "^(22|22/tcp|OpenSSH|ssh)$|(^| )port ([0-9,]*,)?22(,|$| )|^((in|on [^ ]+|from [^ ]+|to [^ ]+|proto [^ ]+) ?)*$" |
+    paste -sd ';' - | sed 's/;/; /g')
+  if [ -n "$rules" ]; then
+    problem "SSH открыт мимо белого списка, правила ufw: $rules. Убрать: sudo ufw delete allow <правило> (свои адреса — admin_ips и ips людей в server.yml)"
+  fi
+}
+
 # ---------- Контейнеры ----------
 
 check_restarting() {
@@ -165,6 +179,19 @@ check_compose_projects() {
   fi
   if [ -n "$no_limits" ]; then
     problem "Контейнеры вне лимитов проекта (нет extends из base.yml): ${no_limits%, }"
+  fi
+}
+
+# Папка проекта web/ целиком смонтирована в контейнер на запись: взломанное приложение подменит
+# compose.yml и .env, а их запускает root (project-compose, автовыкладка). Монтировать на запись —
+# подпапки (media, private), саму web/ — только на чтение (TEAM.md, «Кто запускает контейнеры»)
+check_web_mounts() {
+  local rw
+  rw=$(docker ps -q 2>/dev/null | xargs -r docker inspect --format \
+    '{{.Name}}{{range .Mounts}}{{if and (eq .Type "bind") .RW}} {{.Source}}{{end}}{{end}}' 2>/dev/null |
+    awk '{ for (i = 2; i <= NF; i++) if ($i ~ /^\/srv\/projects\/[^\/]+\/web\/?$/) { printf "%s, ", substr($1, 2); break } }')
+  if [ -n "$rw" ]; then
+    problem "Папка проекта web/ смонтирована в контейнер на запись: ${rw%, }. Взломанное приложение подменит compose.yml и .env — их запускает root. На запись — только подпапки (media), web/ — :ro"
   fi
 }
 
@@ -358,10 +385,12 @@ check_cpu
 check_free_memory
 check_memory
 check_failed_units
+check_ssh_open
 check_restarting
 check_crashed
 check_open_ports
 check_compose_projects
+check_web_mounts
 check_project_volumes
 check_orphan_volumes
 check_certificates

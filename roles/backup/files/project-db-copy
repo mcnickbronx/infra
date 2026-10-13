@@ -97,13 +97,20 @@ runuser -u postgres -- pg_restore --exit-on-error --no-owner --no-acl --role="$T
 
 if [ -n "$FILES" ]; then
   # Без прав и владельцев источника: права — из ACL по умолчанию папки «куда» (их видят его
-  # контейнеры), группа — его участников; папки — с наследованием группы, как их создаёт автовыкладка
+  # контейнеры), группа — его участников; папки — с наследованием группы, как их создаёт автовыкладка.
+  # web/ открыта участникам на запись: media или private там может оказаться ссылкой на чужую папку —
+  # root не пошёл бы по ней ни читать, ни стирать (--delete). Поэтому ссылки — пропуск, а rsync
+  # получает саму папку (без / на конце): даже подменённую в последний момент он копирует как ссылку
   for d in media private; do
     src=/srv/projects/$FROM/web/$d dst=/srv/projects/$TO/web/$d
+    if [ -L "$src" ] || [ -L "$dst" ]; then
+      echo "файлы: $d/ — пропуск: это ссылка, а не папка ($src или $dst)" >&2
+      continue
+    fi
     [ -d "$src" ] || continue
     echo "файлы: $d/"
     [ -d "$dst" ] || install -d -m 2770 -g "$TO-dev" "$dst"
-    rsync -rlt --delete --no-perms --no-owner --no-group "$src/" "$dst/"
+    rsync -rlt --delete --no-perms --no-owner --no-group "$src" "/srv/projects/$TO/web/"
     chgrp -R "$TO-dev" "$dst"
     find "$dst" -type d -exec chmod g+rwxs {} +
   done

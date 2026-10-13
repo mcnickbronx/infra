@@ -8,7 +8,7 @@
 #   sudo infra apply [--check] [-y] [...]   показать, что изменится, и после подтверждения применить
 #                                          (--check — только показать, -y — применить без вопроса)
 #   sudo infra update [--check] [-y]        обновления: Docker, Postgres, Traefik, пакеты, перезагрузка
-#   sudo infra upgrade <версия> [...]       движок другой версии (git-тег), затем apply
+#   sudo infra upgrade <версия> [...]       движок другой версии (git-тег с подписью из SIGNERS), затем apply
 #   sudo infra run <плейбук> [...]          плейбук движка как есть — для проверок (tests/verify.yml)
 # Остальные параметры уходят ansible-playbook: --tags base,users, -e skip_lockout_check=true.
 # Движок — папка этого скрипта (/opt/infra), его Ansible — .venv в ней; настройки и пароли —
@@ -337,7 +337,21 @@ cmd_run() {
   return "$rc"
 }
 
-# Ручные правки кода прямо в /opt/infra не пропадают молча: с ними upgrade отказывает
+# Версия подписана ключом из SIGNERS той версии, что стоит сейчас: новая сама за себя не ручается.
+# Без этого новую версию мог бы выпустить любой, кто получил доступ к репозиторию на GitHub, —
+# а её install.sh и плейбук работают от root. Имя внутри подписанного тега — то же: старую версию
+# под новым номером не выдать. Код 0 — подписана
+tag_signed() {
+  local signers
+  [ "$(git -C "$ENGINE" for-each-ref --format='%(tag)' "refs/tags/$1" 2>/dev/null)" = "$1" ] || return 1
+  signers=$(mktemp)
+  CLEANUP+=("$signers")
+  git -C "$ENGINE" show HEAD:SIGNERS > "$signers" 2>/dev/null || return 1
+  git -C "$ENGINE" -c gpg.ssh.allowedSignersFile="$signers" verify-tag "refs/tags/$1" >/dev/null 2>&1
+}
+
+# Ручные правки кода прямо в /opt/infra не пропадают молча: с ними upgrade отказывает.
+# Тег, который на GitHub подменили, git не скачает (fetch откажет: «would clobber existing tag»)
 cmd_upgrade() {
   local version=${1:?Использование: infra upgrade <версия> [параметры apply...]}
   shift
@@ -348,7 +362,12 @@ cmd_upgrade() {
   local before
   before=$(git -C "$ENGINE" describe --tags --always)
   git -C "$ENGINE" fetch --quiet --tags origin
-  git -C "$ENGINE" -c advice.detachedHead=false checkout --quiet "$version"
+  git -C "$ENGINE" rev-parse -q --verify "refs/tags/$version" >/dev/null ||
+    die "нет версии $version (версии — git-теги vX.Y.Z: git -C $ENGINE tag)"
+  tag_signed "$version" || die "версия $version не подписана ключом из $ENGINE/SIGNERS — не ставлю:
+  её мог выпустить кто угодно с доступом к репозиторию на GitHub. Своя сборка без подписи или
+  старая версия (до v1.7.1) — вручную, ADMIN.md, «Обновления»"
+  git -C "$ENGINE" -c advice.detachedHead=false checkout --quiet "refs/tags/$version"
   "$ENGINE/install.sh"            # Ansible и коллекции — тех версий, что в новом движке
   log "upgrade: движок $before → $(git -C "$ENGINE" describe --tags --always)"
   echo "== Движок: $(git -C "$ENGINE" describe --tags --always)"
@@ -651,6 +670,7 @@ case $command in
   menu) check_setup "$command"; INFRA_WHO=$WHO exec "$ENGINE/infra-menu" ;;
   edit|status|apply|update|upgrade|run) check_setup "$command"; "cmd_$command" "$@" ;;
   run-unit) check_setup "$command"; run_unit "$@" ;;      # служебная: её запускает служба infra-apply
+  tag-signed) tag_signed "${1:?}" ;;                      # служебная: меню показывает только подписанные версии
   -h|--help|help) usage 0 ;;
   *) echo "infra: неизвестная команда «$command»" >&2; usage 1 ;;
 esac

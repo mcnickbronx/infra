@@ -60,14 +60,16 @@
     mode: "0644"
   notify: Restart crowdsec
 
-- name: "Свой сценарий: запрос к .env — бан с первого раза"
-  ansible.builtin.copy:
-    src: infra-http-env.yaml
-    dest: /etc/crowdsec/scenarios/infra-http-env.yaml
-    mode: "0644"
+# Был до v1.7.1: бан с первого запроса к .env. Убран — один запрос можно вызвать с чужого браузера
+# (<img src=".../.env"> на любой странице), и тот получал бан на все сайты сервера. Сканеры .env
+# ловит общий crowdsecurity/http-sensitive-files (DECISIONS.md, «CrowdSec»)
+- name: Прежнего своего сценария .env нет
+  ansible.builtin.file:
+    path: /etc/crowdsec/scenarios/infra-http-env.yaml
+    state: absent
   notify: Restart crowdsec
 
-- name: Ваши IP никогда не банятся
+- name: Ваши IP и IP участников никогда не банятся
   ansible.builtin.template:
     src: whitelist-admins.yaml.j2
     dest: /etc/crowdsec/parsers/s02-enrich/ansible-admin-whitelist.yaml

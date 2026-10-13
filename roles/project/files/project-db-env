@@ -18,10 +18,19 @@ die() { echo "project-db-env: $*" >&2; exit 1; }
 PASSWORD=$(sed -nE "s/^db_password_$NAME:[[:space:]]*\"?([^\"]*)\"?[[:space:]]*$/\1/p" /etc/infra/secrets.yml)
 [ -n "$PASSWORD" ] || die "у проекта $NAME нет базы: нет db_password_$NAME в /etc/infra/secrets.yml"
 HOST=$(docker network inspect "proj-$NAME" -f '{{(index .IPAM.Config 0).Gateway}}')
+[ -L "$ENV_FILE" ] && die "$ENV_FILE — ссылка, а не файл: root не пишет пароль по ссылке"
 [ -f "$ENV_FILE" ] || die "нет $ENV_FILE — сначала .env проекта"
 
-# sed -i и >> от root сохраняют владельца и права файла
-sed -i -E "/^${PREFIX}DB_(HOST|PORT|NAME|USER|PASSWORD)=/d" "$ENV_FILE"
-printf '%sDB_HOST=%s\n%sDB_PORT=5432\n%sDB_NAME=%s\n%sDB_USER=%s\n%sDB_PASSWORD=%s\n' \
-  "$PREFIX" "$HOST" "$PREFIX" "$PREFIX" "$NAME" "$PREFIX" "$NAME" "$PREFIX" "$PASSWORD" >>"$ENV_FILE"
+# Новый .env — рядом, затем на место одним mv: web/ открыта участникам на запись, и файл,
+# дописываемый root по имени, могли бы между делом подменить ссылкой. Владелец и права — прежние
+TMP=$(mktemp "$ENV_FILE.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+{
+  grep -vE "^${PREFIX}DB_(HOST|PORT|NAME|USER|PASSWORD)=" "$ENV_FILE" || true
+  printf '%sDB_HOST=%s\n%sDB_PORT=5432\n%sDB_NAME=%s\n%sDB_USER=%s\n%sDB_PASSWORD=%s\n' \
+    "$PREFIX" "$HOST" "$PREFIX" "$PREFIX" "$NAME" "$PREFIX" "$NAME" "$PREFIX" "$PASSWORD"
+} > "$TMP"
+chown --reference="$ENV_FILE" "$TMP"
+chmod --reference="$ENV_FILE" "$TMP"
+mv -fT "$TMP" "$ENV_FILE"
 echo "${PREFIX}DB_* в $ENV_FILE обновлены. Контейнеры увидят их после: sudo project-compose $NAME up -d --force-recreate"
