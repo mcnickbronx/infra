@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Управляется Ansible (роль backup).
+# Заменить базу проекта копией базы другого проекта этого сервера — чаще всего прод → dev,
+# чтобы проверить миграции и код на настоящих данных:
+#   sudo project-db-copy shop shop_dev            # спросит подтверждение
+#   sudo project-db-copy --files shop shop_dev    # и папки media/ и private/ (web/ проекта)
+#   sudo project-db-copy -y ...                           # без вопроса (меню, скрипты)
+# По шагам:
+#   1. снимок проекта «куда» (только база; с --files — полный): передумали —
+#      project-restore <куда> /etc/restic/env <снимок> (номер — в выводе и журнале событий);
+#   2. дамп «откуда» — на ходу, проект «откуда» не останавливается (pg_dump читает согласованный срез);
+#   3. «куда» останавливается, его база очищается целиком (схемы его роли): таблицы, которых
+#      в копии нет (новые миграции dev), не остаются со старыми данными;
+#   4. копия — от роли проекта «куда» (как project-restore), расширения — от postgres;
+#   5. миграции кода «куда» (сервис deploy его compose.yml, если есть) и запуск: не прошла миграция
+#      на настоящих данных — видно здесь, а не при выкладке на прод.
+# Защита прода: копировать можно только В проект, чьё имя оканчивается на _dev (shop_dev):
+# перепутанный порядок «откуда куда» стёр бы рабочую базу. Обхода нет намеренно.
+# Персональные данные копируются как есть: письма из «куда» уходить не должны (в Django у dev —
+# EMAIL_BACKEND console). Пока идёт копия, автовыкладка «куда» ждёт (та же блокировка).
+set -Eeuo pipefail
+
+FILES="" YES=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --files) FILES=1; shift ;;
+    -y|--yes) YES=1; shift ;;
+    *) break ;;
+  esac
+done
+FROM=${1:?Использование: project-db-copy [--files] [-y] <откуда> <куда>}
+TO=${2:?Использование: project-db-copy [--files] [-y] <откуда> <куда>}
+LIST=/etc/restic/projects.json
+die() { echo "project-db-copy: $*" >&2; exit 1; }
+
+for p in "$FROM" "$TO"; do
+  [[ $p =~ ^[a-z][a-z0-9_]*$ ]] || die "недопустимое имя проекта: $p"
+  jq -e --arg n "$p" 'any(.[]; .name == $n and .db == "postgres")' "$LIST" >/dev/null ||
+    die "у проекта $p нет базы на этом сервере (db: postgres в server.yml)"
+done
+[ "$FROM" != "$TO" ] || die "откуда и куда — один и тот же проект"
+[[ $TO == *_dev ]] || die "копировать можно только в проект *_dev, а $TO — не такой: порядок — откуда, потом куда (project-db-copy shop shop_dev)"
+
+what="базу $TO копией $FROM${FILES:+ (и папки media/, private/)}"
+if [ -z "$YES" ]; then
+  [ -t 0 ] || die "нужно подтверждение: запустите в терминале или с -y"
+  read -r -p "Заменить $what? Всё, что сейчас в базе $TO, будет стёрто (перед этим — снимок). [y/N] " a
+  [[ $a =~ ^[yYдД] ]] || { echo "Отменено"; exit 1; }
+fi
+
+STAGE=$(mktemp -d /var/tmp/db-copy.XXXXXX)       # 0700, только root: дамп с данными прода
+STARTED=""
+finish() {
+  local rc=$?
+  rm -rf "$STAGE"
+  if [ "$rc" != 0 ] && [ -n "$STARTED" ]; then
+    infra-log "копия базы $FROM → $TO: ошибка (код $rc); вернуть как было: project-restore $TO /etc/restic/env ${SNAP:-<снимок>}"
+  fi
+}
+trap finish EXIT
+
+# Выкладка «куда» в это время перезапустила бы его контейнеры с полупустой базой
+if [ -d /var/lib/project-deploy ]; then
+  exec 9>"/var/lib/project-deploy/$TO.lock"
+  flock -w 60 9 || die "идёт выкладка $TO — повторите через минуту"
+fi
+
+echo "== 1. Снимок $TO — вернуть как было можно из него"
+if [ -n "$FILES" ]; then out=$(project-backup "$TO" 2>&1); else out=$(project-backup --db-only "$TO" 2>&1); fi
+echo "$out" | tail -3
+SNAP=$(grep -oE 'snapshot [0-9a-f]+ saved' <<<"$out" | awk '{print $2}' | tail -1)
+[ -n "$SNAP" ] || die "снимок $TO не сделан — копия не начата"
+STARTED=1
+infra-log "копия базы $FROM → $TO${FILES:+ с файлами}: начата, снимок $TO до замены — $SNAP"
+
+echo "== 2. Дамп $FROM"
+runuser -u postgres -- pg_dump -Fc "$FROM" > "$STAGE/dump"
+
+echo "== 3. $TO останавливается, база очищается"
+project-compose "$TO" stop
+project-db-empty "$TO"
+
+echo "== 4. Копия в $TO"
+# Как в project-restore: расширения — от postgres, остальное — от роли проекта «куда»
+EXT='^[0-9]+; [0-9]+ [0-9]+ (EXTENSION|COMMENT - EXTENSION) '
+pg_restore -l "$STAGE/dump" > "$STAGE/toc"
+grep -E "$EXT" "$STAGE/toc" > "$STAGE/toc-ext" || true
+# Схема public уже есть (шаг 3) — её строки из копии не нужны
+grep -vE "$EXT" "$STAGE/toc" | grep -vE '^[0-9]+; [0-9]+ [0-9]+ (SCHEMA|COMMENT|ACL) - (SCHEMA )?public ' > "$STAGE/toc-main" || true
+chown postgres "$STAGE" "$STAGE/toc-main" "$STAGE/dump"
+if [ -s "$STAGE/toc-ext" ]; then
+  echo "расширения: $(awk '{print $NF}' "$STAGE/toc-ext" | sort -u | xargs)"
+  pg_restore -L "$STAGE/toc-ext" -f - "$STAGE/dump" | runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 -d "$TO"
+fi
+runuser -u postgres -- pg_restore --exit-on-error --no-owner --no-acl --role="$TO" \
+  -L "$STAGE/toc-main" -d "$TO" "$STAGE/dump"
+
+if [ -n "$FILES" ]; then
+  # Без прав и владельцев источника: права — из ACL по умолчанию папки «куда» (их видят его
+  # контейнеры), группа — его участников; папки — с наследованием группы, как их создаёт автовыкладка
+  for d in media private; do
+    src=/srv/projects/$FROM/web/$d dst=/srv/projects/$TO/web/$d
+    [ -d "$src" ] || continue
+    echo "файлы: $d/"
+    [ -d "$dst" ] || install -d -m 2770 -g "$TO-dev" "$dst"
+    rsync -rlt --delete --no-perms --no-owner --no-group "$src/" "$dst/"
+    chgrp -R "$TO-dev" "$dst"
+    find "$dst" -type d -exec chmod g+rwxs {} +
+  done
+fi
+
+echo "== 5. Миграции кода $TO и запуск"
+rc=0
+if project-compose "$TO" --profile deploy config --services 2>/dev/null | grep -qx deploy; then
+  project-compose "$TO" --profile deploy run --rm deploy || rc=$?
+fi
+project-compose "$TO" up -d || rc=$?
+STARTED=""                                         # дальше итог пишется здесь, а не в finish
+if [ "$rc" != 0 ]; then
+  infra-log "копия базы $FROM → $TO: скопировано, но миграции или запуск $TO не прошли (код $rc); снимок до замены — $SNAP"
+  echo "!!! Скопировано, но миграции или запуск $TO не прошли — причина выше." \
+       "Вернуть как было: project-restore $TO /etc/restic/env $SNAP" >&2
+  exit 2
+fi
+infra-log "копия базы $FROM → $TO${FILES:+ с файлами}: готово, снимок $TO до замены — $SNAP"
+echo "Готово: $what. Вернуть как было: project-compose $TO down && project-restore $TO /etc/restic/env $SNAP && project-compose $TO up -d"

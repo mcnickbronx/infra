@@ -1,0 +1,11 @@
+# Управляется Ansible (роль monitoring). Сводка раз в день в 09:00 (notify_summary_time):
+# нет её в чате — сервер лежит
+[Unit]
+Description=Daily server summary at 09:00
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

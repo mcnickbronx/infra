@@ -1,0 +1,2 @@
+expect_error: "server_name — строчные латинские"
+server_name: Shop_Server

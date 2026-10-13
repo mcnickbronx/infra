@@ -1,0 +1,60 @@
+# health-check.sh — все проверки сервера в одном скрипте: каждые 10 минут, о новом и прошедшем —
+# в Telegram (infra-notify; бот, чат и прокси — в /etc/infra/secrets.yml), раз в день — сводка
+- name: Скрипт проверки состояния сервера
+  ansible.builtin.template:
+    src: health-check.sh.j2
+    dest: /usr/local/bin/health-check.sh
+    mode: "0755"
+
+- name: Уведомления в Telegram (infra-notify)
+  ansible.builtin.copy:
+    src: infra-notify
+    dest: /usr/local/sbin/infra-notify
+    mode: "0755"
+
+# О чём уже сообщили — чтобы не повторять каждые 10 минут
+- name: Папка состояния health-check
+  ansible.builtin.file:
+    path: /var/lib/health-check
+    state: directory
+    mode: "0700"
+
+# По ней health-check напоминает про update.yml, если его не запускали больше недели.
+# Отметку обновляет update.yml; новому серверу она ставится при установке — всё свежее
+- name: Отметка последнего update.yml
+  ansible.builtin.copy:
+    content: ""
+    dest: /var/lib/update-last-run
+    force: false
+    mode: "0644"
+
+- name: Службы и таймеры health-check
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop: [health-check.service, health-check.timer, health-check-summary.service]
+
+- name: Таймер утренней сводки
+  ansible.builtin.template:
+    src: health-check-summary.timer.j2
+    dest: /etc/systemd/system/health-check-summary.timer
+    mode: "0644"
+
+# В --check юнита может ещё не быть (его установка только показана) — тогда включение пропускается
+- name: Юниты таймеров health-check уже установлены
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ item }}"
+  loop: [health-check.timer, health-check-summary.timer]
+  register: health_timers
+
+- name: Таймеры health-check включены
+  ansible.builtin.systemd:
+    name: "{{ item.item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: "{{ health_timers.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode or item.stat.exists

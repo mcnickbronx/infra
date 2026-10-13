@@ -1,0 +1,5 @@
+{#- Настройки ссылки доступа для infra-access и страницы (её служба без прав читает этот файл):
+    секрета здесь нет — только его sha256 -#}
+{{ {'server': inventory_hostname, 'host': access_host, 'port': access_web_port | int,
+    'hours': access_link_hours | int, 'max_open': access_max_open | int,
+    'token_sha256': secrets.access_token | hash('sha256')} | to_nice_json }}

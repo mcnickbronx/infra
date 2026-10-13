@@ -1,0 +1,11 @@
+# Управляется Ansible. IP администратора (admin_ips) не банятся,
+# даже если вы несколько раз ошиблись с ключом или паролем.
+name: ansible/admin-whitelist
+description: "Admin IPs from Ansible"
+whitelist:
+  reason: "admin_ips"
+  ip:
+    - "192.0.2.10"
+    - "2001:db8::10"
+  cidr:
+    - "198.51.100.0/29"

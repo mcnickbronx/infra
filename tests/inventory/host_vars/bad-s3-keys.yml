@@ -1,0 +1,3 @@
+expect_error: "нет s3_access_key и s3_secret_key"
+restic_s3_repository_base: "s3:https://s3.fixture.test/backups"
+secrets_file: {restic_password: fixtureResticInvalid0000000000000000000000000}

@@ -1,0 +1,201 @@
+# ---------- Проверки до любых изменений ----------
+# Проверки описания — роль preflight (в site.yml перед этой ролью). Здесь — то,
+# что зависит от состояния сервера.
+
+# С каких IP вы подключены, передаёт команда infra (infra_client_ip): Ansible работает на самом
+# сервере, своего подключения у него нет. Несколько IP через запятую — запуск из tmux или screen,
+# проверяются все SSH-сессии пользователя. «консоль» — консоль хостера: файрвол её не закроет.
+# Пусто — откуда запуск, неизвестно (cron, ansible-playbook в обход infra): проверить нечем,
+# поэтому остановка, как и при IP не из списка
+- name: С каких ваших IP файрвол не пустит
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import ipaddress, json, sys
+        nets = [ipaddress.ip_network(n, strict=False) for n in json.loads(sys.argv[2])]
+        print(", ".join(ip for ip in sys.argv[1].split(",")
+                        if not any(ipaddress.ip_address(ip) in n for n in nets)))
+      - "{{ infra_client_ip }}"
+      - "{{ ssh_allowed_ips | to_json }}"
+  register: client_ip_check
+  changed_when: false
+  check_mode: false     # только читает; иначе в --check stdout пустой и проверка ниже не работает
+  when: infra_client_ip | default('') not in ['', 'консоль']
+
+- name: Защита от блокировки себя
+  ansible.builtin.assert:
+    that: >-
+      skip_lockout_check | default(false) | bool
+      or infra_client_ip | default('') == 'консоль'
+      or (infra_client_ip | default('') != '' and client_ip_check.stdout == '')
+    fail_msg: >-
+      {% if infra_client_ip | default('') == '' -%}
+      Не удалось узнать, с какого IP вы подключены: запуск не из SSH-сессии и не с консоли хостера
+      (tmux или screen без вашей открытой SSH-сессии, cron, ansible-playbook в обход infra).
+      Файрвол может закрыть вам доступ. Запустите sudo infra apply из обычной SSH-сессии
+      (или с -e skip_lockout_check=true, если уверены).
+      {%- else -%}
+      Вы подключены с {{ client_ip_check.stdout }}, но в admin_ips этого IP нет.
+      После включения файрвола вы потеряете доступ. Добавьте IP в admin_ips в server.yml
+      (или запустите с -e skip_lockout_check=true, если уверены).
+      {%- endif %}
+    quiet: true
+
+# ---------- Система ----------
+# python-is-python3: команда python запускает системный python3 (в Ubuntu её нет).
+# Python проектов — в их образах, этот только для скриптов на хосте.
+- name: Базовые пакеты
+  ansible.builtin.apt:
+    name: [ca-certificates, curl, ufw, unattended-upgrades, acl, jq, python3-debian, git, python-is-python3,
+           mc, bash-completion]
+    update_cache: true
+    cache_valid_time: 3600
+
+# Ввод команд для всех: стрелки ищут в истории по набранному началу (docker ↑ — прошлые
+# команды docker), Tab — без учёта регистра и сразу со списком вариантов.
+# \e[A и \eOA — стрелки в разных режимах терминала.
+- name: Поиск по истории стрелками, Tab без учёта регистра
+  ansible.builtin.blockinfile:
+    path: /etc/inputrc
+    marker: "# {mark} ANSIBLE"
+    block: |
+      "\e[A": history-search-backward
+      "\e[B": history-search-forward
+      "\eOA": history-search-backward
+      "\eOB": history-search-forward
+      set completion-ignore-case on
+      set show-all-if-ambiguous on
+
+# fwupd обновляет прошивки оборудования; у виртуального сервера их нет, а его ежедневная
+# проверка ходит на зарубежный сервис, падает и попадает в «упавшие сервисы» health-check.
+- name: Обновление прошивок (fwupd) выключено на виртуальном сервере
+  ansible.builtin.systemd:
+    name: fwupd-refresh.timer
+    enabled: false
+    state: stopped
+  when: ansible_virtualization_role | default('') == 'guest'
+  failed_when: false        # fwupd не установлен — выключать нечего
+
+- name: Часовой пояс
+  community.general.timezone:
+    name: "{{ timezone }}"
+
+# Журнал событий сервера: что, когда и кто (ADMIN.md, «Где смотреть, что происходило»).
+# Пишут команда infra, бэкап, восстановление, автовыкладка
+- name: Журнал событий — скрипт infra-log и ротация
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: infra-log, dest: /usr/local/sbin/infra-log, mode: "0755" }
+    - { src: logrotate-infra, dest: /etc/logrotate.d/infra, mode: "0644" }
+  loop_control:
+    label: "{{ item.dest }}"
+
+# Файл мог создать сам infra-log (первый apply пишет в журнал до этой роли) — права правятся
+# и у существующего; время изменения не трогается, иначе повторный прогон что-то менял бы
+- name: Журнал событий /var/log/infra.log
+  ansible.builtin.file:
+    path: /var/log/infra.log
+    state: touch
+    owner: root
+    group: adm
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+# Предел размера журналов (maxsize) проверяется, когда запускается logrotate: раз в час,
+# а не раз в сутки — иначе поток запросов к сайтам за сутки разогнал бы access-лог Traefik
+- name: Папка настроек таймера logrotate
+  ansible.builtin.file:
+    path: /etc/systemd/system/logrotate.timer.d
+    state: directory
+    mode: "0755"
+
+- name: logrotate каждый час
+  ansible.builtin.copy:
+    src: logrotate-hourly.conf
+    dest: /etc/systemd/system/logrotate.timer.d/hourly.conf
+    mode: "0644"
+  notify: Restart logrotate timer
+
+# Участники проектов не видят чужие процессы (ps, top, /proc/<pid>) — и аргументы их команд
+- name: Процессы других пользователей скрыты (hidepid=2)
+  ansible.posix.mount:
+    path: /proc
+    src: proc
+    fstype: proc
+    opts: defaults,hidepid=2
+    state: mounted
+
+# Сами — только обновления безопасности Ubuntu (так настроен unattended-upgrades в Ubuntu),
+# без перезагрузки, вместе с ними — списки пакетов. Остальное ставит update.yml.
+- name: Автообновления безопасности
+  ansible.builtin.copy:
+    src: 20auto-upgrades
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    mode: "0644"
+
+- name: Пользователь администратора
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    shell: /bin/bash
+    groups: sudo
+    append: true
+
+- name: SSH-ключи администратора
+  ansible.posix.authorized_key:
+    user: "{{ admin_user }}"
+    key: "{{ admin_keys }}"
+    exclusive: true
+
+- name: sudo без пароля для администратора
+  ansible.builtin.copy:
+    content: "{{ admin_user }} ALL=(ALL) NOPASSWD: ALL\n"
+    dest: /etc/sudoers.d/90-admin
+    mode: "0440"
+    validate: visudo -cf %s
+
+- name: Укрепление SSH
+  ansible.builtin.template:
+    src: 10-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/10-hardening.conf
+    mode: "0644"
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Restart ssh
+
+# ---------- Файрвол: сначала правила, потом включение ----------
+- name: Файрвол — HTTP и HTTPS всем
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: ["80", "443"]
+
+# SSH — только с admin_ips и IP участников проектов сервера (people → ips). Правила
+# с пометкой ansible-wl скрипт приводит к списку: недостающие добавляет, лишние удаляет.
+- name: Скрипт синхронизации белого списка
+  ansible.builtin.copy:
+    src: ufw-sync-whitelist
+    dest: /usr/local/sbin/ufw-sync-whitelist
+    mode: "0755"
+
+- name: Белый список SSH
+  ansible.builtin.template:
+    src: whitelist.json.j2
+    dest: /etc/ufw/ansible-whitelist.json
+    mode: "0644"
+
+- name: Применение белого списка (лишние IP удаляются)
+  ansible.builtin.command: /usr/local/sbin/ufw-sync-whitelist /etc/ufw/ansible-whitelist.json
+  register: whitelist_sync
+  changed_when: "'CHANGED' in whitelist_sync.stdout"
+
+- name: Файрвол — запрет входящих по умолчанию и включение
+  community.general.ufw:
+    state: enabled
+    default: deny
+    direction: incoming

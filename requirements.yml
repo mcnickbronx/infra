@@ -1,0 +1,13 @@
+# Версии коллекций закреплены — те, что в пакете ansible 14.4.0, на котором всё проверено
+# (тот же пакет ставит CI). Если коллекций нет в вашей версии пакета ansible или версии другие:
+#   ansible-galaxy collection install -r requirements.yml
+# Обновление: поднять версии здесь и ansible в .github/workflows/lint.yml, проверить на тестовой VDS.
+collections:
+  - name: ansible.posix
+    version: "2.2.2"
+  - name: community.general
+    version: "13.4.0"
+  - name: community.docker
+    version: "5.3.0"
+  - name: community.postgresql
+    version: "4.2.0"

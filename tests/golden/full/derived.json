@@ -1,0 +1,66 @@
+{
+    "access_host": "access.fixture.test",
+    "autodeploy_projects": [
+        "shop"
+    ],
+    "backup_hourly_step": 5,
+    "db_projects": [
+        "shop",
+        "crm"
+    ],
+    "host_people": [
+        "dina",
+        "ivan",
+        "gone",
+        "olga",
+        "vera",
+        "kira"
+    ],
+    "hourly_backup_projects": [
+        "shop",
+        "crm"
+    ],
+    "people_groups": {
+        "dina": [
+            "devs",
+            "shop-dev",
+            "docker"
+        ],
+        "gone": [
+            "devs",
+            "crm-dev"
+        ],
+        "ivan": [
+            "devs",
+            "crm-dev"
+        ],
+        "kira": [
+            "devs",
+            "static-dev"
+        ],
+        "olga": [
+            "devs",
+            "blog-dev",
+            "static-dev"
+        ],
+        "vera": [
+            "devs",
+            "blog-dev"
+        ]
+    },
+    "postgres_memory_share": 0.4,
+    "project_default_cpus": 2.0,
+    "ssh_allowed_ips": [
+        "192.0.2.10",
+        "198.51.100.0/29",
+        "2001:db8::10",
+        "192.0.2.21",
+        "198.51.100.30",
+        "198.51.100.70/29",
+        "203.0.113.99",
+        "203.0.113.40",
+        "2001:db8:40::/64",
+        "2001:db8::77",
+        "203.0.113.50"
+    ]
+}

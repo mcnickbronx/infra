@@ -1,0 +1,23 @@
+# Проверки при каждом push и pull request — те же, что tools/check.sh у администратора
+# (make check). На серверы ничего не раскатывает.
+# Версии закреплены (requirements-dev.txt): без изменений в репозитории проверка не должна вдруг покраснеть.
+name: lint
+"on": [push, pull_request]   # в кавычках: иначе yamllint читает on как true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ansible, ansible-lint, shellcheck (версии — requirements-dev.txt)
+        run: pip install -r requirements-dev.txt
+
+      - name: Коллекции закреплённых версий ставятся
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Все проверки (tools/check.sh)
+        run: tools/check.sh

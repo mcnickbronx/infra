@@ -1,0 +1,3 @@
+expect_error: "Нет в people: ['nobody']"
+projects:
+  site: {net: 5, devs: [nobody]}

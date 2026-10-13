@@ -1,0 +1,23 @@
+# Каждый сервер группы invalid (tests/inventory) описан с одной ошибкой. Проверки
+# инвентаря (роль preflight) должны остановиться на ней с сообщением из expect_error.
+# Проверка, которую случайно ослабили или сломали, здесь покраснеет.
+# Запуск — через tools/check.sh.
+- name: Проверки инвентаря ловят ошибки
+  hosts: invalid
+  gather_facts: false
+  tasks:
+    - name: Описание с ошибкой
+      block:
+        - name: Проверки инвентаря
+          ansible.builtin.include_role:
+            name: preflight
+
+        - name: Ошибка не поймана
+          ansible.builtin.fail:
+            msg: "проверки инвентаря пропустили ошибку"
+      rescue:
+        - name: Остановились на нужной ошибке
+          ansible.builtin.assert:
+            that: expect_error in (ansible_failed_result | to_json(ensure_ascii=false))
+            fail_msg: "Ждали «{{ expect_error }}», а получили: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+            quiet: true

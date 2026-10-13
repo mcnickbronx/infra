@@ -1,0 +1,7 @@
+# Серверы с одной ошибкой: основа у всех корректная, ошибку добавляет host_vars.
+docker_users: []
+projects:
+  site:
+    net: 5
+    db: postgres
+    devs: [ivan]

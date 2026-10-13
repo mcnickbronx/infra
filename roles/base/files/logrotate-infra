@@ -1,0 +1,15 @@
+# Управляется Ansible (роль base). Журнал событий сервера (infra-log): раз в месяц новый файл,
+# хранятся 24 (два года), старые сжаты. Больше 10 МБ — новый файл раньше срока: logrotate
+# проверяет раз в сутки, и случайный поток событий не займёт диск
+/var/log/infra.log {
+    monthly
+    maxsize 10M
+    rotate 24
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+    # /var/log в Ubuntu доступна на запись группе syslog — без su logrotate откажет
+    su root adm
+}

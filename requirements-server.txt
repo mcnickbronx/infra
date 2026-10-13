@@ -1,0 +1,4 @@
+# Ansible на сервере — в /opt/infra/.venv (ставит install.sh). Та же версия ansible-core, что
+# в пакете ansible из requirements-dev.txt, на котором всё проверено; коллекции — requirements.yml.
+# Обновление: поднять вместе с requirements-dev.txt и requirements.yml, проверить на тестовой VDS.
+ansible-core==2.21.4

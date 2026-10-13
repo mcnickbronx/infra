@@ -1,0 +1,3 @@
+expect_error: "занято системой"
+projects:
+  traefik: {net: 5, db: postgres, devs: [ivan]}

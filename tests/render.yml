@@ -1,0 +1,82 @@
+# Все шаблоны ролей на тестовом инвентаре (tests/inventory): результат — в
+# tests/golden/<сервер>/, эталон лежит в git. Любое изменение правил (белый список,
+# pg_hba, лимиты...) видно в git diff tests/golden, как обычный код.
+# Запуск — через tools/check.sh (он же сравнивает с эталоном).
+- name: Шаблоны на тестовых серверах
+  hosts: fixture
+  gather_facts: false
+  vars:
+    out: "{{ playbook_dir }}/golden/{{ inventory_hostname }}"
+    templates:
+      - base/10-hardening.conf
+      - base/whitelist.json
+      - docker/daemon.json
+      - docker/base.yml
+      - postgres/90-ansible.conf
+      - postgres/pg_hba.conf
+      - traefik/compose.yml
+      - traefik/traefik.yml
+      - traefik/middlewares.yml
+      - crowdsec/acquis-traefik.yaml
+      - crowdsec/whitelist-admins.yaml
+      - access/config.json
+      - access/traefik-access.yml
+      - backup/backup.sh
+      - backup/backup-hourly.sh
+      - backup/backup-hourly.timer
+      - backup/env
+      - backup/s3-env
+      - backup/projects.json
+      - monitoring/health-check.sh
+      - monitoring/health-check-summary.timer
+    # Вычисляемые значения (derived.yml): от них зависят все правила доступа
+    derived:
+      host_people: "{{ host_people }}"
+      ssh_allowed_ips: "{{ ssh_allowed_ips }}"
+      db_projects: "{{ db_projects | map(attribute='key') | list }}"
+      autodeploy_projects: "{{ autodeploy_projects }}"
+      hourly_backup_projects: "{{ hourly_backup_projects }}"
+      backup_hourly_step: "{{ backup_hourly_step }}"
+      access_host: "{{ access_host }}"
+      postgres_memory_share: "{{ postgres_memory_share }}"
+      project_default_cpus: "{{ project_default_cpus }}"
+      people_groups: "{{ people_groups }}"
+  tasks:
+    - name: Проверки инвентаря проходят
+      ansible.builtin.import_role:
+        name: preflight
+
+    # Заново: шаблон, которого больше нет, не должен остаться в эталоне
+    - name: Прежний результат удалён
+      ansible.builtin.file:
+        path: "{{ out }}"
+        state: absent
+
+    - name: Папки результата
+      ansible.builtin.file:
+        path: "{{ out }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ templates | map('dirname') | unique | list + ['project'] }}"
+
+    - name: Шаблоны ролей
+      ansible.builtin.template:
+        src: "../roles/{{ item | dirname }}/templates/{{ item | basename }}.j2"
+        dest: "{{ out }}/{{ item }}"
+        mode: "0644"
+      loop: "{{ templates }}"
+
+    - name: Лимиты проектов (slice)
+      ansible.builtin.template:
+        src: ../roles/project/templates/project.slice.j2
+        dest: "{{ out }}/project/proj-{{ item.key }}.slice"
+        mode: "0644"
+      loop: "{{ projects | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Вычисляемые значения
+      ansible.builtin.copy:
+        content: "{{ derived | to_nice_json(sort_keys=true) }}\n"
+        dest: "{{ out }}/derived.json"
+        mode: "0644"

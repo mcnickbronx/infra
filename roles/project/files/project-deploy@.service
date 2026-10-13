@@ -1,0 +1,13 @@
+# Управляется Ansible (роль project). Автовыкладка проекта %i (autodeploy: true в server.yml).
+[Unit]
+Description=Autodeploy of project %i
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/project-deploy %i
+# В журнале — только выкладки и ошибки: вывод скрипта — уровня notice, а «запущено/завершено»
+# systemd (info) каждые 15 секунд отбрасывается
+SyslogLevel=notice
+LogLevelMax=notice

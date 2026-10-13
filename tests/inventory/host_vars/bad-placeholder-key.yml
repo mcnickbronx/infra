@@ -1,0 +1,5 @@
+expect_error: "people.ivan"
+people:
+  ivan:
+    key: "ssh-ed25519 AAAA...замените... ivan@laptop"
+    ips: [198.51.100.30]

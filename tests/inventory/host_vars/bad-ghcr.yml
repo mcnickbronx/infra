@@ -1,0 +1,5 @@
+expect_error: "нужны ghcr_user и ghcr_token"
+projects:
+  site: {net: 5, autodeploy: true, devs: [ivan]}
+docker_users: [ivan]
+secrets_file: {restic_password: fixtureResticInvalid0000000000000000000000000}

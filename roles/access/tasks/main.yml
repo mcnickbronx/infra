@@ -1,0 +1,77 @@
+# Вход по SSH с меняющегося IP — одна секретная ссылка на сервер (access_link в server.yml):
+#   страница   infra-access-web.service — без прав, на 127.0.0.1, снаружи через Traefik;
+#   заявки     infra-access.path → infra-access process (root): IP заново проверен, правило ufw
+#              с пометкой «infra-access <до>», событие в журнал и в Telegram;
+#   срок       infra-access-expire.timer — каждые 5 минут убирает истёкшие правила.
+# Ссылку показывает sudo infra-access link (меню: «Доступ по ссылке»). access_link: false — всё
+# выключается, открытые по ссылке правила закрываются.
+
+- name: Папка настроек ссылки доступа
+  ansible.builtin.file:
+    path: /etc/infra-access
+    state: directory
+    mode: "0755"
+  when: access_link
+
+# Читает и служба без прав — поэтому 0644: секрета в файле нет, только его sha256
+- name: Настройки ссылки доступа
+  ansible.builtin.template:
+    src: config.json.j2
+    dest: /etc/infra-access/config.json
+    mode: "0644"
+  when: access_link
+
+- name: Команда infra-access (root) и страница ссылки
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - {src: infra-access, dest: /usr/local/sbin/infra-access, mode: "0700"}
+    - {src: infra-access-web, dest: /usr/local/bin/infra-access-web, mode: "0755"}
+  notify: Restart infra-access-web
+
+- name: Службы и таймер ссылки доступа
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop: [infra-access-web.service, infra-access.path, infra-access.service, infra-access-expire.service, infra-access-expire.timer]
+  notify: Restart infra-access-web
+
+- name: Маршрут Traefik к странице ссылки
+  ansible.builtin.template:
+    src: traefik-access.yml.j2
+    dest: "{{ traefik_dir }}/dynamic/infra-access.yml"
+    mode: "0600"
+  when: access_link
+
+# Предпросмотр (--check) юниты не копирует: на сервере, где их ещё нет, включать нечего
+- name: Юниты ссылки доступа уже установлены
+  ansible.builtin.stat:
+    path: /etc/systemd/system/infra-access-web.service
+  register: access_unit
+
+- name: Страница, очередь заявок и таймер — работают, если access_link
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: "{{ access_link }}"
+    state: "{{ 'started' if access_link else 'stopped' }}"
+    daemon_reload: true
+  loop: [infra-access-web.service, infra-access.path, infra-access-expire.timer]
+  when: not ansible_check_mode or access_unit.stat.exists
+
+# ---------- Выключено (access_link: false) ----------
+# Открытые по ссылке правила — закрыть: иначе их некому было бы убрать по сроку
+- name: Открытые по ссылке IP закрыты
+  ansible.builtin.command: /usr/local/sbin/infra-access close all
+  register: access_closed
+  changed_when: "'нечего закрывать' not in access_closed.stdout"
+  when: not access_link and access_unit.stat.exists and not ansible_check_mode
+
+- name: Маршрут и настройки ссылки убраны
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: ["{{ traefik_dir }}/dynamic/infra-access.yml", /etc/infra-access]
+  when: not access_link

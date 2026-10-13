@@ -1,0 +1,8 @@
+# Управляется Ansible. Лимиты проекта {{ item.key }}: все его контейнеры
+# (через extends в /srv/infra/compose/base.yml) работают в этом slice.
+[Unit]
+Description=Project {{ item.key }}
+
+[Slice]
+MemoryMax={{ (item.value.memory | default(project_default_memory)) | upper }}
+CPUQuota={{ ((item.value.cpus | default(project_default_cpus)) | float * 100) | round | int }}%

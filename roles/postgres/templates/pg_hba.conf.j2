@@ -1,0 +1,23 @@
+# Управляется Ansible: файл пишется целиком, ручные правки будут перезаписаны.
+# Свои строки — в файлы pg_hba.d/*.conf рядом (они подключаются в конце и не перезаписываются).
+# Убранные из server.yml проекты пропадают отсюда сами. Снаружи — только через SSH-туннель (127.0.0.1).
+#
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# --- Локально (как в стандартном pg_hba.conf Debian/Ubuntu)
+local   all             postgres                                peer
+local   all             all                                     peer
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+local   replication     all                                     peer
+host    replication     all             127.0.0.1/32            scram-sha-256
+host    replication     all             ::1/128                 scram-sha-256
+
+# --- Проекты: пользователь = база = имя проекта, из сети своего проекта
+{% for p in db_projects %}
+host    {{ p.key }}    {{ p.key }}    172.20.{{ p.value.net }}.0/24    scram-sha-256
+{% endfor %}
+
+# --- Свои строки администратора сервера (Postgres 16+): срабатывает первая подходящая строка,
+# поэтому отсюда можно только добавить доступ, но не закрыть открытый выше
+include_dir pg_hba.d

@@ -1,0 +1,18 @@
+# Управляется Ansible. IP администратора (admin_ips) не банятся,
+# даже если вы несколько раз ошиблись с ключом или паролем.
+name: ansible/admin-whitelist
+description: "Admin IPs from Ansible"
+whitelist:
+  reason: "admin_ips"
+  ip:
+{% for ip in admin_ips | reject('search', '/') %}
+    - "{{ ip }}"
+{% else %}
+    - "127.0.0.1"
+{% endfor %}
+  cidr:
+{% for ip in admin_ips | select('search', '/') %}
+    - "{{ ip }}"
+{% else %}
+    - "127.0.0.0/8"
+{% endfor %}

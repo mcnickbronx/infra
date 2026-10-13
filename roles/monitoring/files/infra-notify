@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Управляется Ansible (роль monitoring).
+# Уведомление в Telegram — в чат команды через её бота. Бот и чат задаются в /etc/infra/secrets.yml:
+#   telegram_bot_token: "123456:ABC..."     — токен бота (@BotFather)
+#   telegram_chat_id: "-1001234567890"      — куда писать: чат команды (id с минусом) или личный
+#                                             чат с ботом (сначала Start у бота); несколько — через запятую
+#   telegram_proxy: "socks5h://user:pass@203.0.113.5:1080"   — по желанию: Telegram с сервера
+#                                             закрыт (http://, https://, socks5://, socks5h://)
+# Не заданы — уведомлений нет (код 0): всё и так в журналах сервера.
+#   infra-notify "текст"       — отправить
+#   infra-notify --find-chat   — id чатов, куда недавно писали боту (сначала напишите в чате)
+# Код 1 — не отправилось (нет связи с Telegram): вызывающий повторит позже.
+# INFRA_NOTIFY_DRY=<файл> — не отправлять, а дописать в файл (для проверок в tests/); не
+# записалось — код 1, как при недоступном Telegram.
+set -uo pipefail
+SECRETS=/etc/infra/secrets.yml
+
+secret() { sed -nE "s/^$1:[[:space:]]*[\"']?([^\"'[:space:]]*).*/\1/p" "$SECRETS" 2>/dev/null | tail -1; }
+
+# Токен и прокси (в нём бывает пароль) — через --config из stdin, не в аргументах curl:
+# аргументы видны в списке процессов
+telegram() {
+  local method=$1; shift
+  { printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$TOKEN" "$method"
+    [ -z "$PROXY" ] || printf 'proxy = "%s"\n' "$PROXY"
+  } | curl -fsS --connect-timeout 10 -m 30 --retry 1 -K - "$@"
+}
+
+TOKEN=$(secret telegram_bot_token)
+CHAT=$(secret telegram_chat_id)
+PROXY=$(secret telegram_proxy)
+
+if [ "${1:-}" = --find-chat ]; then
+  [ -n "$TOKEN" ] || { echo "Нет telegram_bot_token в $SECRETS" >&2; exit 1; }
+  updates=$(telegram getUpdates) || {
+    echo "Нет связи с Telegram${PROXY:+ через прокси из telegram_proxy}. Telegram с сервера закрыт —" >&2
+    echo "нужен прокси: telegram_proxy в $SECRETS (ADMIN.md, «Уведомления в Telegram»)" >&2
+    exit 1
+  }
+  jq -r '[.result[] | (.message // .channel_post // .my_chat_member) | .chat
+    | select(.id) | "\(.id)  \(.title // .username // .first_name)"] | unique[]' <<<"$updates"
+  echo "Нет нужного чата — добавьте бота в чат команды (или нажмите Start у бота для личного чата)," >&2
+  echo "напишите там что-нибудь и повторите" >&2
+  exit 0
+fi
+
+text=${1:?Использование: infra-notify "текст" | --find-chat}
+text=${text:0:4000}                      # предел сообщения Telegram — 4096 символов
+if [ -n "${INFRA_NOTIFY_DRY:-}" ]; then
+  printf '%s\n---\n' "$text" 2>/dev/null >>"$INFRA_NOTIFY_DRY"
+  exit
+fi
+[ -n "$TOKEN" ] && [ -n "$CHAT" ] || exit 0    # Telegram не настроен — ни одного запроса
+rc=0
+for chat in ${CHAT//,/ }; do
+  telegram sendMessage -o /dev/null --data-urlencode "chat_id=$chat" --data-urlencode "text=$text" || rc=1
+done
+exit "$rc"

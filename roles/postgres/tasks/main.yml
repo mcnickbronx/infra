@@ -1,0 +1,190 @@
+- name: Папка для ключей apt
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Ключ официального репозитория PostgreSQL
+  ansible.builtin.get_url:
+    url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    dest: /etc/apt/keyrings/postgresql.asc
+    mode: "0644"
+
+- name: Репозиторий PostgreSQL (PGDG)
+  ansible.builtin.deb822_repository:
+    name: pgdg
+    types: deb
+    uris: https://apt.postgresql.org/pub/repos/apt
+    suites: "{{ ansible_distribution_release }}-pgdg"
+    components: main
+    signed_by: /etc/apt/keyrings/postgresql.asc
+
+- name: Установка PostgreSQL
+  ansible.builtin.apt:
+    name:
+      - "postgresql-{{ postgres_version }}"
+      - python3-psycopg2
+    update_cache: true
+
+- name: Настройки производительности (по объёму RAM сервера)
+  ansible.builtin.template:
+    src: 90-ansible.conf.j2
+    dest: "/etc/postgresql/{{ postgres_version }}/main/conf.d/90-ansible.conf"
+    owner: postgres
+    group: postgres
+    mode: "0644"
+  notify: Restart postgresql
+
+- name: Файрвол — Postgres доступен из сетей проектов (172.20.<net>.0/24)
+  community.general.ufw:
+    rule: allow
+    from_ip: 172.20.0.0/16
+    port: "5432"
+    proto: tcp
+
+- name: PostgreSQL запущен
+  ansible.builtin.service:
+    name: postgresql
+    state: started
+    enabled: true
+
+# Библиотека грузится при старте (shared_preload_libraries в 90-ansible.conf), а смотреть
+# статистику можно после CREATE EXTENSION — в базе postgres, куда входит администратор
+- name: Статистика запросов (pg_stat_statements в базе postgres)
+  community.postgresql.postgresql_ext:
+    name: pg_stat_statements
+    login_db: postgres
+  become: true
+  become_user: postgres
+
+# ---------- Проект = пользователь + база с тем же именем ----------
+- name: Пользователи проектов (лимит подключений, таймаут запросов)
+  community.postgresql.postgresql_user:
+    name: "{{ item.key }}"
+    password: "{{ db_passwords[item.key] }}"
+    # LOGIN явно: проект, убранный и возвращённый в server.yml, снова может входить (см. ниже).
+    # Создавать базы проекту нельзя: тесты гоняют в CI или локально, не на сервере.
+    role_attr_flags: LOGIN,NOCREATEDB
+    comment: ansible-project      # метка: пользователь проекта, создан плейбуком
+    conn_limit: "{{ item.value.db_conn_limit | default(project_default_db_conn_limit) }}"
+    configuration:
+      statement_timeout: "{{ item.value.db_statement_timeout | default(project_default_db_statement_timeout) }}"
+  loop: "{{ db_projects }}"
+  loop_control:
+    label: "{{ item.key }}"
+  become: true
+  become_user: postgres
+  no_log: true
+
+- name: Базы проектов
+  community.postgresql.postgresql_db:
+    name: "{{ item.key }}"
+    owner: "{{ item.key }}"
+  loop: "{{ db_projects }}"
+  loop_control:
+    label: "{{ item.key }}"
+  become: true
+  become_user: postgres
+
+- name: Базы, которые уже есть
+  ansible.builtin.command: psql -tAc "SELECT datname FROM pg_database"
+  become: true
+  become_user: postgres
+  register: pg_existing_dbs
+  changed_when: false
+  check_mode: false
+
+# В --check базы нового проекта ещё нет (её создание только показано) — права на неё
+# не проверить, иначе --check --diff падал бы на каждом новом проекте
+- name: Запрет подключения к чужим базам (по умолчанию PUBLIC может подключаться к любой)
+  when: not ansible_check_mode or item.key in pg_existing_dbs.stdout_lines
+  community.postgresql.postgresql_privs:
+    login_db: postgres
+    type: database
+    objs: "{{ item.key }}"
+    privs: CONNECT
+    roles: PUBLIC
+    state: absent
+  loop: "{{ db_projects }}"
+  loop_control:
+    label: "{{ item.key }}"
+  become: true
+  become_user: postgres
+
+# ---------- Пользователи убранных проектов ----------
+# Проект убрали из server.yml — его пользователь больше не входит (NOLOGIN), даже с 127.0.0.1
+# через туннель. База и роль остаются: удаление данных — вручную (README, «Ограничения»).
+# Только роли с меткой ansible-project: созданные вручную пользователи не трогаются.
+- name: Пользователи проектов, которых больше нет в server.yml
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -tA
+      - -c
+      - >-
+        SELECT r.rolname FROM pg_roles r
+        JOIN pg_shdescription d ON d.objoid = r.oid AND d.classoid = 'pg_authid'::regclass
+        WHERE d.description = 'ansible-project' AND r.rolcanlogin
+  become: true
+  become_user: postgres
+  register: pg_project_roles
+  changed_when: false
+  check_mode: false
+
+- name: Вход пользователям убранных проектов закрыт (NOLOGIN)
+  community.postgresql.postgresql_user:
+    name: "{{ item }}"
+    role_attr_flags: NOLOGIN
+  loop: "{{ pg_project_roles.stdout_lines | difference(db_projects | map(attribute='key')) }}"
+  become: true
+  become_user: postgres
+
+# NOLOGIN (и строки pg_hba) не рвут уже открытые подключения: пул соединений в контейнере
+# убранного проекта работал бы с базой до перезапуска. Завершаются сессии всех ролей
+# с меткой ansible-project без LOGIN — в том числе закрытых прошлыми запусками.
+- name: Открытые подключения пользователей убранных проектов завершены
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -tA
+      - -c
+      - >-
+        SELECT count(pg_terminate_backend(a.pid)) FROM pg_stat_activity a
+        JOIN pg_roles r ON r.oid = a.usesysid
+        JOIN pg_shdescription d ON d.objoid = r.oid AND d.classoid = 'pg_authid'::regclass
+        WHERE d.description = 'ansible-project' AND NOT r.rolcanlogin
+  become: true
+  become_user: postgres
+  register: pg_terminated
+  changed_when: pg_terminated.stdout | default('0') | int > 0
+
+# ---------- pg_hba: кто откуда ----------
+# Свои строки администратора сервера — в pg_hba.d/*.conf: движок подключает папку, но её не трогает
+- name: Папка для своих строк pg_hba (pg_hba.d)
+  ansible.builtin.file:
+    path: "/etc/postgresql/{{ postgres_version }}/main/pg_hba.d"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+
+# Файл целиком из шаблона: строки удалённых проектов и IP не остаются.
+- name: pg_hba.conf
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: "/etc/postgresql/{{ postgres_version }}/main/pg_hba.conf"
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  notify: Reload postgresql
+
+# ---------- Администратор баз ----------
+# Только через SSH-туннель (127.0.0.1): порт 5432 снаружи закрыт.
+- name: Администратор Postgres (суперпользователь)
+  community.postgresql.postgresql_user:
+    name: "{{ admin_user }}"
+    password: "{{ postgres_admin_password }}"
+    role_attr_flags: SUPERUSER
+  become: true
+  become_user: postgres
+  no_log: true

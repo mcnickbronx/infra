@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Управляется Ansible.
+# Восстановление ОДНОГО проекта из restic: папки, volumes и базы.
+# Контейнеры проекта должны быть остановлены.
+# Использование:
+#   project-restore <имя> [env-файл] [снимок]
+# env-файл — настройки restic; чтобы восстановить с ДРУГОГО сервера,
+# укажите файл с его репозиторием и ключами (ADMIN.md, «Восстановление и перенос»).
+#
+# Папки проекта приводятся ТОЧНО к состоянию снимка: файлы, которых в снимке нет,
+# удаляются (например, подброшенные после взлома). Поэтому снимок сначала
+# распаковывается во временную папку, а затем синхронизируется rsync --delete
+# по каждому пути из снимка. restore --delete прямо в / не используется: с --target /
+# слишком легко удалить лишнее за пределами проекта.
+# На время восстановления нужно свободное место примерно размером с проект.
+#
+# Снимок с другого сервера (перенос, новый сервер): группа <проект>-dev там могла иметь
+# другой номер (gid), а restic хранит числа, а не имена. Номер заменяется здешним —
+# у владельцев файлов и в ACL, иначе файлы проекта достались бы чужой группе.
+set -Eeuo pipefail
+
+NAME=${1:?Использование: project-restore <имя> [env-файл] [снимок]}
+ENV_FILE=${2:-/etc/restic/env}
+SNAPSHOT=${3:-latest}
+LIST=/etc/restic/projects.json
+STAGE=""
+PGLIST=""
+
+# Временные файлы — прочь; неудача — в журнал событий сервера (/var/log/infra.log)
+finish() {
+  local rc=$?
+  [ -z "$STAGE" ] || rm -rf "$STAGE"
+  [ -z "$PGLIST" ] || rm -f "$PGLIST"
+  [ "$rc" = 0 ] || infra-log "восстановление $NAME: ошибка (код $rc), снимок $SNAPSHOT из $ENV_FILE"
+}
+trap finish EXIT
+
+set -a; source "$ENV_FILE"; set +a
+
+ITEM=$(jq -e --arg n "$NAME" '.[] | select(.name == $n)' "$LIST") || {
+  echo "Проект '$NAME' не описан на этом сервере (сначала опишите его в /etc/infra/server.yml: sudo infra apply)" >&2
+  exit 1; }
+
+# --- какой снимок и какие пути в нём сохранены
+# Снимки проекта, подходящие под SNAPSHOT, из них самый свежий: первая строка — его id, вторая —
+# время, дальше — сохранённые пути. latest — последний ПОЛНЫЙ снимок: снимки только базы (тег
+# db-only, backup_hourly: db) без номера не выбираются — на новом сервере такой принёс бы базу
+# без файлов проекта. С номером (id, полным или коротким) — любой снимок проекта; снимок только
+# базы восстанавливает только базу, папки проекта не трогает.
+mapfile -t SNAP < <(restic snapshots --json --tag "project:$NAME" | jq -r --arg want "$SNAPSHOT" '
+  [(. // [])[] | select(($want == "latest" and ((.tags // []) | any(. == "db-only") | not))
+                        or (.id | startswith($want)) or .short_id == $want)]
+  | sort_by(.time) | last // empty
+  | .id, .time, .paths[]')
+[ "${#SNAP[@]}" -ge 3 ] || { echo "Снимок '$SNAPSHOT' проекта $NAME не найден" >&2; exit 1; }
+SNAP_ID=${SNAP[0]}
+SNAP_TIME=${SNAP[1]}
+PATHS=("${SNAP[@]:2}")
+if [ "$SNAPSHOT" = latest ]; then
+  NEWER=$(restic snapshots --json --tag "project:$NAME,db-only" | jq -r --arg t "$SNAP_TIME" '
+    [(. // [])[] | select(.time > $t)] | sort_by(.time) | last // empty | "\(.short_id) от \(.time[0:16] | sub("T"; " "))"')
+  [ -z "$NEWER" ] || echo "Есть снимок только базы новее: $NEWER. Только базу из него: project-restore $NAME $ENV_FILE <id>"
+fi
+case " ${PATHS[*]} " in
+  *" /srv/projects/$NAME "*) ;;
+  *) echo "Снимок ${SNAP_ID:0:8} — только база: папки проекта не меняются" ;;
+esac
+
+# Пути из снимка должны относиться к этому проекту: папка проекта, его дампы, его volumes.
+# Защита от ошибки в снимке: rsync --delete по чужому пути был бы катастрофой.
+# (тома проекта называются <проект>_<ключ>, если у тома нет своего name: — правило из TEAM.md;
+#  том с другим именем остановит восстановление здесь, а не сотрёт чужое)
+for p in "${PATHS[@]}"; do
+  case $p in
+    ""|*/../*|*/..) echo "В снимке некорректный путь '$p' — восстановление остановлено" >&2; exit 1 ;;
+    "/srv/projects/$NAME"|"/var/backups/db/$NAME") ;;
+    /var/lib/docker/volumes/"${NAME}"_*|/var/lib/docker/*/volumes/"${NAME}"_*) ;;
+    *) echo "В снимке неожиданный путь $p — восстановление остановлено" >&2; exit 1 ;;
+  esac
+done
+
+STAGE=$(mktemp -d "/var/tmp/restore-$NAME.XXXXXX")   # 0700, только root
+
+infra-log "восстановление $NAME: начато, снимок ${SNAP_ID:0:8} из $ENV_FILE"
+echo "Распаковка снимка ${SNAP_ID:0:8} проекта $NAME"
+restic restore "$SNAP_ID" --target "$STAGE"
+
+# Папка проекта всегда принадлежит root:<проект>-dev — по ней узнаём gid группы в снимке.
+# Замена — во временной папке (её видит только root) и до синхронизации: подменить
+# файлы ссылками под руками некому.
+PROJECT_STAGE=$STAGE/srv/projects/$NAME
+if [ -d "$PROJECT_STAGE" ]; then
+  OLD_GID=$(stat -c %g "$PROJECT_STAGE")
+  NEW_GID=$(getent group "$NAME-dev" | cut -d: -f3)
+  [ -n "$NEW_GID" ] || { echo "Нет группы $NAME-dev — сначала прогоните site.yml" >&2; exit 1; }
+  if [ "$OLD_GID" != "$NEW_GID" ] && [ "$OLD_GID" != 0 ]; then
+    echo "Группа $NAME-dev: в снимке gid $OLD_GID, на этом сервере $NEW_GID — заменяю"
+    ( cd "$STAGE" && getfacl -R -n -P "srv/projects/$NAME" \
+        | sed -E "s/^(# group: )$OLD_GID\$/\1$NEW_GID/; s/^((default:)?group:)$OLD_GID:/\1$NEW_GID:/" \
+        | setfacl --restore=- )
+    find "$PROJECT_STAGE" -type l -gid "$OLD_GID" -exec chgrp -h "$NEW_GID" {} +   # ссылки getfacl пропускает
+  fi
+fi
+
+echo "Синхронизация папок проекта (лишние файлы удаляются)"
+for p in "${PATHS[@]}"; do
+  if [ ! -d "$STAGE$p" ]; then
+    echo "  в снимке нет $p — пропуск"
+    continue
+  fi
+  echo "  $p"
+  mkdir -p "$p"
+  # -A -X: ACL и xattr (web/ открыт группе проекта и контейнерам через ACL);
+  # --numeric-ids: uid/gid как в снимке (userns-remap — 100000+, у них нет имён).
+  rsync -aHAX --numeric-ids --delete "$STAGE$p/" "$p/"
+done
+
+DUMPS=/var/backups/db/$NAME
+if [ "$(jq -r '.db' <<<"$ITEM")" = postgres ]; then
+  f="$DUMPS/$NAME.pgdump"
+  [ -f "$f" ] || { echo "нет дампа $f" >&2; exit 1; }
+  # Содержимое базы восстанавливает роль проекта (--role), а не суперпользователь:
+  # функции и ограничения из дампа не выполняются с правами postgres. Но расширения
+  # (pg_trgm, uuid-ossp...) ставит суперпользователь, и роль проекта не может ни удалить
+  # их, ни создать недоверенные — pg_restore завершился бы ошибкой. Поэтому расширения —
+  # отдельно, от postgres, остальное — от роли проекта.
+  # База — точно как в снимке: сначала очистить целиком (project-db-empty), иначе таблицы,
+  # появившиеся после снимка (миграция, которую откатываем), остались бы. Расширения — после
+  # очистки: она удаляет их вместе с public
+  echo "очистка базы $NAME"
+  project-db-empty "$NAME"
+  EXT='^[0-9]+; [0-9]+ [0-9]+ (EXTENSION|COMMENT - EXTENSION) '
+  pg_restore -l "$f" > "$STAGE/toc"
+  grep -E "$EXT" "$STAGE/toc" > "$STAGE/toc-ext" || true
+  # Список объектов читает postgres: файл создаёт root и отдаёт ему (писать в чужой
+  # файл в /tmp root не может — fs.protected_regular)
+  PGLIST=$(mktemp)
+  grep -vE "$EXT" "$STAGE/toc" > "$PGLIST"
+  chown postgres "$PGLIST"
+  if [ -s "$STAGE/toc-ext" ]; then
+    echo "расширения: $(awk '{print $NF}' "$STAGE/toc-ext" | sort -u | xargs)"
+    pg_restore -L "$STAGE/toc-ext" -f - "$f" \
+      | runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 -d "$NAME"
+  fi
+  echo "pg_restore $NAME"
+  # --clean --if-exists: на пустой базе ничего не удаляет; база и роль проекта остаются
+  # читает root: папка дампов закрыта (0700), у postgres туда доступа нет
+  runuser -u postgres -- pg_restore --clean --if-exists --no-owner --role="$NAME" \
+    -L "$PGLIST" -d "$NAME" < "$f"
+fi
+
+infra-log "восстановление $NAME: готово, снимок ${SNAP_ID:0:8}"
+echo "Готово. Запустите контейнеры проекта."

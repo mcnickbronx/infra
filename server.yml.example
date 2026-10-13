@@ -1,0 +1,84 @@
+# Настройки сервера: /etc/infra/server.yml (только root). Его читает sudo infra apply.
+# Здесь — пример со всеми настройками; установщик кладёт его на новый сервер, вы правите.
+# Пароли — не здесь, а в /etc/infra/secrets.yml: их создаёт сам движок.
+#
+# На одном сервере — одна команда: кто в docker_users, тот администратор этого сервера
+# (видит все проекты, пароли баз, ключи бэкапа).
+
+# ---------- Сервер и администратор (обязательно) ----------
+server_name: vds-shop        # имя сервера: папка копий в S3, подписи в уведомлениях
+admin_keys: |                # ваши SSH-ключи, по ключу в строке; других ключей у admin не останется
+  ssh-ed25519 AAAA...замените... you@laptop
+admin_ips:                   # ваши IP: им открыт SSH и служебные панели (admin-only@file); можно подсети
+  - 203.0.113.10
+acme_email: you@example.org  # контакт Let's Encrypt; об истечении сертификатов следит health-check
+
+# ---------- Люди ----------
+# key — публичный SSH-ключ (несколько — `key: |` и по ключу в строке); ключа, которого здесь нет,
+# на сервере не останется. ips — адреса, с которых человеку открыт SSH/SFTP. Человек попадает
+# на сервер, только если он в devs хотя бы одного проекта; убрали отовсюду — аккаунт удалится.
+people:
+  ivan:
+    key: "ssh-ed25519 AAAA...замените... ivan@laptop"
+    ips: [198.51.100.23]
+  olga:
+    key: |
+      ssh-ed25519 AAAA...замените... olga@laptop
+      ssh-ed25519 AAAA...замените... olga@desktop
+    ips: [198.51.100.40, 198.51.100.41]
+  anna:
+    key: "ssh-ed25519 AAAA...замените... anna@laptop"
+    ips: [192.0.2.88]
+
+# Docker (это root на сервере). Только из devs проектов этого сервера.
+docker_users: [ivan, olga]
+
+# ---------- Проекты ----------
+# Проект — папка /srv/projects/<проект>/web (код и compose.yml), своя Docker-сеть, при
+# необходимости база в общем Postgres, участники. Имя — латиницей (a-z, 0-9, _): это и имя базы,
+# пользователя базы, compose-проекта. Обязателен только net; остальное — по необходимости,
+# по умолчанию — project_default_<ключ> движка (group_vars/all/main.yml).
+# Подключение к базе: адрес 172.20.<net>.1, порт 5432, база и пользователь — имя проекта,
+# пароль — db_password_<проект> в /etc/infra/secrets.yml. Его проект кладёт в свой .env.
+projects:
+  shop:
+    net: 11                       # номер сети 1..254, уникален на сервере, потом НЕ менять
+                                  #   (сеть proj-shop, 172.20.11.0/24; адрес базы — 172.20.11.1)
+    domains: [shop.example.com, www.shop.example.com]   # для справки; на сайт домен ведут
+                                  #   labels Traefik в compose проекта (TEAM.md)
+    db: postgres                  # база и пользователь «shop»; без строки — без базы
+    db_conn_limit: 100            # подключений к базе
+    db_statement_timeout: 120s    # предел времени запроса ("0" — без предела)
+    memory: 4g                    # память на весь проект
+    cpus: 2                       # CPU на весь проект
+    # autodeploy: true            # автовыкладка: сервер сам забирает новый образ из ghcr.io. Включать,
+                                  #   когда в .env проекта есть DEPLOY_IMAGE; участники — только из
+                                  #   docker_users; ghcr_user и ghcr_token — в secrets.yml (ADMIN.md)
+    # backup_hourly: db            # частые снимки, сразу в S3 (ночные — как у всех): db — только база,
+                                  #   all — база и папки проекта (media и т.п.), как ночной снимок
+    # backup_every: 15            # как часто, минут: 1, 5, 15, 30 или 60 (по умолчанию 60 — в :05)
+    devs: [ivan, olga, anna]      # участники: SSH/SFTP, файлы проекта
+
+  blog:
+    net: 12                       # без базы: статика или сайт без своих данных
+    devs: [olga]
+
+# ---------- По желанию ----------
+# Копия бэкапов в S3 (README, «Бэкапы»); ключи — s3_access_key и s3_secret_key в secrets.yml
+# restic_s3_repository_base: "s3:https://s3.example.org/my-bucket"
+
+# Уведомления — в Telegram: бот, чат и прокси — в secrets.yml (ADMIN.md, «Уведомления»).
+# Пороги и время сводки — умолчания движка, свои — так:
+# disk_alert_percent: 80        # диск заполнен (с backup_disk_stop_percent: 90 — «КРИТИЧНО»)
+# memory_alert_percent: 10      # свободной памяти меньше
+# notify_summary_time: "09:00"  # утренняя сводка: всё в порядке или проблемы
+# Вдобавок — пинг своего healthchecks (облачный не принимает российские IP):
+# backup_healthcheck_url: "https://hc.example.org/ping/..."
+# monitor_healthcheck_url: "https://hc.example.org/ping/..."
+
+# Ссылка доступа — SSH с меняющегося IP на сутки (ADMIN.md, «Ссылка доступа»); включена по умолчанию:
+# access_link: false              # выключить
+# access_link_host: access.example.ru   # свой адрес вместо <IP>.sslip.io (A-запись на сервер)
+# access_link_hours: 24           # на сколько открывать, 1..72
+# Любое умолчание движка можно поменять здесь — например, лимиты запросов Traefik:
+# traefik_ratelimit_average: 300

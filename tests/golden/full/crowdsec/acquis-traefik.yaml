@@ -1,0 +1,5 @@
+# Управляется Ansible
+filenames:
+  - /srv/infra/traefik/logs/access.log
+labels:
+  type: traefik

@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+# infra — «панель» сервера: приводит сервер к его описанию /etc/infra/server.yml.
+#   sudo infra                              меню: всё, что ниже, и проекты — стрелками (infra-menu)
+#   sudo infra init                         новый сервер: server.yml по четырём вопросам
+#   sudo infra edit [secrets]               правка server.yml (secrets — secrets.yml: ключи S3, ghcr,
+#                                          Telegram): проверка, что изменится, «Применить?»
+#   sudo infra status                       сервер одним экраном: проекты, бэкап, проблемы
+#   sudo infra apply [--check] [-y] [...]   показать, что изменится, и после подтверждения применить
+#                                          (--check — только показать, -y — применить без вопроса)
+#   sudo infra update [--check] [-y]        обновления: Docker, Postgres, Traefik, пакеты, перезагрузка
+#   sudo infra upgrade <версия> [...]       движок другой версии (git-тег), затем apply
+#   sudo infra run <плейбук> [...]          плейбук движка как есть — для проверок (tests/verify.yml)
+# Остальные параметры уходят ansible-playbook: --tags base,users, -e skip_lockout_check=true.
+# Движок — папка этого скрипта (/opt/infra), его Ansible — .venv в ней; настройки и пароли —
+# /etc/infra. Прогон с изменениями идёт службой infra-apply: обрыв SSH его не прерывает.
+# Что и кем применено — в журнале событий /var/log/infra.log (diff настроек, имена новых паролей).
+set -euo pipefail
+
+ENGINE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+CONF=/etc/infra
+STATE=/var/lib/infra          # копия server.yml последнего полного apply, отпечатки паролей
+OUTPUT=$STATE/last-run.log    # вывод последнего прогона службой (он же — в journalctl -u infra-apply)
+PLAYBOOK=$ENGINE/.venv/bin/ansible-playbook
+UNIT=infra-apply
+
+CLEANUP=()                    # временные файлы — удаляются при выходе
+trap 'rm -f "${CLEANUP[@]}"' EXIT
+
+die() { echo "infra: $*" >&2; exit 1; }
+
+usage() { sed -n '2,15s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+
+# ---------- Окружение ----------
+check_setup() {
+  [ "$(id -u)" = 0 ] || die "нужен root: sudo infra $*"
+  [ -x "$PLAYBOOK" ] || die "нет Ansible в $ENGINE/.venv — запустите $ENGINE/install.sh"
+  [ -f "$CONF/server.yml" ] || die "нет $CONF/server.yml — новый сервер: sudo infra init"
+  [ -f "$CONF/secrets.yml" ] || die "нет $CONF/secrets.yml — запустите $ENGINE/install.sh"
+  SERVER=$(server_name)
+  [ -n "$SERVER" ] || die "в $CONF/server.yml нет server_name (строчные латинские буквы, цифры и -)"
+  CLIENT_IP=$(client_ip)
+  WHO="${SUDO_USER:-root}@${CLIENT_IP:-?}"
+}
+
+server_name() { sed -nE "s/^server_name:[[:space:]]*[\"']?([a-z0-9-]+).*/\1/p" "$CONF/server.yml" | head -1; }
+
+# С каких IP вы подключены по SSH — для защиты от блокировки себя файрволом (роль base):
+#   IP сессии, чьё соединение держит процесс-предок (sshd);
+#   такого предка нет (tmux, screen: их сервер — потомок systemd) — IP всех SSH-сессий
+#   пользователя sudo через запятую, проверяются все;
+#   предок — login (консоль хостера) — «консоль»: файрвол её не закроет.
+# Иначе пусто: откуда запуск, неизвестно — apply остановится, пока не дадут skip_lockout_check
+client_ip() {
+  local pid=$$ peers line uid
+  peers=$(ss -tnpH state established '( sport = :22 )' 2>/dev/null) || return 0
+  while [ "${pid:-1}" -gt 1 ]; do
+    if line=$(grep -m1 "pid=$pid," <<<"$peers"); then
+      peer_ip <<<"$line"
+      return 0
+    fi
+    [ "$(ps -o comm= -p "$pid")" != login ] || { echo консоль; return 0; }
+    pid=$(ps -o ppid= -p "$pid" | tr -d ' ') || break
+  done
+  [ -n "${SUDO_USER:-}" ] && uid=$(id -u "$SUDO_USER" 2>/dev/null) || return 0
+  while read -r line; do
+    for pid in $(grep -oE 'pid=[0-9]+' <<<"$line" | cut -d= -f2); do
+      if [ "$(ps -o uid= -p "$pid" | tr -d ' ')" = "$uid" ]; then
+        peer_ip <<<"$line"
+        break
+      fi
+    done
+  done <<<"$peers" | sort -u | paste -sd, -
+}
+
+# Адрес собеседника из строки ss: без порта, скобок IPv6 и префикса ::ffff:
+peer_ip() { awk '{print $4}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff://'; }
+
+# ---------- Вопросы ----------
+# ask "Вопрос" [по умолчанию] — ответ в REPLY; Enter — значение по умолчанию
+ask() {
+  read -r -p "$1${2:+ [$2]}: " REPLY || die "нет ответа — прервано"
+  REPLY=${REPLY:-${2:-}}
+}
+# confirm — «да» только явное (y, д); agree — «да» по умолчанию (Enter). Без терминала — «нет»
+confirm() { local a; read -r -p "$1 [y/N] " a || a=""; [[ $a =~ ^[yYдД] ]]; }
+agree() { local a; read -r -p "$1 [Y/n] " a || a=n; [[ ! $a =~ ^[nNнН] ]]; }
+
+# ---------- Файлы настроек ----------
+# Ошибка YAML текстом (с номером строки); пусто — файл в порядке. Ключ, повторённый дважды, —
+# тоже ошибка: YAML молча оставил бы второй — второй projects: стёр бы проекты из первого.
+# yaml_error <файл> <имя для сообщений> — в сообщении имя, а не путь временной копии
+yaml_error() {
+  "$ENGINE/.venv/bin/python" - "$1" "$2" 2>&1 <<'PY'
+import sys
+import yaml
+
+
+class Loader(yaml.SafeLoader):
+    pass
+
+
+def mapping(loader, node, deep=False):
+    seen = {}
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node, deep=True)
+        line = key_node.start_mark.line + 1
+        if key in seen:
+            raise yaml.YAMLError(f"«{key}» дважды: строки {seen[key]} и {line} — второй заменил бы первый")
+        seen[key] = line
+    return loader.construct_mapping(node, deep)
+
+
+Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = yaml.load(f, Loader=Loader)
+except Exception as e:  # YAML, кодировка, ключ-список — всё одинаково «файл не читается»
+    sys.exit(str(e).replace(f'"{sys.argv[1]}"', sys.argv[2]))
+if not isinstance(data, dict):
+    sys.exit("нужны настройки вида «ключ: значение»")
+PY
+}
+
+# У ключа в файле настроек непустое значение: filled <файл> <ключ> (пустые заготовки "" — нет)
+filled() {
+  local value
+  value=$(sed -nE "s/^$2:[[:space:]]*(.*)$/\1/p" "$1" | head -1)
+  case $value in ''|'""'*|"''"*|'#'*) return 1 ;; esac
+}
+
+# ---------- Журнал событий ----------
+# Скрипт — из движка: на новом сервере /usr/local/sbin/infra-log ставит только первый apply
+log() { INFRA_WHO=$WHO "$ENGINE/roles/base/files/infra-log" "$@"; }
+
+# Отпечатки паролей: имя и начало sha256 значения — в журнал попадает, какие пароли появились
+# или сменились, но не сами пароли. Пустые заготовки ("") — как будто строки нет
+secret_sums() {
+  sed -nE 's/^([A-Za-z0-9_]+):[[:space:]]*(.*)$/\1 \2/p' "${1:-$CONF/secrets.yml}" | while read -r key value; do
+    case $value in ''|'""'*|"''"*|'#'*) continue ;; esac
+    printf '%s %s\n' "$key" "$(printf '%s' "$value" | sha256sum | cut -c1-16)"
+  done | sort
+}
+
+# Что поменяли в server.yml с прошлого полного apply — diff в журнал
+log_settings_change() {
+  if [ ! -f "$STATE/server.yml" ]; then
+    log "настройки (server.yml): первый apply"
+  elif ! diff -q "$STATE/server.yml" "$CONF/server.yml" >/dev/null; then
+    log "настройки (server.yml) изменены с прошлого полного apply:"
+    { diff -u --label было --label стало "$STATE/server.yml" "$CONF/server.yml" || true; } | tail -n +3 | log -   # код diff — 1
+  fi
+}
+
+# Чем различаются два набора отпечатков: строки «появились …», «сменились …», «удалены …» (имена)
+sums_diff() {
+  local added changed removed
+  added=$(join -v2 <(echo "$1") <(echo "$2") | cut -d' ' -f1 | xargs)
+  removed=$(join -v1 <(echo "$1") <(echo "$2") | cut -d' ' -f1 | xargs)
+  changed=$(join <(echo "$1") <(echo "$2") | awk '$2 != $3 { print $1 }' | xargs)
+  [ -z "$added" ] || echo "появились $added"
+  [ -z "$changed" ] || echo "сменились $changed"
+  [ -z "$removed" ] || echo "удалены $removed"
+}
+
+# Какие пароли появились, сменились или удалены (вписаны руками или созданы движком)
+log_secrets_change() {
+  local old new line
+  new=$(secret_sums)
+  if [ ! -f "$STATE/secrets.sums" ]; then
+    log "пароли (secrets.yml): первый apply, есть $(cut -d' ' -f1 <<<"$new" | xargs)"
+    (umask 077; echo "$new" > "$STATE/secrets.sums")
+    return 0
+  fi
+  old=$(cat "$STATE/secrets.sums")
+  while read -r line; do
+    [ -z "$line" ] || log "пароли (secrets.yml): $line"
+  done < <(sums_diff "$old" "$new")
+  (umask 077; echo "$new" > "$STATE/secrets.sums")
+}
+
+# Частичный прогон: применена не вся server.yml
+partial() {
+  local a
+  for a in "$@"; do
+    case $a in
+      -t|--tags|--tags=*|--skip-tags|--skip-tags=*|--start-at-task|--start-at-task=*|--step) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Пароль бэкапов создан этим прогоном (до него строки не было) — главное, что нельзя потерять:
+# без него при потере сервера бэкапы не открыть. Напоминание — последним в выводе, чтобы
+# не потерялось среди задач, и строкой в журнал событий
+remind_restic_password() {
+  local had=$1
+  [ "$had" = 0 ] && grep -q '^restic_password:[[:space:]]*[^[:space:]]' "$CONF/secrets.yml" || return 0
+  log "пароль бэкапов (restic_password) создан — сохранить в менеджере паролей"
+  cat <<REMIND | tee -a "$OUTPUT"
+
+!!! Создан пароль бэкапов: restic_password в $CONF/secrets.yml.
+!!! Сохраните его в менеджере паролей сейчас: без него при потере сервера бэкапы
+!!! (на сервере, в S3 и у вас) не открыть. Забрать к себе, не выводя в консоль:
+!!!   ssh <сервер> sudo cat $CONF/secrets.yml > ~/infra-access/$SERVER.yml
+REMIND
+}
+
+# ---------- Запуск Ansible ----------
+# Как есть, в этом терминале: предпросмотр и проверки
+play() {
+  cd "$ENGINE"
+  ANSIBLE_CONFIG=$ENGINE/ansible.cfg "$PLAYBOOK" -i "$SERVER," -c local -e "infra_client_ip=$CLIENT_IP" "$@"
+}
+
+# Прогон с изменениями — службой systemd: обрыв SSH или Ctrl+C её не прервут. Служба запускает
+# этот же скрипт (run_unit ниже), он и пишет итог в журнал событий — так итог не теряется вместе
+# с SSH. Её вывод — в $OUTPUT, отсюда он показывается. Вторая такая служба не запустится —
+# два прогона сразу не идут.
+apply_in_background() {
+  local rc=0 runner
+  systemctl is-active -q "$UNIT" && die "уже идёт другой прогон: journalctl -fu $UNIT"
+  install -d -m 0700 "$STATE"
+  install -m 0600 /dev/null "$OUTPUT"
+  echo "== Применяю на $SERVER (служба $UNIT: обрыв SSH её не прервёт; журнал — journalctl -u $UNIT)"
+  systemd-run --quiet --wait --collect --unit="$UNIT" --working-directory="$ENGINE" \
+    -E HOME=/root -E PYTHONUNBUFFERED=1 -E INFRA_WHO="$WHO" -E INFRA_CLIENT_IP="$CLIENT_IP" \
+    "$ENGINE/infra" run-unit "$@" &
+  runner=$!
+  trap 'echo; echo "infra: прогон продолжается службой — journalctl -fu $UNIT"; exit 130' INT
+  follow "$runner" "$OUTPUT"
+  wait "$runner" || rc=$?
+  trap - INT
+  return "$rc"
+}
+
+# Показывает файл по мере записи, пока жив процесс, и остаток после — ничего не теряется
+follow() {
+  local pid=$1 file=$2 shown=0 size last=""
+  while [ -z "$last" ]; do
+    kill -0 "$pid" 2>/dev/null || last=1     # до чтения: процесса нет — файл уже дописан
+    size=$(stat -c %s "$file")
+    if [ "$size" -gt "$shown" ]; then
+      tail -c +$((shown + 1)) "$file" | head -c $((size - shown)) || true   # tail — SIGPIPE от head
+      shown=$size
+    fi
+    [ -n "$last" ] || sleep 0.5
+  done
+}
+
+# Внутри службы: прогон, его вывод — в $OUTPUT и журнал службы, итог — в журнал событий.
+# Копия server.yml «как применено» — только после удачного полного прогона (без --tags)
+run_unit() {
+  local playbook=$1 what=update rc changed since full=1 had_restic; shift
+  WHO=${INFRA_WHO:-root@?} CLIENT_IP=${INFRA_CLIENT_IP:-}
+  had_restic=$(grep -c '^restic_password:[[:space:]]*[^[:space:]]' "$CONF/secrets.yml" || true)
+  if partial "$@"; then full=""; fi
+  if [ "$playbook" = site.yml ]; then
+    what=apply
+    [ -z "$full" ] || log_settings_change
+  fi
+  since=$(date '+%F %T')
+  log "$what: начат${*:+ ($*)}"
+  set +e
+  play "$playbook" "$@" 2>&1 | tee -a "$OUTPUT"
+  rc=${PIPESTATUS[0]}
+  set -e
+  changed=$(sed -nE 's/.*changed=([0-9]+).*/\1/p' "$OUTPUT" | tail -1)
+  if [ "$rc" = 0 ]; then
+    log "$what: готово, изменений ${changed:-?}"
+  else
+    log "$what: ошибка (код $rc) — journalctl -u $UNIT --since '$since'"
+  fi
+  if [ "$playbook" = site.yml ]; then
+    log_secrets_change
+    remind_restic_password "$had_restic"
+    if [ "$rc" = 0 ] && [ -n "$full" ]; then
+      install -m 0600 "$CONF/server.yml" "$STATE/server.yml"
+    fi
+  fi
+  return "$rc"
+}
+
+# Предпросмотр (--check --diff), вопрос, затем прогон. У site.yml видно только то, что изменится
+# (задач больше сотни), у update.yml — всё: он короткий, и в нём список обновлений.
+# STAGE — на каком шаге остановились (preview, ask, apply): по нему infra edit решает, что предложить
+preview_and_apply() {
+  local playbook=$1 check=$2 yes=$3; shift 3
+  local changed show_ok=false preview
+  [ "$playbook" = site.yml ] || show_ok=true
+  if [ -z "$yes" ]; then
+    STAGE=preview
+    echo "== Что изменится на $SERVER (ничего не меняя)"
+    preview=$(mktemp)
+    CLEANUP+=("$preview")
+    if ! ANSIBLE_DISPLAY_OK_HOSTS=$show_ok ANSIBLE_DISPLAY_SKIPPED_HOSTS=false \
+        play "$playbook" --check --diff "$@" | tee "$preview"; then
+      echo "infra: проверка не прошла — сервер не изменён. На новом сервере предпросмотр может споткнуться
+о ещё не поставленных пакетах (Docker, Postgres) — тогда первый раз: sudo infra apply -y" >&2
+      return 1
+    fi
+    [ -z "$check" ] || return 0
+    changed=$(sed -nE 's/.*changed=([0-9]+).*/\1/p' "$preview" | tail -1)
+    if [ "${changed:-0}" = 0 ]; then
+      echo "Изменений нет — применять нечего"
+      return 0
+    fi
+    STAGE=ask
+    confirm "Применить эти изменения на $SERVER?" || { echo "Отменено, сервер не изменён"; return 1; }
+  fi
+  STAGE=apply
+  apply_in_background "$playbook" "$@"
+}
+
+# Флаги команды: --check, -y; остальное — ansible-playbook
+parse() {
+  CHECK="" YES="" ARGS=()
+  for a in "$@"; do
+    case $a in
+      --check) CHECK=1 ;;
+      -y|--yes) YES=1 ;;
+      *) ARGS+=("$a") ;;
+    esac
+  done
+  [ -z "$CHECK" ] || YES=""      # --check — только показать, даже с -y
+}
+
+# ---------- Команды ----------
+cmd_apply() { parse "$@"; preview_and_apply site.yml "$CHECK" "$YES" "${ARGS[@]}"; }
+cmd_update() { parse "$@"; preview_and_apply update.yml "$CHECK" "$YES" "${ARGS[@]}"; }
+# Плейбук как есть (проверки, сценарии на тестовом сервере) — тоже в журнал: сценарии меняют данные
+cmd_run() {
+  [ $# -gt 0 ] || usage 1
+  local rc=0
+  log "run: $*"
+  play "$@" || rc=$?
+  if [ "$rc" = 0 ]; then log "run $1: готово"; else log "run $1: ошибка (код $rc)"; fi
+  return "$rc"
+}
+
+# Ручные правки кода прямо в /opt/infra не пропадают молча: с ними upgrade отказывает
+cmd_upgrade() {
+  local version=${1:?Использование: infra upgrade <версия> [параметры apply...]}
+  shift
+  [ -d "$ENGINE/.git" ] || die "$ENGINE — не git-репозиторий (движок ставили копией): обновите его копией"
+  if [ -n "$(git -C "$ENGINE" status --porcelain --untracked-files=no)" ]; then
+    die "в $ENGINE есть ручные правки (git -C $ENGINE status) — перенесите их в ветку движка или отмените"
+  fi
+  local before
+  before=$(git -C "$ENGINE" describe --tags --always)
+  git -C "$ENGINE" fetch --quiet --tags origin
+  git -C "$ENGINE" -c advice.detachedHead=false checkout --quiet "$version"
+  "$ENGINE/install.sh"            # Ansible и коллекции — тех версий, что в новом движке
+  log "upgrade: движок $before → $(git -C "$ENGINE" describe --tags --always)"
+  echo "== Движок: $(git -C "$ENGINE" describe --tags --always)"
+  cmd_apply "$@"
+}
+
+# ---------- Новый сервер ----------
+KEY_RE='(ssh-(ed25519|rsa)|ecdsa-sha2-nistp[0-9]+|sk-[^ ]+) [A-Za-z0-9+/]{40,}={0,3}( .*)?$'
+
+# Ключи, с которыми заходят сейчас: authorized_keys root и того, кто зашёл через sudo (их кладёт
+# хостер при заказе VDS). Только сам ключ — без опций в начале строки (command="..." и т.п.)
+found_keys() {
+  local home
+  home=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)
+  cat /root/.ssh/authorized_keys "$home/.ssh/authorized_keys" 2>/dev/null | grep -oE "$KEY_RE" | sort -u || true
+}
+
+# Какие из адресов — не IP и не подсеть (пусто — все годятся)
+bad_ips() {
+  "$ENGINE/.venv/bin/python" - "$@" <<'PY'
+import ipaddress
+import sys
+
+for a in sys.argv[1:]:
+    try:
+        ipaddress.ip_network(a, strict=False)
+    except ValueError:
+        print(a)
+PY
+}
+
+# Короткий server.yml по четырём вопросам — проекты и люди потом, sudo infra edit. Свой IP и ключ
+# чаще всего вписывают с ошибкой и закрывают себе вход, поэтому они берутся из этой SSH-сессии
+# и authorized_keys — их остаётся подтвердить
+cmd_init() {
+  local name email keys line ips detected bad admin new err ip
+  local email_re='^[^@[:space:]"\\]+@[^@[:space:]"\\]+\.[A-Za-z]{2,}$'
+  [ "$(id -u)" = 0 ] || die "нужен root: sudo infra init"
+  [ -x "$ENGINE/.venv/bin/python" ] || die "нет $ENGINE/.venv — сначала $ENGINE/install.sh"
+  if [ -f "$CONF/server.yml" ] && ! cmp -s "$CONF/server.yml" "$ENGINE/server.yml.example"; then
+    die "$CONF/server.yml уже есть — правка: sudo infra edit"
+  fi
+  echo "== Новый сервер: четыре вопроса. Проекты и людей добавите потом — sudo infra edit"
+
+  name=$(hostname -s | tr '[:upper:]' '[:lower:]' | tr '_.' '--' | tr -cd 'a-z0-9-')
+  while :; do
+    ask "1. Имя сервера — в уведомлениях и папке бэкапов" "$name"; name=$REPLY
+    [[ $name =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] && break
+    echo "   только строчные латинские буквы, цифры и -"; name=""
+  done
+
+  while :; do
+    ask "2. Email для Let's Encrypt — туда пишут, если сертификат не продлевается"; email=$REPLY
+    [[ $email =~ $email_re && ! $email =~ @example\. ]] && break
+    echo "   нужен настоящий адрес"
+  done
+
+  keys=$(found_keys)
+  if [ -n "$keys" ]; then
+    echo "3. SSH-ключи, с которыми на сервер заходят сейчас:"
+    ssh-keygen -lf /dev/stdin <<<"$keys" 2>/dev/null | sed 's/^/   /' || cut -c1-70 <<<"$keys" | sed 's/^/   /'
+    agree "   Входить с ними администратору?" || keys=""
+  fi
+  if [ -z "$keys" ]; then
+    echo "3. Ваш открытый SSH-ключ — строка «ssh-ed25519 AAAA... имя» (на компьютере: cat ~/.ssh/id_ed25519.pub)."
+    echo "   Несколько — по строке, в конце пустая строка:"
+    while read -r line && [ -n "$line" ]; do
+      if [[ $line =~ ^$KEY_RE ]]; then keys+="$line"$'\n'; else echo "   не открытый ключ — пропущено"; fi
+    done
+    keys=${keys%$'\n'}
+    [ -n "$keys" ] || die "без ключа администратор не войдёт на сервер — прервано, ничего не записано"
+  fi
+
+  detected=$(client_ip)
+  [ "$detected" != консоль ] || detected=""
+  echo "4. IP, с которых вам открыт SSH, — остальным он закрыт. Домашний IP часто меняется:"
+  echo "   тогда впишите подсеть провайдера (203.0.113.0/24) или несколько адресов через пробел."
+  while :; do
+    ask "   Ваши IP" "${detected//,/ }"; ips=$REPLY
+    # shellcheck disable=SC2086  # адреса через пробел — по одному
+    [ -n "$ips" ] && bad=$(bad_ips $ips) && [ -z "$bad" ] && break
+    echo "   нужны IP или подсети${bad:+, а это не они: $(xargs <<<"$bad")}"; bad=""
+  done
+
+  admin=$(sed -nE 's/^admin_user:[[:space:]]*([a-z_][a-z0-9_-]*).*/\1/p' "$ENGINE/group_vars/all/main.yml")
+  install -d -m 0700 "$CONF"
+  new=$(mktemp "$CONF/server.yml.XXXXXX")
+  CLEANUP+=("$new")
+  {
+    echo "# Настройки сервера — создал sudo infra init $(date +%F). Правка — sudo infra edit,"
+    echo "# все настройки с пояснениями — $ENGINE/server.yml.example"
+    echo "server_name: $name"
+    echo "admin_keys: |                # SSH-ключи администратора ($admin), по ключу в строке"
+    sed 's/^/  /' <<<"$keys"
+    echo "admin_ips:                   # с этих IP открыт SSH; можно подсети"
+    for ip in $ips; do echo "  - \"$ip\""; done
+    echo "acme_email: \"$email\""
+    echo
+    echo "# Люди и проекты — блоки из примера $ENGINE/server.yml.example"
+    echo "people: {}"
+    echo "docker_users: []"
+    echo "projects: {}"
+  } > "$new"
+  err=$(yaml_error "$new" server.yml) || die "не получился server.yml: $err"
+  mv "$new" "$CONF/server.yml"
+  [ -f "$CONF/secrets.yml" ] || install -m 0600 "$ENGINE/secrets.yml.example" "$CONF/secrets.yml"
+  check_setup init
+  log "init: создан server.yml"
+
+  echo
+  echo "Записано: $CONF/server.yml. Первый apply закроет SSH для всех, кроме ваших IP, и заведёт"
+  echo "аккаунт $admin с вашими ключами; root по SSH больше не пустит (эта сессия останется)."
+  echo "Дальше вход: ssh $admin@$(hostname -I | awk '{print $1}')"
+  if confirm "Настроить сервер сейчас?"; then
+    cmd_apply -y
+  else
+    echo "Когда будете готовы: sudo infra apply -y (первый раз — без предпросмотра: на пустом сервере"
+    echo "он спотыкается о ещё не поставленные Docker и Postgres)"
+  fi
+}
+
+# ---------- Правка настроек ----------
+# Как visudo: правка в копии; сохранили — проверка YAML, что поменялось, предпросмотр
+# и «Применить?». Проверка не прошла или не стали применять — поправить снова, вернуть как было
+# или оставить (применит следующий apply). Редактор — editor (nano; другой — sudo update-alternatives
+# --config editor) или SUDO_EDITOR.
+# infra edit secrets — то же для secrets.yml (ключи S3, ghcr, Telegram), но что поменялось — только
+# имена ключей: значения — пароли, им не место на экране и в журнале событий
+cmd_edit() {
+  local editor=${SUDO_EDITOR:-${VISUAL:-${EDITOR:-editor}}} file cmd before tmp err rc a
+  case ${1:-} in
+    '') file=server.yml cmd="sudo infra edit" ;;
+    secrets) file=secrets.yml cmd="sudo infra edit secrets" ;;
+    *) die "что править: sudo infra edit (server.yml) или sudo infra edit secrets (secrets.yml)" ;;
+  esac
+  install -d -m 0700 "$STATE"
+  exec 8>"$STATE/edit.lock"
+  flock -n 8 || die "настройки сейчас правит кто-то другой (sudo infra edit)"
+  before=$(mktemp "$STATE/$file.before.XXXXXX")
+  tmp=$(mktemp --suffix=.yml "$STATE/${file%.yml}.XXXXXX")
+  CLEANUP+=("$before" "$tmp")
+  cp "$CONF/$file" "$before"
+  cp "$CONF/$file" "$tmp"
+  while :; do
+    # shellcheck disable=SC2086  # редактор с параметрами: SUDO_EDITOR="code --wait"
+    $editor "$tmp" || die "редактор ($editor) завершился с ошибкой"
+    if cmp -s "$tmp" "$before"; then
+      install -m 0600 "$before" "$CONF/$file"     # «поправить снова» и вернули всё как было
+      echo "Без изменений"
+      return 0
+    fi
+    if ! err=$(yaml_error "$tmp" "$file"); then
+      echo "Ошибка в $file — не сохранён:"
+      sed 's/^/  /' <<<"$err"
+      agree "Поправить?" && continue
+      install -m 0600 "$before" "$CONF/$file"
+      echo "Правка отменена, $file — как до неё"
+      return 1
+    fi
+    echo "== Что поменялось в $file"
+    changes "$file" "$before" "$tmp"
+    install -m 0600 "$tmp" "$CONF/$file"
+    log "edit: $file изменён"
+    changes "$file" "$before" "$tmp" | log -
+    SERVER=$(server_name)
+    rc=0 STAGE=""
+    if [ -z "$SERVER" ]; then
+      echo "infra: нет server_name (строчные латинские буквы, цифры и -)" >&2
+      rc=1 STAGE=preview
+    else
+      preview_and_apply site.yml "" "" || rc=$?
+    fi
+    [ "$rc" != 0 ] || return 0
+    if [ "$STAGE" = apply ]; then
+      echo "$file уже новый, прогон — с ошибкой (причина выше). Поправить — $cmd"
+      return "$rc"
+    fi
+    while :; do
+      read -r -p "e — поправить, r — вернуть $file как был, k — оставить (применит sudo infra apply) [e]: " a || a=k
+      case ${a:-e} in
+        [eEуУ]*) cp "$CONF/$file" "$tmp"; continue 2 ;;
+        [rRкК]*)
+          install -m 0600 "$before" "$CONF/$file"
+          log "edit: $file возвращён как был"
+          echo "$file — как до правки"
+          return 1 ;;
+        [kKлЛ]*) echo "$file сохранён, не применён: sudo infra apply"; return 1 ;;
+      esac
+    done
+  done
+}
+
+# Что поменялось: у server.yml — diff, у secrets.yml — только имена ключей (значения — пароли)
+changes() {
+  local keys
+  if [ "$1" = secrets.yml ]; then
+    keys=$(sums_diff "$(secret_sums "$2")" "$(secret_sums "$3")")
+    echo "${keys:-ключи и значения те же — изменились комментарии или оформление}"
+  else
+    { diff -u --label было --label стало "$2" "$3" || true; } | tail -n +3     # код diff — 1
+  fi
+}
+
+# ---------- Состояние сервера ----------
+# Последнее событие из журнала (этого и прошлого месяца): last_event 'бэкап: '
+last_event() {
+  cat /var/log/infra.log.1 /var/log/infra.log 2>/dev/null | grep -E "^[0-9-]+ [0-9:]+ [^ ]+ $1" | tail -1 || true
+}
+# Строка журнала для людей: «2026-10-07 14:02 — готово, изменений 0 (nick@203.0.113.10)»
+event_text() {
+  awk '{ t = $1 " " substr($2, 1, 5); who = $3; $1 = $2 = $3 = ""; sub(/^ +[^:]*: /, "")
+         print t " — " $0 (who == "система" ? "" : " (" who ")") }' <<<"$1"
+}
+
+# Сервер одним экраном: версия, применены ли настройки, бэкап, уведомления, проекты (контейнеры,
+# сайты, автовыкладка) и что сейчас видит health-check. Только читает
+cmd_status() {
+  local line mem p up total hosts deploy containers problems hourly d=/var/lib/project-deploy
+  mem=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%.1f из %.1f ГБ", a / 1048576, t / 1048576 }' /proc/meminfo)
+  echo "== $SERVER · движок $(git -C "$ENGINE" describe --tags --always 2>/dev/null || echo 'копия, не git')" \
+       "· $(. /etc/os-release && echo "$PRETTY_NAME") · включён с $(uptime -s | cut -c1-16)"
+  echo "Нагрузка $(cut -d' ' -f3 /proc/loadavg) при $(nproc) CPU · свободно памяти $mem" \
+       "· диск / занят на $(df --output=pcent / | tail -1 | tr -d ' ')"
+  echo
+
+  line=$(last_event 'apply: (готово|ошибка)')
+  if [ -n "$line" ]; then echo "Последний apply: $(event_text "$line")"; else echo "Последний apply: не было — sudo infra apply"; fi
+  if [ -f "$STATE/server.yml" ] && ! cmp -s "$STATE/server.yml" "$CONF/server.yml"; then
+    echo "server.yml изменён после последнего полного apply — что изменится: sudo infra apply --check"
+  fi
+  line=$(last_event 'бэкап: ')
+  if [ -n "$line" ]; then line=$(event_text "$line"); else line="ещё не было (ночью, около 03:00)"; fi
+  if filled "$CONF/server.yml" restic_s3_repository_base; then line+=", копия в S3"; else line+=", без копии в S3"; fi
+  echo "Бэкап: $line"
+  hourly=$(jq -r '[.[] | select(.hourly) | .name + (if .hourly == "db" then " — база" else " — база и файлы" end)
+                    + ", каждые \(.every // 60) мин"] | join("; ")' /etc/restic/projects.json 2>/dev/null || true)
+  if [ -n "$hourly" ]; then
+    if [ -s /var/lib/backup-hourly/failed ]; then line="ошибка $(cat /var/lib/backup-hourly/failed) — journalctl -u backup-hourly"
+    elif [ -f /var/lib/backup-hourly/last-ok ]; then line="последний $(date -r /var/lib/backup-hourly/last-ok '+%F %H:%M')"
+    else line="ещё не было"; fi
+    if filled "$CONF/server.yml" restic_s3_repository_base; then line+=", сразу в S3"; fi
+    echo "Частые снимки ($hourly): $line"
+  fi
+  if [ -f /var/lib/update-last-run ]; then
+    echo "Обновления: $(date -r /var/lib/update-last-run +%F) (sudo infra update — раз в неделю)"
+  else
+    echo "Обновления: ещё не ставились — sudo infra update"
+  fi
+  if filled "$CONF/secrets.yml" telegram_bot_token && filled "$CONF/secrets.yml" telegram_chat_id; then
+    echo "Уведомления: Telegram"
+  elif filled "$CONF/secrets.yml" telegram_bot_token; then
+    echo "Уведомления: бот есть, чата нет — sudo infra-notify --find-chat"
+  else
+    echo "Уведомления: не настроены — ADMIN.md, «Уведомления в Telegram»"
+  fi
+  if [ -f /etc/infra-access/config.json ]; then
+    line=$({ /usr/local/sbin/infra-access list 2>/dev/null || true; } | { grep ' до ' || true; } | sed 's/  *до / до /' | paste -sd ',' - | sed 's/,/, /g')
+    echo "Доступ по ссылке: ${line:-сейчас ничего не открыто} (ссылка — sudo infra-access link)"
+  fi
+
+  echo
+  if [ ! -s /etc/restic/projects.json ]; then
+    echo "Проекты: появятся после sudo infra apply"
+  elif [ "$(jq length /etc/restic/projects.json)" = 0 ]; then
+    echo "Проектов нет — добавить: sudo infra edit"
+  else
+    # Проект|состояние|разовый (compose run)|все метки — по ним сайты (Host в правилах Traefik)
+    containers=$(docker ps -aq 2>/dev/null | xargs -r docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.project"}}|{{.State.Status}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{range .Config.Labels}}{{.}} {{end}}' 2>/dev/null || true)
+    echo "Проекты:"
+    for p in $(jq -r '.[].name' /etc/restic/projects.json); do
+      read -r up total < <(awk -F'|' -v p="$p" '$1 == p && $3 != "True" { n++; if ($2 == "running") u++ } END { print u + 0, n + 0 }' <<<"$containers")
+      hosts=$(awk -F'|' -v p="$p" '$1 == p' <<<"$containers" | grep -o 'Host(`[^`]*`)' | sed 's/^Host(`//; s/`)$//' | sort -u | paste -sd' ' - || true)
+      deploy=""
+      if systemctl is-enabled -q "project-deploy@$p.timer" 2>/dev/null; then
+        if [ -f "$d/$p.failed" ]; then deploy="автовыкладка не удалась: $(head -1 "$d/$p.failed")"
+        elif [ -f "$d/$p.current" ]; then deploy="выложен $(date -r "$d/$p.current" '+%F %H:%M')"
+        else deploy="автовыкладка ждёт первого образа"
+        fi
+      fi
+      if [ "$total" = 0 ]; then line="не запущен"; else line="контейнеры $up из $total"; fi
+      echo "  $p — $line${hosts:+ · $hosts}${deploy:+ · $deploy}"
+    done
+  fi
+
+  [ -x /usr/local/bin/health-check.sh ] || return 0
+  echo
+  problems=$(/usr/local/bin/health-check.sh 2>&1 || true)
+  if [ -n "$problems" ]; then echo "Проблемы (health-check):"; echo "$problems"; else echo "Проблем нет (health-check)"; fi
+}
+
+# Без параметров в терминале — меню; без терминала (скрипт, ssh без -t) — подсказка, как раньше
+if [ $# = 0 ]; then
+  [ -t 0 ] && [ -t 1 ] || usage 1
+  set -- menu
+fi
+command=$1; shift
+case $command in
+  init) cmd_init "$@" ;;
+  menu) check_setup "$command"; INFRA_WHO=$WHO exec "$ENGINE/infra-menu" ;;
+  edit|status|apply|update|upgrade|run) check_setup "$command"; "cmd_$command" "$@" ;;
+  run-unit) check_setup "$command"; run_unit "$@" ;;      # служебная: её запускает служба infra-apply
+  -h|--help|help) usage 0 ;;
+  *) echo "infra: неизвестная команда «$command»" >&2; usage 1 ;;
+esac

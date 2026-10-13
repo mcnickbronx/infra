@@ -1,0 +1,5 @@
+expect_error: "неизвестные ключи ['docker_user']"
+# Так его прочли бы site.yml и update.yml из /etc/infra/server.yml
+server_settings:
+  server_name: bad-top-key
+  docker_user: [ivan]

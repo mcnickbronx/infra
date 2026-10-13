@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Управляется Ansible.
+# Бэкап ОДНОГО проекта в restic: дампы его баз + его папки + его volumes.
+# Снимок помечается тегом project:<имя>, поэтому его можно восстановить отдельно.
+# Использование: project-backup [--db-only] <имя> [файл с настройками restic]
+#   --db-only — только дамп базы (частые снимки, backup_hourly: db). У такого снимка ещё тег
+#               db-only: project-restore без номера снимка его не выбирает (в нём нет папок проекта)
+set -Eeuo pipefail
+
+DB_ONLY=""
+[ "${1:-}" != --db-only ] || { DB_ONLY=1; shift; }
+NAME=${1:?Использование: project-backup [--db-only] <имя> [env-файл]}
+ENV_FILE=${2:-/etc/restic/env}
+LIST=/etc/restic/projects.json
+
+set -a; source "$ENV_FILE"; set +a
+
+ITEM=$(jq -e --arg n "$NAME" '.[] | select(.name == $n)' "$LIST") || {
+  echo "Проект '$NAME' не описан на этом сервере" >&2; exit 1; }
+
+DUMPS=/var/backups/db/$NAME
+install -d -m 0700 "$DUMPS"
+
+# --- дамп базы проекта (имя базы = имя проекта)
+if [ "$(jq -r '.db' <<<"$ITEM")" = postgres ]; then
+  echo "pg_dump $NAME"
+  # пишет root: папка дампов закрыта (0700), у postgres туда доступа нет
+  runuser -u postgres -- pg_dump -Fc "$NAME" > "$DUMPS/$NAME.pgdump"
+fi
+
+if [ -n "$DB_ONLY" ]; then
+  [ -s "$DUMPS/$NAME.pgdump" ] || { echo "У проекта $NAME нет базы — снимок только базы не из чего делать" >&2; exit 1; }
+  restic cat config >/dev/null 2>&1 || restic init
+  restic backup --tag "project:$NAME" --tag db-only "$DUMPS"
+  echo "Готово: снимок базы, теги project:$NAME и db-only"
+  exit 0
+fi
+
+# --- папка проекта, дампы и его docker volumes
+PATHS=("/srv/projects/$NAME" "$DUMPS")
+# тома по метке compose, а не по префиксу имени: у shop и shop_old префиксы совпадают
+# путь берётся у Docker: с userns-remap тома лежат в /var/lib/docker/<uid>.<gid>/volumes
+# Восстановление принимает только тома <проект>_<ключ> (защита от rsync --delete по
+# чужим путям), поэтому том со своим name: в снимок не берётся, а бэкап считается
+# неудавшимся, пока том не переименуют: узнать об этом надо сейчас, а не при восстановлении.
+# Анонимные тома (без имени) метки не получают: они временные и в бэкап не входят.
+SKIPPED=()
+for v in $(docker volume ls -q --filter "label=com.docker.compose.project=$NAME"); do
+  case $v in
+    "${NAME}"_*) ;;
+    *) SKIPPED+=("$v"); continue ;;
+  esac
+  d=$(dirname "$(docker volume inspect -f '{{ .Mountpoint }}' "$v")")
+  [ -d "$d" ] && PATHS+=("$d")
+done
+
+restic cat config >/dev/null 2>&1 || restic init
+restic backup --tag "project:$NAME" "${PATHS[@]}"
+if [ ${#SKIPPED[@]} -gt 0 ]; then
+  echo "!!! $NAME: тома не в бэкапе — у них свой name:, восстановление их не примет: ${SKIPPED[*]}." \
+       "Уберите name: у тома в compose.yml (том станет ${NAME}_<ключ>) и перенесите данные" >&2
+  exit 2
+fi
+echo "Готово: снимок с тегом project:$NAME"
+# Ночной бэкап пишет в журнал событий сам, итогом; здесь — только запуск вручную (через sudo)
+[ -z "${SUDO_USER:-}" ] || infra-log "снимок проекта $NAME (вручную): готово"

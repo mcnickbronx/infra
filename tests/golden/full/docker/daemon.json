@@ -1,0 +1,11 @@
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "5" },
+  "live-restore": true,
+  "no-new-privileges": true,
+  "ip": "127.0.0.1",
+  "userns-remap": "dockremap",
+  "default-address-pools": [
+    { "base": "172.24.0.0/13", "size": 24 }
+  ]
+}

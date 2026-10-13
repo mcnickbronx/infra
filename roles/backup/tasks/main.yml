@@ -1,0 +1,102 @@
+- name: Установка restic
+  ansible.builtin.apt:
+    name: [restic, rsync]    # rsync — для точного восстановления (project-restore)
+
+- name: Папка настроек restic
+  ansible.builtin.file:
+    path: /etc/restic
+    state: directory
+    mode: "0700"
+
+# Уровень 1. Лежит на том же диске, что и данные: следите за местом (disk_alert_percent).
+- name: Папка локального репозитория
+  ansible.builtin.file:
+    path: "{{ restic_local_repo }}"
+    state: directory
+    mode: "0700"
+
+- name: Параметры локального репозитория (секреты)
+  ansible.builtin.template:
+    src: env.j2
+    dest: /etc/restic/env
+    mode: "0600"
+  no_log: true
+
+# Уровень 3
+- name: Параметры копии в S3 (секреты)
+  ansible.builtin.template:
+    src: s3-env.j2
+    dest: /etc/restic/s3-env
+    mode: "0600"
+  no_log: true
+  when: restic_s3_repository_base | length > 0
+
+- name: S3 выключен — параметров копии нет
+  ansible.builtin.file:
+    path: /etc/restic/s3-env
+    state: absent
+  when: restic_s3_repository_base | length == 0
+
+- name: Список проектов сервера для бэкапа
+  ansible.builtin.template:
+    src: projects.json.j2
+    dest: /etc/restic/projects.json
+    mode: "0600"
+
+- name: Скрипты бэкапа, восстановления и копии базы по проектам
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    mode: "0700"
+  loop: [project-backup, project-restore, project-db-copy, project-db-dump, project-db-empty, backup-s3-copy]
+
+- name: Скрипт ночного бэкапа
+  ansible.builtin.template:
+    src: backup.sh.j2
+    dest: /usr/local/bin/backup.sh
+    mode: "0700"
+
+- name: Скрипт частых снимков (backup_hourly, backup_every)
+  ansible.builtin.template:
+    src: backup-hourly.sh.j2
+    dest: /usr/local/bin/backup-hourly.sh
+    mode: "0700"
+
+- name: systemd-сервис и таймер
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop: [backup.service, backup.timer, backup-hourly.service]
+
+# Расписание — с шагом самого частого проекта (backup_hourly_step в derived.yml)
+- name: Таймер частых снимков
+  ansible.builtin.template:
+    src: backup-hourly.timer.j2
+    dest: /etc/systemd/system/backup-hourly.timer
+    mode: "0644"
+  register: hourly_timer_file
+
+- name: Таймер бэкапа включён
+  ansible.builtin.systemd:
+    name: backup.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# Предпросмотр (--check) таймер не копирует: на сервере, где его ещё нет, проверять нечего —
+# а без этой задачи предпросмотр не показал бы, что backup_hourly добавили или убрали
+- name: Таймер частых снимков уже установлен
+  ansible.builtin.stat:
+    path: /etc/systemd/system/backup-hourly.timer
+  register: hourly_unit
+
+# Таймер частых снимков — только если они кому-то нужны: убрали backup_hourly у всех — выключается.
+# Новое расписание работающий таймер берёт только после перезапуска
+- name: Таймер частых снимков — включён, если есть проекты с backup_hourly
+  ansible.builtin.systemd:
+    name: backup-hourly.timer
+    enabled: "{{ hourly_backup_projects | length > 0 }}"
+    state: "{{ ('restarted' if hourly_timer_file is changed else 'started') if hourly_backup_projects | length > 0 else 'stopped' }}"
+    daemon_reload: true
+  when: not ansible_check_mode or hourly_unit.stat.exists

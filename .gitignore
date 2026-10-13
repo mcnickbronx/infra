@@ -1,0 +1,35 @@
+# --- Секреты ---
+# Настройки и пароли серверов в репозиторий не попадают: они на самих серверах, /etc/infra
+server.yml
+secrets.yml
+# пароль vault прежней схемы (до движка на сервере) — не коммитить
+.vault_pass
+*.vault_pass
+.env
+*.decrypted
+*.key
+*.pem
+
+# --- Ansible ---
+*.retry
+# кеш ansible-lint и коллекции (ставит install.sh / ansible-galaxy в collections/)
+.ansible/
+collections/
+fact_cache/
+
+# --- Python (скрипты ролей, локальное окружение с ansible) ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- Редакторы и IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- ОС ---
+.DS_Store
+Thumbs.db

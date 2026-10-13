@@ -1,0 +1,9 @@
+# Копия в S3 (уровень 3): restic copy из локального репозитория (RESTIC_FROM_*) в S3.
+# Папка сервера; репозиторий — её подпапка <дата начала>, новая каждые 14 дней (backup-s3-copy)
+RESTIC_REPOSITORY={{ restic_s3_repository_base }}/{{ inventory_hostname }}
+RESTIC_PASSWORD={{ restic_password }}
+AWS_ACCESS_KEY_ID={{ restic_aws_access_key_id }}
+AWS_SECRET_ACCESS_KEY={{ restic_aws_secret_access_key }}
+RESTIC_FROM_REPOSITORY={{ restic_local_repo }}
+RESTIC_FROM_PASSWORD={{ restic_password }}
+RESTIC_CACHE_DIR=/var/cache/restic

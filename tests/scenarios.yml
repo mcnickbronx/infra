@@ -1,0 +1,935 @@
+# Сценарии на тестовом сервере: то, что редко делают руками и что поэтому ломается
+# незаметно, — по-настоящему, с проверкой результата. Меняет данные проекта shop
+# (и возвращает как было), поэтому только на сервере с test_server: true в server.yml:
+#   sudo infra run tests/scenarios.yml
+# tools/rollout.sh <тестовый сервер> --scenarios запускает её после apply и tests/verify.yml.
+#
+#   1. Аккаунт плейбука без доступа к серверу удаляется вместе с открытой сессией;
+#      чужой аккаунт с именем участника плейбук не трогает.
+#   2. Бэкап и восстановление проекта на Postgres: файлы, лишний файл, том, база
+#      с расширением pg_trgm, снимок «с другого сервера» (другой gid группы проекта).
+#      Том со своим name: — бэкап громко не удаётся.
+#   3. Проект в Docker: сеть, доступ к базе из .env, вход в свою базу и отказ в чужую, лимиты;
+#      приложение (uid 1000) пишет в папку, которую участник создал, как автовыкладка;
+#      health-check замечает compose без extends и том со своим name:, уведомление (--notify) —
+#      только о новом и прошедшем (прошедшее — спустя 30 минут), сводка (--summary), при недоступном
+#      Telegram — повтор через час; уведомления — в файл (INFRA_NOTIFY_DRY).
+#   4. Автовыкладка (project-deploy) с локальным реестром: выкладка, отказ подготовки
+#      с возвратом прежней версии (и при первой выкладке — запущенной руками), откат вручную.
+#      Откат при идущей выкладке — отказ, а не молчаливый выход.
+#   5. Команда infra: edit сохраняет правку, ошибку в ключе ловит проверка (и правку можно
+#      вернуть), сломанный YAML и ключ дважды не сохраняет; edit secrets называет изменённый ключ,
+#      но не показывает и не пишет в журнал значение; init задаёт вопросы, переспрашивает
+#      неверное, пишет server.yml и отказывает, если он уже есть.
+#   6. Меню (sudo infra без параметров) в настоящем терминале — нажатиями клавиш (tests/menu.py):
+#      состояние, проект, бэкап, смена пароля базы (по-настоящему), журнал событий, диагностика,
+#      Telegram, баны, новая версия движка; события — в журнале. Без терминала — подсказка.
+#   7. Частые снимки: shop — база и файлы каждые 60 минут, crm — только база (тег db-only) каждые 5;
+#      в :05 снимаются оба, в :17 — только crm; свежий снимок сразу в S3 (папка на диске вместо
+#      бакета), сбой копии — ошибка; снимок только базы по номеру восстанавливает только базу, без
+#      номера выбирается последний полный снимок; пропуск, пока идёт ночной бэкап; сбой виден
+#      в health-check и infra status. Запрос к .env — бан CrowdSec
+#      с первого раза, к .envrc — нет.
+#   8. Ссылка доступа: просмотр страницы ничего не открывает, кнопка открывает SSH IP посетителя
+#      (повторно — продлевает), уведомление и infra status; IP из белого списка и частный — нет;
+#      срок вышел — закрыто; close all.
+#   9. Копия базы shop → shop_dev (project-db-copy): в не-*_dev и без подтверждения — отказ; снимок
+#      до замены; база заменена целиком (таблица только dev исчезла), владелец — роль dev; расширение
+#      прода (pg_trgm) и индекс на нём — в dev; --files с группой dev; откат снимком — точно как было
+#      (project-restore очищает базу); project-db-dump.
+- name: Сценарии на тестовом сервере
+  hosts: all
+  become: true
+  vars_files:
+    - /etc/infra/server.yml          # = infra_dir: здесь переменные движка ещё не прочитаны
+  vars:
+    image: postgres:17-alpine          # клиент Postgres в контейнере
+    web: /srv/projects/shop/web
+    marker: restore-me
+    secret: verify-SECRET-not-shown       # значение ключа в secrets.yml: его не должно быть на экране и в журнале
+    fake_gid: 1999                     # номер группы проекта «на другом сервере»
+    psql_shop: [runuser, -u, postgres, --, psql, -X, -v, ON_ERROR_STOP=1, -d, shop, -tAc]
+  pre_tasks:
+    - name: Пароли сервера (/etc/infra/secrets.yml)
+      ansible.builtin.include_vars:
+        file: "{{ infra_dir }}/secrets.yml"
+        name: secrets_file
+      no_log: true
+  tasks:
+    - name: Только тестовый сервер
+      ansible.builtin.assert:
+        that:
+          - test_server | default(false)
+          - "'shop' in db_projects | map(attribute='key')"
+        fail_msg: "Сценарии — только на сервере с test_server: true в server.yml и проектом shop (Postgres)"
+        quiet: true
+
+    # ================= 1. Аккаунты =================
+    - name: "1. Аккаунт плейбука, которого нет в инвентаре, с открытой сессией"
+      ansible.builtin.shell: |
+        set -e
+        useradd -m -s /bin/bash -G devs,shop-dev ghost
+        setsid runuser -u ghost -- sleep 900 >/dev/null 2>&1 < /dev/null &
+        sleep 1
+        id -u ghost
+      register: ghost
+      changed_when: true
+
+    - name: "1. Роль users"
+      ansible.builtin.include_role:
+        name: users
+
+    - name: "1. Аккаунт и его процессы"
+      ansible.builtin.shell: |
+        getent passwd ghost || true
+        pgrep -u {{ ghost.stdout_lines[-1] }} || true
+      register: ghost_after
+      changed_when: false
+
+    - name: "1. Аккаунт удалён, сессия закрыта"
+      ansible.builtin.assert:
+        that: ghost_after.stdout == ''
+        fail_msg: "ghost остался: {{ ghost_after.stdout }}"
+        quiet: true
+
+    - name: "1. Инвентарь, где участник проекта — nobody (системный пользователь)"
+      ansible.builtin.set_fact:
+        people_with_nobody: "{{ people | combine({'nobody': {'key': people[host_people[0]].key, 'ips': []}}) }}"
+        projects_with_nobody: "{{ projects | combine({'shop': {'devs': projects.shop.devs + ['nobody']}}, recursive=true) }}"
+
+    - name: "1. Чужой аккаунт с именем участника"
+      block:
+        - name: "1. Роль users с таким инвентарём"
+          ansible.builtin.include_role:
+            name: users
+          vars:
+            people: "{{ people_with_nobody }}"
+            projects: "{{ projects_with_nobody }}"
+
+        - name: "1. Роль не остановилась"
+          ansible.builtin.fail:
+            msg: "Роль users взялась менять системного пользователя nobody"
+      rescue:
+        - name: "1. Остановилась с объяснением"
+          ansible.builtin.assert:
+            that: "'созданные не плейбуком' in ansible_failed_result.msg | default('')"
+            fail_msg: "Не та ошибка: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+            quiet: true
+
+    # ================= 2. Бэкап и восстановление (Postgres) =================
+    # Снимок как будто с другого сервера: группа проекта там — fake_gid (у владельцев
+    # файлов и в ACL — так, как было бы там). После восстановления всё это должно
+    # принадлежать здешней shop-dev.
+    - name: "2. Файлы, том и база до снимка"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        mkdir -p {{ web }}/verify/sub
+        echo {{ marker }} > {{ web }}/verify/marker.txt
+        ln -sfn marker.txt {{ web }}/verify/link
+        G=$(getent group shop-dev | cut -d: -f3)
+        cd /srv/projects
+        getfacl -R -n -P shop \
+          | sed -E "s/^(# group: )$G\$/\1{{ fake_gid }}/; s/^((default:)?group:)$G:/\1{{ fake_gid }}:/" \
+          | setfacl --restore=-
+        find shop -type l -gid "$G" -exec chgrp -h {{ fake_gid }} {} +
+        docker volume create --label com.docker.compose.project=shop shop_verify >/dev/null
+        echo {{ marker }} > "$(docker volume inspect -f '{{ '{{' }}.Mountpoint{{ '}}' }}' shop_verify)/f"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: "2. Расширение (ставит суперпользователь, как администратор) и таблица проекта"
+      ansible.builtin.command:
+        argv: "{{ psql_shop + [item] }}"
+      loop:
+        - CREATE EXTENSION IF NOT EXISTS pg_trgm
+        - >-
+          SET ROLE shop; DROP TABLE IF EXISTS verify_t;
+          CREATE TABLE verify_t (id int PRIMARY KEY, name text);
+          CREATE INDEX ON verify_t USING gin (name gin_trgm_ops);
+          INSERT INTO verify_t VALUES (1, '{{ marker }}')
+      changed_when: true
+
+    - name: "2. Снимок проекта"
+      ansible.builtin.command: project-backup shop
+      changed_when: true
+
+    - name: "2. Порча: файл удалён, лишний файл, строка базы удалена, том переписан"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        rm {{ web }}/verify/marker.txt
+        echo junk > {{ web }}/verify/junk.php
+        echo changed > "$(docker volume inspect -f '{{ '{{' }}.Mountpoint{{ '}}' }}' shop_verify)/f"
+        runuser -u postgres -- psql -X -d shop -c "DELETE FROM verify_t"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: "2. Восстановление"
+      ansible.builtin.command: project-restore shop
+      register: restore
+      changed_when: true
+
+    - name: "2. Что восстановилось"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        echo "marker=$(cat {{ web }}/verify/marker.txt)"
+        echo "junk=$([ -e {{ web }}/verify/junk.php ] && echo yes || echo no)"
+        echo "volume=$(cat "$(docker volume inspect -f '{{ '{{' }}.Mountpoint{{ '}}' }}' shop_verify)/f")"
+        echo "db=$(runuser -u postgres -- psql -X -d shop -tAc 'SELECT name FROM verify_t')"
+        echo "fake_gid_files=$(find /srv/projects/shop -xdev -gid {{ fake_gid }} | wc -l)"
+        echo "fake_gid_acl=$(getfacl -R -n -P /srv/projects/shop 2>/dev/null | grep -c ':{{ fake_gid }}:')"
+        echo "dirs=$(stat -c '%a:%G' /srv/projects/shop /srv/projects/shop/web {{ web }}/verify/sub | xargs)"
+        echo "marker_acl=$(getfacl -p {{ web }}/verify/marker.txt 2>/dev/null | grep -c '^group:shop-dev:rw')"
+        echo "link=$(stat -c %G {{ web }}/verify/link)"
+        echo "logged=$(tail -n 20 /var/log/infra.log | grep -c 'восстановление shop: готово')"
+      args:
+        executable: /bin/bash
+      register: restored
+      changed_when: false
+
+    - name: "2. Проект восстановлен точно, группа — здешняя"
+      vars:
+        r: "{{ dict(restored.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.marker == marker
+          - r.junk == 'no'
+          - r.volume == marker
+          - r.db == marker
+          - r.fake_gid_files == '0'
+          - r.fake_gid_acl == '0'
+          - r.dirs == '750:shop-dev 2770:shop-dev 2770:shop-dev'
+          - r.marker_acl == '1'
+          - r.link == 'shop-dev'
+          - r.logged | int > 0                  # событие — в журнале /var/log/infra.log
+          - "'заменяю' in restore.stdout and 'pg_trgm' in restore.stdout"
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }} {{ restore.stdout }}"
+        quiet: true
+
+    - name: "2. Том со своим name: — бэкап не удаётся и называет том"
+      ansible.builtin.shell: |
+        docker volume create --label com.docker.compose.project=shop verify-custom >/dev/null
+        project-backup shop
+        rc=$?
+        docker volume rm verify-custom >/dev/null
+        exit $rc
+      register: custom_backup
+      changed_when: true
+      failed_when: custom_backup.rc != 2 or 'verify-custom' not in custom_backup.stderr
+
+    - name: "2. Уборка"
+      ansible.builtin.shell: |
+        set -e
+        rm -rf {{ web }}/verify
+        docker volume rm shop_verify >/dev/null
+        runuser -u postgres -- psql -X -q -d shop -c "DROP TABLE IF EXISTS verify_t; DROP EXTENSION IF EXISTS pg_trgm"
+      changed_when: true
+
+    # ================= 3. Проект в Docker =================
+    # Доступ к базе — в .env проекта, как у приложений: адрес по правилу, пароль из secrets.yml
+    - name: "3. .env проекта: доступ к базе"
+      ansible.builtin.copy:
+        dest: "{{ web }}/.env"
+        mode: "0660"
+        content: |
+          PGHOST=172.20.{{ projects.shop.net }}.1
+          PGUSER=shop
+          PGDATABASE=shop
+          PGPASSWORD={{ db_passwords.shop }}
+      no_log: true
+
+    - name: "3. compose.yml проекта: клиент Postgres в сети проекта"
+      ansible.builtin.copy:
+        dest: "{{ web }}/compose.yml"
+        mode: "0664"
+        content: |
+          name: shop
+          services:
+            client:
+              extends: { file: /srv/infra/compose/base.yml, service: hardened }
+              image: {{ image }}
+              user: "1000:1000"            # как типичное приложение в образе
+              command: sleep infinity
+              env_file: [.env]
+              volumes: [./files:/files]
+          networks:
+            default:
+              name: proj-shop
+              external: true
+
+    # Как автовыкладка (make_dirs): mkdir и запись для группы — через ACL папки проекта
+    # её получает и пользователь приложения в контейнере
+    - name: "3. Папка для записи приложения — от участника"
+      ansible.builtin.command: runuser -u tester -- bash -c 'cd {{ web }} && mkdir files && chmod 2770 files'
+      changed_when: true
+
+    - name: "3. Проект запущен (project-compose)"
+      ansible.builtin.command: project-compose shop up -d --quiet-pull --wait
+      changed_when: true
+
+    # Чужая база — с её настоящим паролем: отказать должен pg_hba (не та сеть), а не пароль
+    - name: "3. Из контейнера: своя база, чужая база, лимиты"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        echo "own=$(project-compose shop exec -T client psql -tAc 'SELECT current_user' 2>&1)"
+        echo "foreign=$(project-compose shop exec -T -e PGPASSWORD={{ db_passwords.crm }} client \
+          psql -h 172.20.{{ projects.crm.net }}.1 -U crm -d crm -tAc 'SELECT 1' 2>&1 | grep -o 'no pg_hba.conf entry' | head -1)"
+        echo "write=$(project-compose shop exec -T client sh -c 'echo ok > /files/w && mkdir /files/sub && echo ok > /files/sub/w && cat /files/sub/w' 2>&1)"
+        echo "slice=$(docker inspect -f '{{ '{{' }}.HostConfig.CgroupParent{{ '}}' }}' "$(project-compose shop ps -q client)")"
+        echo "memory=$(systemctl show proj-shop.slice -p MemoryMax --value)"
+        echo "mounts=$(docker inspect -f {% raw %}'{{range .Mounts}}{{.Type}}:{{.Name}}{{.Destination}} {{end}}'{% endraw %} \
+          "$(project-compose shop ps -q client)")"
+      args:
+        executable: /bin/bash
+      register: in_docker
+      changed_when: false
+      no_log: true                     # пароль crm в команде
+
+    - name: "3. Контейнер входит в свою базу, в чужую — нет, пишет в папку участника, лимиты действуют"
+      vars:
+        r: "{{ dict(in_docker.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.own == 'shop'
+          - r.foreign == 'no pg_hba.conf entry'
+          - r.slice == 'proj-shop.slice'
+          - r.memory | int > 0
+          - r.write == 'ok'
+          - "'bind:/files' in r.mounts"
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
+        quiet: true
+
+    - name: "3. Сервис без extends и с томом со своим name:"
+      ansible.builtin.copy:
+        dest: "{{ web }}/verify-bad.yml"
+        mode: "0664"
+        content: |
+          name: shop
+          services:
+            bad:
+              image: {{ image }}
+              command: sleep infinity
+              volumes: [data:/data]
+          volumes:
+            data:
+              name: verify-foreign
+          networks:
+            default:
+              name: proj-shop
+              external: true
+
+    - name: "3. Запуск и health-check"
+      ansible.builtin.shell: |
+        docker compose -f verify-bad.yml up -d --quiet-pull --wait >/dev/null 2>&1 || exit 1
+        /usr/local/bin/health-check.sh
+        # Уведомления — в файл, состояние — своё: настоящие уведомления и их состояние не трогаем
+        rm -rf /tmp/verify-health && mkdir -m 700 /tmp/verify-health
+        for _ in 1 2; do          # второй раз — то же самое: сообщать нечего
+          HEALTH_STATE_DIR=/tmp/verify-health INFRA_NOTIFY_DRY=/tmp/verify-health/sent \
+            /usr/local/bin/health-check.sh --notify
+        done
+      args:
+        chdir: "{{ web }}"
+      register: bad_health
+      changed_when: true
+
+    - name: "3. health-check заметил оба нарушения"
+      ansible.builtin.assert:
+        that:
+          - "'вне лимитов проекта' in bad_health.stdout and 'shop-bad-1' in bad_health.stdout"
+          - "'verify-foreign' in bad_health.stdout"
+        fail_msg: "{{ bad_health.stdout }}"
+        quiet: true
+
+    - name: "3. Уборка"
+      ansible.builtin.shell: |
+        set -e
+        docker compose -f verify-bad.yml down -v >/dev/null 2>&1
+        project-compose shop down >/dev/null 2>&1
+        rm -rf compose.yml verify-bad.yml files .env
+      args:
+        chdir: "{{ web }}"
+      changed_when: true
+
+    # «Прошло» — когда проблемы нет 30 минут (HEALTH_RESOLVE_MINUTES=0 — сразу). Недоступный
+    # Telegram (INFRA_NOTIFY_DRY в несуществующую папку) — повтор не раньше чем через час
+    - name: "3. Уведомления после уборки, сводка, повтор при недоступном Telegram"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        d=/tmp/verify-health f=/tmp/verify-health/sent
+        export HEALTH_STATE_DIR=$d INFRA_NOTIFY_DRY=$f
+        hc() { /usr/local/bin/health-check.sh "$@"; }
+        hc --notify
+        echo "gone_early=$(grep -c ' — прошло:' $f)"
+        HEALTH_RESOLVE_MINUTES=0 hc --notify
+        hc --summary
+        echo "new=$(grep -c ' — новое:' $f)"
+        echo "new_bad=$(sed -n '1,/^---$/p' $f | grep -c 'shop-bad-1')"
+        echo "gone=$(grep -c ' — прошло:' $f)"
+        echo "gone_bad=$(sed -n '/ — прошло:/,/^---$/p' $f | grep -c 'shop-bad-1')"
+        echo "summary=$(grep -c '^Диски: ' $f)"
+        printf 'проверка\tПроверка отправки\t0\n' >>$d/problems
+        INFRA_NOTIFY_DRY=/nonexistent/sent hc --notify
+        echo "failed=$(ls $d/notify-failed 2>/dev/null | wc -l)"
+        hc --notify
+        echo "retry_early=$(grep -c 'Проверка отправки' $f)"
+        touch -d '-61 min' $d/notify-failed
+        hc --notify
+        echo "retry_late=$(grep -c 'Проверка отправки' $f)"
+        echo "failed_after=$(ls $d/notify-failed 2>/dev/null | wc -l)"
+        rm -rf $d
+      args:
+        executable: /bin/bash
+      register: notified
+      changed_when: false
+
+    - name: "3. О новом — один раз, о прошедшем — спустя время и один раз, сводка, повтор через час"
+      vars:
+        r: "{{ dict(notified.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.gone_early == '0'
+          - r.new == '1'
+          - r.new_bad | int > 0
+          - r.gone == '1'
+          - r.gone_bad | int > 0
+          - r.summary == '1'
+          - r.failed == '1'
+          - r.retry_early == '0'
+          - r.retry_late == '1'
+          - r.failed_after == '0'
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
+        quiet: true
+
+    # ================= 4. Автовыкладка (project-deploy) =================
+    # Реестр образов — локальный (registry:2 на 127.0.0.1:5000). Версии проекта: v0, v1 и v3 —
+    # хорошие, у v2 и v4 падает подготовка (сервис deploy). Проверяется: v0 запущен руками,
+    # первая автовыкладка (v2) не удалась — работает v0; выкладка v1 с папкой данных, которую
+    # создаёт project-deploy; отказ v4 с возвратом v1, v4 не пробуется снова; v3; откат при
+    # идущей выкладке отказывает; откат вручную без уведомления; откаченная версия не выкладывается.
+    - name: "4. Реестр образов и пять версий проекта"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        docker run -d --name verify-registry -p 127.0.0.1:5000:5000 registry:2 >/dev/null
+        b=$(mktemp -d)
+        for v in v0 v1 v2 v3 v4; do
+          if [ $v = v2 ] || [ $v = v4 ]; then step='exit 1'; else step="echo $v > /data/deployed"; fi
+          cat > "$b/compose.yml" <<COMPOSE
+        name: shop
+        services:
+          web:
+            extends: { file: /srv/infra/compose/base.yml, service: hardened }
+            image: \${DEPLOY_IMAGE}
+            command: httpd -f -p 8080 -h /www
+            healthcheck: { test: [CMD, wget, -q, -O-, "http://127.0.0.1:8080/"], interval: 2s, retries: 15 }
+          deploy:
+            extends: { file: /srv/infra/compose/base.yml, service: hardened }
+            image: \${DEPLOY_IMAGE}
+            profiles: [deploy]
+            command: sh -c '$step'
+            volumes: [./data:/data]
+        networks:
+          default: { name: proj-shop, external: true }
+        COMPOSE
+          printf 'FROM busybox\nRUN mkdir /www && echo %s > /www/index.html\nCOPY compose.yml /deploy/compose.yml\n' $v > "$b/Dockerfile"
+          docker build -q -t localhost:5000/verify:$v "$b" >/dev/null
+        done
+        rm -rf "$b"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: "4. Выкладки и откат"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        cd {{ web }}
+        log_start=$(wc -l < /var/log/infra.log)
+        echo "DEPLOY_IMAGE=localhost:5000/verify:test" > .env
+        put() { docker tag localhost:5000/verify:$1 localhost:5000/verify:test && docker push -q localhost:5000/verify:test >/dev/null; }
+        page() { project-compose shop exec -T web wget -q -O- http://127.0.0.1:8080/ 2>&1; }
+        alerts() { HC_URL= /usr/local/bin/health-check.sh | grep -c 'Автовыкладка shop'; }
+        failed() { cut -d' ' -f3- /var/lib/project-deploy/shop.failed; }
+        # Проект запущен руками (до автовыкладки) — v0
+        docker tag localhost:5000/verify:v0 localhost:5000/verify:test
+        docker run --rm --entrypoint cat localhost:5000/verify:v0 /deploy/compose.yml > compose.yml
+        project-compose shop up -d --wait >/dev/null 2>&1; echo "manual=$?:$(page)"
+        put v2; project-deploy shop >/dev/null 2>&1; echo "first_fail=$?:$(page):$(failed):$(alerts)"
+        put v1; project-deploy shop >/dev/null 2>&1
+        echo "v1=$?:$(page):$(cat data/deployed 2>&1):$(stat -c %a data)"
+        put v4; project-deploy shop >/dev/null 2>&1; echo "v4=$?:$(page):$(failed)"
+        project-deploy shop >/dev/null 2>&1; echo "v4_again=$?:$(page)"
+        put v3; project-deploy shop >/dev/null 2>&1
+        echo "v3=$?:$(page):$(cat data/deployed):$([ -e /var/lib/project-deploy/shop.failed ] && echo failed || echo clean)"
+        flock /var/lib/project-deploy/shop.lock sleep 35 &
+        sleep 1; project-deploy shop rollback >/dev/null 2>&1; echo "rollback_busy=$?:$(page)"; wait
+        project-deploy shop rollback >/dev/null 2>&1; echo "rollback=$?:$(page):$(alerts)"
+        project-deploy shop >/dev/null 2>&1; echo "after_rollback=$?:$(page)"
+        events() { tail -n +$((log_start + 1)) /var/log/infra.log | grep -c "$1"; }
+        echo "logged=$(events 'выкладка shop: готово'):$(events 'выкладка shop: .* не удалась'):$(events 'откат shop: готово')"
+      args:
+        executable: /bin/bash
+      register: autodeploy
+      changed_when: true
+
+    - name: "4. Выложено, отказ вернул прежнюю версию, откат работает, health-check сообщил о сбое"
+      vars:
+        r: "{{ dict(autodeploy.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.manual == '0:v0'
+          - "r.first_fail == '1:v0:подготовка (сервис deploy): работает прежняя версия:1'"
+          - r.v1 == '0:v1:v1:2770'
+          - "r.v4 == '1:v1:подготовка (сервис deploy): работает прежняя версия'"
+          - r.v4_again == '0:v1'
+          - r.v3 == '0:v3:v3:clean'
+          - r.rollback_busy == '1:v3'
+          - r.rollback == '0:v1:0'
+          - r.after_rollback == '0:v1'
+          - r.logged == '2:2:1'                 # в журнале событий: v1 и v3, отказы v2 и v4, откат
+        fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
+        quiet: true
+
+    - name: "4. Уборка"
+      ansible.builtin.shell: |
+        set -o pipefail
+        project-compose shop down >/dev/null 2>&1
+        docker rm -f verify-registry >/dev/null 2>&1
+        docker images -q 'localhost:5000/verify' | sort -u | xargs -r docker rmi -f >/dev/null 2>&1
+        rm -rf data compose.yml compose.yml.prev .env /var/lib/project-deploy/shop.*
+      args:
+        chdir: "{{ web }}"
+        executable: /bin/bash
+      changed_when: true
+
+    # ================= 5. Команда infra: init и edit =================
+    # Ответы — из stdin, «редактор» — скрипт (SUDO_EDITOR). server.yml сервера после каждой
+    # проверки и в любом случае в конце — как был (копия /tmp/verify-server.yml)
+    - name: "5. Команда infra"
+      block:
+        - name: "5. Копия server.yml и «редакторы» для infra edit"
+          ansible.builtin.shell: |
+            set -e
+            cp -p /etc/infra/server.yml /tmp/verify-server.yml
+            cp -p /etc/infra/secrets.yml /tmp/verify-secrets.yml
+            ed() { printf '#!/bin/sh\n%s\n' "$2" > "/tmp/verify-edit-$1"; chmod 755 "/tmp/verify-edit-$1"; }
+            ed none 'exit 0'
+            ed comment "echo '# проверка infra edit' >> \"\$1\""
+            ed typo "echo 'projectz: {}' >> \"\$1\""
+            ed broken "echo 'projects: [' >> \"\$1\""
+            ed twice "echo 'projects: {}' >> \"\$1\""
+            ed proxy "sed -i 's#^telegram_proxy:.*#telegram_proxy: \"socks5h://verify:{{ secret }}@203.0.113.5:1080\"#' \"\$1\""
+          changed_when: true
+
+        - name: "5. infra edit: без изменений, комментарий, опечатка в ключе, сломанный YAML, ключ дважды"
+          ansible.builtin.shell: |
+            set -uo pipefail
+            log_start=$(wc -l < /var/log/infra.log)
+            # edit <редактор> <ответ на вопрос>: код выхода и server.yml — прежний (same) или нет
+            edit() {
+              SUDO_EDITOR=/tmp/verify-edit-$1 /usr/local/sbin/infra edit > "/tmp/verify-edit-$1.log" 2>&1 <<<"$2"
+              echo "$?:$(cmp -s /etc/infra/server.yml /tmp/verify-server.yml && echo same || echo changed)"
+            }
+            found() { if grep -q "$2" "/tmp/verify-edit-$1.log"; then echo 1; else echo 0; fi; }
+            echo "none=$(edit none ''):$(found none 'Без изменений')"
+            echo "comment=$(edit comment ''):$(found comment 'Изменений нет'):$(grep -c '^# проверка infra edit$' /etc/infra/server.yml)"
+            cp -p /tmp/verify-server.yml /etc/infra/server.yml
+            echo "typo=$(edit typo r):$(found typo 'неизвестные ключи')"
+            echo "broken=$(edit broken n):$(found broken 'Ошибка в server.yml')"
+            echo "twice=$(edit twice n):$(found twice '«projects» дважды')"
+            events() { tail -n +$((log_start + 1)) /var/log/infra.log | grep -c "$1"; }
+            echo "logged=$(events 'edit: server.yml изменён'):$(events 'edit: server.yml возвращён как был')"
+          args:
+            executable: /bin/bash
+          register: edit
+          changed_when: true
+
+        - name: "5. Правка сохраняется, ошибку ловит проверка и вернуть можно, сломанное не сохраняется"
+          vars:
+            r: "{{ dict(edit.stdout_lines | map('split', '=', 1)) }}"
+          ansible.builtin.assert:
+            that:
+              - r.none == '0:same:1'
+              - r.comment == '0:changed:1:1'          # сохранено; на сервере менять нечего
+              - r.typo == '1:same:1'                  # preflight не пропустил, вернули как было
+              - r.broken == '1:same:1'
+              - r.twice == '1:same:1'
+              - r.logged == '2:1'                     # изменён: комментарий и опечатка; возвращён — опечатка
+            fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }} — вывод в /tmp/verify-edit-*.log"
+            quiet: true
+
+        # Значение ключа — пароль: его нет ни в выводе, ни в журнале событий, есть только имя ключа
+        - name: "5. infra edit secrets: новый telegram_proxy, затем сломанный YAML"
+          ansible.builtin.shell: |
+            set -uo pipefail
+            log_start=$(wc -l < /var/log/infra.log)
+            out=/tmp/verify-edit-proxy.log
+            SUDO_EDITOR=/tmp/verify-edit-proxy /usr/local/sbin/infra edit secrets > $out 2>&1
+            echo "proxy=$?:$(grep -c 'telegram_proxy' $out):$(grep -c '{{ secret }}' $out)"
+            echo "saved=$(grep -c '{{ secret }}' /etc/infra/secrets.yml):$(stat -c '%a %U' /etc/infra/secrets.yml)"
+            cp -p /tmp/verify-secrets.yml /etc/infra/secrets.yml
+            SUDO_EDITOR=/tmp/verify-edit-broken /usr/local/sbin/infra edit secrets > /tmp/verify-edit-secrets-broken.log 2>&1 <<<n
+            echo "broken=$?:$(cmp -s /etc/infra/secrets.yml /tmp/verify-secrets.yml && echo same || echo changed)"
+            events() { tail -n +$((log_start + 1)) /var/log/infra.log | grep -c "$1"; }
+            echo "logged=$(events 'edit: secrets.yml изменён'):$(events 'telegram_proxy'):$(events '{{ secret }}')"
+          args:
+            executable: /bin/bash
+          register: edit_secrets
+          changed_when: true
+
+        - name: "5. Изменённый ключ назван, значения нет ни на экране, ни в журнале; сломанное не сохранено"
+          vars:
+            r: "{{ dict(edit_secrets.stdout_lines | map('split', '=', 1)) }}"
+          ansible.builtin.assert:
+            that:
+              - r.proxy is match('0:[1-9][0-9]*:0$')
+              - r.saved == '1:600 root'
+              - r.broken == '1:same'
+              - r.logged is match('1:[1-9][0-9]*:0$')
+            fail_msg: "{{ r }} — вывод в /tmp/verify-edit-proxy.log и verify-edit-secrets-broken.log"
+            quiet: true
+
+        # Ответы: имя (неверное, затем своё), email (заготовка, затем настоящий), найденные
+        # ключи — да, IP (не IP, затем адрес и подсеть), настроить сейчас — нет
+        - name: "5. infra init: отказ при готовом server.yml, затем вопросы на пустом месте"
+          ansible.builtin.shell: |
+            set -uo pipefail
+            found() { if grep -q "$1" /tmp/verify-init.log; then echo 1; else echo 0; fi; }
+            /usr/local/sbin/infra init > /tmp/verify-init.log 2>&1 <<<''
+            echo "exists=$?:$(found 'уже есть')"
+            rm /etc/infra/server.yml
+            printf '%s\n' Bad_Name verify-init you@example.org admin@test.ru y not-an-ip '203.0.113.10 198.51.100.0/24' n |
+              SUDO_USER={{ admin_user }} /usr/local/sbin/infra init > /tmp/verify-init.log 2>&1
+            echo "init=$?:$(found 'только строчные'):$(found 'нужен настоящий'):$(found 'не они: not-an-ip')"
+            echo "mode=$(stat -c '%a %U' /etc/infra/server.yml)"
+          args:
+            executable: /bin/bash
+          register: init
+          changed_when: true
+
+        - name: "5. Что записал infra init"
+          ansible.builtin.slurp:
+            src: /etc/infra/server.yml
+          register: init_file
+
+        - name: "5. server.yml из ответов: имя, ключи администратора, IP, email, пустые проекты"
+          vars:
+            r: "{{ dict(init.stdout_lines | map('split', '=', 1)) }}"
+            s: "{{ init_file.content | b64decode | from_yaml }}"
+          ansible.builtin.assert:
+            that:
+              - r.exists == '1:1'
+              - r.init == '0:1:1:1'
+              - r.mode == '600 root'
+              - s.server_name == 'verify-init'
+              - s.acme_email == 'admin@test.ru'
+              - s.admin_ips == ['203.0.113.10', '198.51.100.0/24']
+              - admin_keys | trim | split('\n') | map('trim') | reject('in', s.admin_keys) | list | length == 0
+              - s.people == {} and s.projects == {} and s.docker_users == []
+            fail_msg: "{{ r }} {{ s }} — вывод в /tmp/verify-init.log"
+            quiet: true
+      always:
+        - name: "5. server.yml сервера — как был"
+          ansible.builtin.shell: |
+            cp -p /tmp/verify-server.yml /etc/infra/server.yml && rm -f /tmp/verify-server.yml
+            cp -p /tmp/verify-secrets.yml /etc/infra/secrets.yml && rm -f /tmp/verify-secrets.yml
+            cd /tmp && rm -f verify-edit-none verify-edit-comment verify-edit-typo verify-edit-broken verify-edit-twice verify-edit-proxy
+          changed_when: true
+
+    # ================= 6. Меню =================
+    # Пункты проекта shop: восемь общих, у автовыкладки ещё два, затем бэкап, доступ к базе, пароль базы.
+    # Главное меню (с нуля): движок — 6, журналы — 7, диагностика — 8, Telegram — 9, баны — 10;
+    # движок на тестовом сервере — копия (tools/rollout.sh), меню так и говорит.
+    # Пароль базы shop меняется по-настоящему: новый — в secrets.yml и .env, им можно войти
+    - name: "6. Меню в терминале: состояние, проект, бэкап, пароль базы, журнал, диагностика, Telegram, баны, движок"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        log_start=$(wc -l < /var/log/infra.log)
+        down() { local i; for ((i = 0; i < $1; i++)); do printf '{down}'; done; }
+        n=8
+        if systemctl is-enabled -q project-deploy@shop.timer; then n=8; fi
+        shop=$(jq -r '.[].name' /etc/restic/projects.json | grep -nx shop | cut -d: -f1)
+        env=/srv/projects/shop/web/.env
+        had_env=$([ -e $env ] && echo 1 || echo 0)
+        [ -e $env ] || install -m 0640 /dev/null $env
+        old_pw=$(sed -nE 's/^db_password_shop:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' /etc/infra/secrets.yml)
+        python3 {{ playbook_dir }}/menu.py /tmp/verify-menu.log /usr/local/sbin/infra -- \
+          'Esc — выход' '{enter}' 'Enter — назад в меню' '{enter}' \
+          'Esc — выход' '{down}{enter}' 'Проект:' "$(down $((shop - 1))){enter}" \
+          'Проект shop' '{enter}' 'Enter — назад в меню' '{enter}' \
+          'Проект shop' "$(down $n){enter}" 'Enter — назад в меню' '{enter}' \
+          'Проект shop' "$(down $((n + 2))){enter}" 'приставкой' '{enter}' 'Сменить пароль базы shop сейчас' '{tab}{enter}' \
+          'Enter — назад в меню' '{enter}' \
+          'Проект shop' '{tab}{tab}{enter}' 'Проект:' '{tab}{tab}{enter}' \
+          'Esc — выход' "$(down 7){enter}" 'Журнал (q' '{enter}' 'пересоздание после смены пароля базы' 'q' \
+          'Журнал (q' '{tab}{tab}{enter}' \
+          'Esc — выход' "$(down 8){enter}" 'Диагностика' '{enter}' 'Enter — назад в меню' '{enter}' \
+          'Диагностика' '{down}{enter}' 'Enter — назад в меню' '{enter}' \
+          'Диагностика' '{down}{down}{enter}' 'Enter — назад в меню' '{enter}' 'Диагностика' '{tab}{tab}{enter}' \
+          'Esc — выход' "$(down 9){enter}" 'Бот и чат' '{enter}' 'Enter — назад в меню' '{enter}' \
+          'Бот и чат' '{tab}{tab}{enter}' \
+          'Esc — выход' "$(down 10){enter}" 'CrowdSec банит' '{enter}' 'Enter — назад в меню' '{enter}' \
+          'CrowdSec банит' '{tab}{tab}{enter}' \
+          'Esc — выход' "$(down 6){enter}" 'Движок поставлен копией' '{enter}' \
+          'Esc — выход' '{tab}{tab}{enter}'
+        echo "rc=$?"
+        found() { if grep -q "$1" /tmp/verify-menu.log; then echo 1; else echo 0; fi; }
+        echo "screens=$(found '== sudo infra status'):$(found '== sudo project-compose shop ps')"
+        echo "more=$(found '== sudo infra-notify'):$(found '== sudo cscli decisions list')"
+        echo "diag=$(found '== Docker: образы'):$(found '== Проекты: всё, что запущено'):$(found '== Самые долгие запросы')"
+        events() { tail -n +$((log_start + 1)) /var/log/infra.log | grep -c "$1"; }
+        echo "logged=$(events 'снимок проекта shop (вручную): готово')"
+        new_pw=$(sed -nE 's/^db_password_shop:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' /etc/infra/secrets.yml)
+        env_pw=$(sed -n 's/^DB_PASSWORD=//p' $env)
+        login=$(PGPASSWORD=$new_pw psql -X -h 127.0.0.1 -U shop -d shop -tAc 'SELECT 1' 2>&1)
+        changed=$([ -n "$new_pw" ] && [ "$new_pw" != "$old_pw" ] && echo new)
+        echo "dbpass=$changed:$([ "$env_pw" = "$new_pw" ] && echo env):$login:$(events 'сменились db_password_shop')"
+        [ "$had_env" = 1 ] || rm -f $env
+        /usr/local/sbin/infra < /dev/null > /tmp/verify-menu-notty.log 2>&1
+        echo "notty=$?:$(grep -c 'sudo infra init' /tmp/verify-menu-notty.log)"
+      args:
+        executable: /bin/bash
+      register: menu
+      changed_when: true
+
+    - name: "6. Меню прошло, действия — в журнале, пароль базы сменён; без терминала — подсказка"
+      vars:
+        r: "{{ dict(menu.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.rc == '0'
+          - r.screens == '1:1'
+          - r.more == '1:1'                   # Telegram и баны; журнал и «копия движка» — дождался menu.py
+          - r.diag == '1:1:1'                 # диск, память и процессор, Postgres
+          - r.dbpass == 'new:env:1:1'         # новый пароль — в secrets.yml и .env, им входит
+          - r.logged == '1'                   # бэкап из меню — в журнале событий
+          - r.notty == '1:1'
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }} — экран меню в /tmp/verify-menu.log"
+        quiet: true
+
+    # ================= 7. Частые снимки и бан за .env =================
+    # На тестовом сервере в server.yml: shop — backup_hourly: all (каждые 60 минут),
+    # crm — backup_hourly: db, backup_every: 5
+    - name: "7. Частые снимки: минута проекта, сразу в S3; пропуск, пока идёт ночной; сбой виден"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        r() { (set -a; . /etc/restic/env; set +a; restic "$@"); }
+        count() { r snapshots --tag "$1" --json | jq length; }
+        last_crm() { r snapshots --tag project:crm,db-only --json | jq -r "sort_by(.time) | last | .$1"; }
+        psql_crm() { runuser -u postgres -- psql -X -q -d crm -tAc "$1"; }
+        # «S3» — папка на диске: restic пишет в неё так же, как в бакет; настоящий s3-env — в сторону
+        s3=/var/backups/s3-verify; rm -rf "$s3"
+        [ ! -f /etc/restic/s3-env ] || mv /etc/restic/s3-env /etc/restic/s3-env.verify
+        (. /etc/restic/env; printf 'RESTIC_REPOSITORY=%s\nRESTIC_PASSWORD=%s\nRESTIC_FROM_REPOSITORY=%s\nRESTIC_FROM_PASSWORD=%s\n' \
+          "$s3" "$RESTIC_PASSWORD" "$RESTIC_REPOSITORY" "$RESTIC_PASSWORD") > /etc/restic/s3-env
+        # таймер на время проверки стоит: его запуск взял бы блокировку, и проверка «пропустила» бы снимки
+        systemctl stop backup-hourly.timer; while systemctl is-active -q backup-hourly.service; do sleep 1; done
+        shop0=$(count project:shop); crm0=$(count project:crm,db-only)
+        psql_crm "DROP TABLE IF EXISTS verify_h; CREATE TABLE verify_h(v text); INSERT INTO verify_h VALUES ('h1')"
+        rm -f /var/lib/backup-hourly/failed /var/lib/backup-hourly/last-ok
+        # в :05 — оба проекта, в :17 — только crm (каждые 5 минут)
+        BACKUP_HOURLY_MINUTE=05 /usr/local/bin/backup-hourly.sh >/dev/null; echo "rc=$?"
+        echo "snapshots=$(( $(count project:shop) - shop0 )):$(( $(count project:crm,db-only) - crm0 ))"
+        crm_snap=$(last_crm short_id)
+        shop0=$(count project:shop); crm0=$(count project:crm,db-only)
+        BACKUP_HOURLY_MINUTE=17 /usr/local/bin/backup-hourly.sh >/dev/null
+        echo "minute17=$(( $(count project:shop) - shop0 )):$(( $(count project:crm,db-only) - crm0 ))"
+        # последний снимок уже в «S3» — копия сразу, а не ночью; папка — <дата начала 14 дней>
+        echo "s3=$(r -r "$s3/$(ls "$s3")" snapshots --json | jq --arg id "$(last_crm id)" '[.[] | select(.original == $id)] | length')"
+        echo "crm_paths=$(last_crm 'paths | join(" ")')"
+        echo "last_ok=$(find /var/lib/backup-hourly/last-ok -mmin -5 2>/dev/null | wc -l)"
+        st=$(infra status | grep '^Частые снимки')
+        has() { grep -c "$1" <<<"$st"; }
+        echo "status_ok=$(has 'shop — база и файлы, каждые 60 мин'):$(has 'crm — база, каждые 5 мин'):$(has ': последний')"
+        # таймер запускает ту же службу
+        systemctl start backup-hourly.service; echo "unit=$?"
+        # копия в S3 не удалась — ошибка частых снимков, хотя сами снимки есть
+        sed -i "s|^RESTIC_REPOSITORY=.*|RESTIC_REPOSITORY=/proc/verify-no-s3|" /etc/restic/s3-env
+        BACKUP_HOURLY_MINUTE=17 /usr/local/bin/backup-hourly.sh >/dev/null 2>&1
+        echo "s3_fail=$?:$(grep -c ' S3$' /var/lib/backup-hourly/failed)"
+        rm -f /var/lib/backup-hourly/failed /etc/restic/s3-env; rm -rf "$s3"
+        [ ! -f /etc/restic/s3-env.verify ] || mv /etc/restic/s3-env.verify /etc/restic/s3-env
+        # снимок только базы — по номеру: вернулась база, файл в папке проекта остался
+        psql_crm "UPDATE verify_h SET v = 'h2'"; echo new > /srv/projects/crm/web/verify-h.txt
+        out=$(project-restore crm /etc/restic/env "$crm_snap" 2>&1)
+        echo "db_only=$(psql_crm 'SELECT v FROM verify_h'):$(cat /srv/projects/crm/web/verify-h.txt 2>/dev/null):$(grep -c 'только база' <<<"$out")"
+        # без номера — последний полный снимок, о снимке базы новее — подсказка; лишний файл убран
+        out=$(project-restore crm 2>&1)
+        echo "latest=$(grep -c 'Есть снимок только базы новее' <<<"$out"):$([ -e /srv/projects/crm/web/verify-h.txt ] && echo kept || echo gone)"
+        psql_crm "DROP TABLE IF EXISTS verify_h"; rm -f /srv/projects/crm/web/verify-h.txt
+        # ночной бэкап держит блокировку — частые снимки пропускаются, ничего не снимая
+        shop1=$(count project:shop)
+        flock /run/restic-backup.lock sleep 20 & sleep 1
+        out=$(/usr/local/bin/backup-hourly.sh); echo "skip=$?:$(grep -c 'пропуск' <<<"$out"):$(( $(count project:shop) - shop1 ))"
+        kill %1 2>/dev/null; wait
+        # сбой: health-check сообщает, infra status показывает
+        echo "2026-10-09 12:05 shop" > /var/lib/backup-hourly/failed
+        echo "hc_failed=$(/usr/local/bin/health-check.sh | grep -c 'Частые снимки не получаются')"
+        echo "status_failed=$(infra status | grep -c 'Частые снимки (.*): ошибка')"
+        rm -f /var/lib/backup-hourly/failed
+        echo "hc_clean=$(/usr/local/bin/health-check.sh | grep -c 'Частые снимки\|Частых снимков')"
+        systemctl start backup-hourly.timer
+        echo "timer=$(systemctl is-enabled backup-hourly.timer):$(systemctl is-active backup-hourly.timer)"
+      args:
+        executable: /bin/bash
+      register: hourly
+      changed_when: true
+
+    - name: "7. Частые снимки работают, снимок только базы восстанавливает только базу"
+      vars:
+        r: "{{ dict(hourly.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.rc == '0'
+          - r.snapshots == '1:1'              # :05 — shop полный снимок, crm только база
+          - r.minute17 == '0:1'               # :17 — только crm (каждые 5 минут)
+          - r.s3 == '1'                       # свежий снимок уже в «S3»
+          - r.crm_paths == '/var/backups/db/crm'
+          - r.last_ok == '1'
+          - r.status_ok == '1:1:1'
+          - r.unit == '0'
+          - r.s3_fail == '1:1'                # копия не удалась — ошибка, в failed — «S3»
+          - r.db_only == 'h1:new:1'           # база из снимка, файл не тронут, сказано «только база»
+          - r.latest == '1:gone'              # полный снимок, подсказка о снимке базы новее
+          - r.skip == '0:1:0'                 # пропуск без ошибки, нового снимка нет
+          - r.hc_failed == '1'
+          - r.status_failed == '1'
+          - r.hc_clean == '0'
+          - r.timer == 'enabled:active'
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
+        quiet: true
+
+    # Строка в access-лог Traefik от имени чужого адреса (TEST-NET-2: в интернете его нет) —
+    # CrowdSec читает лог и банит с первого запроса к .env; к /.envrc — нет
+    - name: "7. Запрос к .env — бан с первого раза, к .envrc — нет"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        log=/srv/infra/traefik/logs/access.log
+        line() { echo "$1 - - [$(LC_ALL=C date -u '+%d/%b/%Y:%H:%M:%S +0000')] \"GET $2 HTTP/1.1\" 404 19 \"-\" \"verify\" 1 \"-\" \"-\" 0ms"; }
+        line 198.51.100.77 '/api/.env.production?x=1' >> "$log"
+        line 198.51.100.78 '/.envrc' >> "$log"
+        for i in $(seq 1 30); do cscli decisions list -i 198.51.100.77 -o raw | grep -q infra/http-env-file && break; sleep 1; done
+        echo "env=$(cscli decisions list -i 198.51.100.77 -o raw | grep -c infra/http-env-file)"
+        echo "envrc=$(cscli decisions list -i 198.51.100.78 -o raw | grep -c infra/http-env-file)"
+        cscli decisions delete -i 198.51.100.77 >/dev/null 2>&1
+        cscli alerts delete -i 198.51.100.77 >/dev/null 2>&1
+        cscli alerts delete -i 198.51.100.78 >/dev/null 2>&1
+        echo "left=$(cscli decisions list -i 198.51.100.77 -o raw | grep -c ban)"
+      args:
+        executable: /bin/bash
+      register: envban
+      changed_when: true
+
+    - name: "7. Бан за .env работает и убран"
+      vars:
+        r: "{{ dict(envban.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.env == '1'
+          - r.envrc == '0'
+          - r.left == '0'
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
+        quiet: true
+
+    # ================= 8. Доступ по ссылке =================
+    # Страница на 127.0.0.1 — как её зовёт Traefik (X-Real-Ip — IP посетителя). Очередь разбирает
+    # настоящая служба (infra-access.path); уведомления на время сценария — в файл (drop-in в /run)
+    - name: "8. Ссылка: GET не открывает, кнопка — открывает IP посетителя; белый список, срок, закрытие"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        url=http://127.0.0.1:8099/access/$TOKEN
+        notify=/tmp/verify-access-notify; rm -f $notify
+        install -d /run/systemd/system/infra-access.service.d
+        printf '[Service]\nEnvironment=INFRA_NOTIFY_DRY=%s\n' $notify > /run/systemd/system/infra-access.service.d/dry.conf
+        systemctl daemon-reload
+        rule() { ufw show added | grep -c "from $1 to any port 22 proto tcp comment 'infra-access "; }
+        post() { curl -s -X POST -H "X-Real-Ip: $1" $url; }
+        curl -s -H 'X-Real-Ip: 1.1.1.1' $url >/dev/null; echo "view=$(rule 1.1.1.1)"
+        echo "open=$(post 1.1.1.1 | grep -c 'SSH открыт для 1.1.1.1'):$(rule 1.1.1.1)"
+        echo "again=$(post 1.1.1.1 | grep -c 'SSH открыт для 1.1.1.1'):$(rule 1.1.1.1)"
+        echo "notified=$(grep -c 'SSH открыт для 1.1.1.1' $notify 2>/dev/null)"
+        echo "status=$(infra status | grep -c 'Доступ по ссылке: 1.1.1.1 до')"
+        echo "white=$(post {{ admin_ips | first }} | grep -c 'уже в белом списке'):$(rule {{ admin_ips | first }})"
+        echo "private=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'X-Real-Ip: 10.0.0.1' $url)"
+        echo "expire=$(infra-access expire --now 4102444800 && rule 1.1.1.1):$(tail -n 5 /var/log/infra.log | grep -c 'SSH для 1.1.1.1 закрыт — срок вышел')"
+        post 1.0.0.1 >/dev/null
+        echo "close=$(rule 1.0.0.1):$(infra-access close all >/dev/null && rule 1.0.0.1)"
+        rm -rf /run/systemd/system/infra-access.service.d $notify; systemctl daemon-reload
+      args:
+        executable: /bin/bash
+      environment:
+        TOKEN: "{{ secrets_file.access_token }}"
+      register: access
+      changed_when: true
+      no_log: true
+
+    - name: "8. Ссылка доступа работает"
+      vars:
+        r: "{{ dict(access.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.view == '0'                     # просмотр страницы (предпросмотр мессенджера) ничего не открыл
+          - r.open == '1:1'
+          - r.again == '1:1'                  # повторно — продлено, правило одно
+          - r.notified | int >= 1             # уведомление ушло
+          - r.status == '1'
+          - r.white == '1:0'                  # IP из белого списка — временного правила нет
+          - r.private == '400'
+          - r.expire == '0:1'                 # срок вышел — закрыто, событие в журнале
+          - r.close == '1:0'
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
+        quiet: true
+
+    # ================= 9. Копия базы прод → dev =================
+    # На тестовом сервере есть shop_dev (server.yml). shop — «прод», shop_dev — «dev» со своей
+    # таблицей (как новая миграция) и своим файлом
+    - name: "9. project-db-copy: только в *_dev; снимок до замены; база заменена целиком; файлы; откат; project-db-dump"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        q() { runuser -u postgres -- psql -X -q -d "$1" -tAc "$2"; }
+        has() { q "$1" "SELECT count(*) FROM pg_tables WHERE tablename = '$2'"; }
+        # расширение в проде (ставит администратор) и индекс на нём — копия переносит и их
+        q shop "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+        q shop "SET ROLE shop; DROP TABLE IF EXISTS verify_c; CREATE TABLE verify_c(v text); INSERT INTO verify_c VALUES ('prod')"
+        q shop "SET ROLE shop; CREATE INDEX verify_c_trgm ON verify_c USING gin (v gin_trgm_ops)"
+        q shop_dev "SET ROLE shop_dev; DROP TABLE IF EXISTS verify_devonly; CREATE TABLE verify_devonly(v text)"
+        install -d /srv/projects/shop/web/media /srv/projects/shop_dev/web/media
+        echo prod > /srv/projects/shop/web/media/verify-c.txt; echo dev > /srv/projects/shop_dev/web/media/dev-only.txt
+        echo "refuse_prod=$(project-db-copy -y shop_dev shop 2>&1 | grep -c 'только в проект \*_dev'):$(has shop verify_c)"
+        echo "refuse_tty=$(project-db-copy shop shop_dev </dev/null 2>&1 | grep -c 'нужно подтверждение'):$(has shop_dev verify_devonly)"
+        out=$(project-db-copy -y --files shop shop_dev 2>&1); echo "rc=$?"
+        snap=$(grep -oE 'project-restore shop_dev /etc/restic/env [0-9a-f]+' <<<"$out" | awk '{print $NF}' | tail -1)
+        owner=$(q shop_dev "SELECT tableowner FROM pg_tables WHERE tablename = 'verify_c'")
+        echo "copied=$(q shop_dev 'SELECT v FROM verify_c'):$(has shop_dev verify_devonly):$owner"
+        trgm() { q shop_dev "SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'"; }
+        echo "ext=$(trgm):$(q shop_dev "SELECT count(*) FROM pg_indexes WHERE indexname = 'verify_c_trgm'")"
+        m=/srv/projects/shop_dev/web/media
+        echo "files=$(cat $m/verify-c.txt):$([ -e $m/dev-only.txt ] && echo kept || echo gone):$(stat -c %G $m/verify-c.txt)"
+        echo "logged=$(tail -n 10 /var/log/infra.log | grep -c 'копия базы shop → shop_dev с файлами: готово')"
+        project-restore shop_dev /etc/restic/env "$snap" >/dev/null 2>&1
+        echo "undo=$(has shop_dev verify_devonly):$(has shop_dev verify_c):$([ -e $m/dev-only.txt ] && echo kept || echo gone):$(trgm)"
+        project-db-dump shop > /tmp/verify-dump.pgdump; echo "dump=$?:$(pg_restore -l /tmp/verify-dump.pgdump | grep -c 'TABLE public verify_c')"
+        q shop "DROP TABLE IF EXISTS verify_c; DROP EXTENSION IF EXISTS pg_trgm"
+        q shop_dev "DROP TABLE IF EXISTS verify_c; DROP TABLE IF EXISTS verify_devonly; DROP EXTENSION IF EXISTS pg_trgm"
+        rm -f /srv/projects/shop/web/media/verify-c.txt $m/verify-c.txt $m/dev-only.txt /tmp/verify-dump.pgdump
+      args:
+        executable: /bin/bash
+      register: dbcopy
+      changed_when: true
+
+    - name: "9. Копия базы работает и защищает прод"
+      vars:
+        r: "{{ dict(dbcopy.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.refuse_prod == '1:1'            # в прод нельзя: отказ, прод не тронут
+          - r.refuse_tty == '1:1'             # без терминала и -y — отказ, dev не тронут
+          - r.rc == '0'
+          - r.copied == 'prod:0:shop_dev'     # данные прода; таблицы только dev нет; владелец — роль dev
+          - r.ext == '1:1'                    # расширение прода и индекс на нём — в dev
+          - r.files == 'prod:gone:shop_dev-dev'   # файлы прода, лишний файл dev убран, группа — dev
+          - r.logged == '1'
+          - r.undo == '1:0:kept:0'            # снимок до замены вернул dev точно: без таблицы и расширения копии
+          - r.dump == '0:1'
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
+        quiet: true

@@ -1,0 +1,3 @@
+expect_error: "db — только postgres"
+projects:
+  site: {net: 5, db: mysql, devs: [ivan]}

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Управляется Ansible.
+# Доступ к базе проекта — в его .env, строками DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+# (их читает приложение; прежние такие строки заменяются). Пароль на экран не выводится:
+#   sudo project-db-env shop              # DB_* — боевой проект
+#   sudo project-db-env shop_dev DEV_     # DEV_DB_* — dev-проект с DEV=True
+# Нужен при создании проекта и после смены пароля базы; затем пересоздать контейнеры:
+#   sudo project-compose shop up -d --force-recreate
+# Пароль — db_password_<проект> из /etc/infra/secrets.yml, адрес — шлюз сети проекта (172.20.<net>.1).
+set -euo pipefail
+NAME=${1:?Использование: project-db-env <проект> [приставка, например DEV_]}
+PREFIX=${2:-}
+ENV_FILE=/srv/projects/$NAME/web/.env
+die() { echo "project-db-env: $*" >&2; exit 1; }
+
+[[ $NAME =~ ^[a-z][a-z0-9_]*$ ]] || die "имя проекта — строчные латинские буквы, цифры и _"
+[[ $PREFIX =~ ^[A-Z0-9_]*$ ]] || die "приставка — заглавные латинские буквы, цифры и _ (например DEV_)"
+PASSWORD=$(sed -nE "s/^db_password_$NAME:[[:space:]]*\"?([^\"]*)\"?[[:space:]]*$/\1/p" /etc/infra/secrets.yml)
+[ -n "$PASSWORD" ] || die "у проекта $NAME нет базы: нет db_password_$NAME в /etc/infra/secrets.yml"
+HOST=$(docker network inspect "proj-$NAME" -f '{{(index .IPAM.Config 0).Gateway}}')
+[ -f "$ENV_FILE" ] || die "нет $ENV_FILE — сначала .env проекта"
+
+# sed -i и >> от root сохраняют владельца и права файла
+sed -i -E "/^${PREFIX}DB_(HOST|PORT|NAME|USER|PASSWORD)=/d" "$ENV_FILE"
+printf '%sDB_HOST=%s\n%sDB_PORT=5432\n%sDB_NAME=%s\n%sDB_USER=%s\n%sDB_PASSWORD=%s\n' \
+  "$PREFIX" "$HOST" "$PREFIX" "$PREFIX" "$NAME" "$PREFIX" "$NAME" "$PREFIX" "$PASSWORD" >>"$ENV_FILE"
+echo "${PREFIX}DB_* в $ENV_FILE обновлены. Контейнеры увидят их после: sudo project-compose $NAME up -d --force-recreate"

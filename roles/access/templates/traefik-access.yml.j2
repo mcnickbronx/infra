@@ -1,0 +1,16 @@
+# Управляется Ansible (роль access). Ссылка доступа: https://{{ access_host }}/access/<секрет> —
+# страница на 127.0.0.1:{{ access_web_port }} (Traefik в сети хоста). Сертификат — Let's Encrypt (le),
+# как у сайтов. Не чаще 10 запросов в минуту с адреса (login-ratelimit): подбирать секрет бессмысленно,
+# а перебор путей CrowdSec банит
+http:
+  routers:
+    infra-access:
+      rule: "Host(`{{ access_host }}`) && PathPrefix(`/access/`)"
+      entryPoints: [websecure]
+      service: infra-access
+      middlewares: [login-ratelimit@file]
+  services:
+    infra-access:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:{{ access_web_port }}"

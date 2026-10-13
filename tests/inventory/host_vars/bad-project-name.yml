@@ -1,0 +1,3 @@
+expect_error: "Имя проекта 'Shop'"
+projects:
+  Shop: {net: 5, devs: [ivan]}

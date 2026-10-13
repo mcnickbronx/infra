@@ -1,0 +1,9 @@
+# Копия в S3 (уровень 3): restic copy из локального репозитория (RESTIC_FROM_*) в S3.
+# Папка сервера; репозиторий — её подпапка <дата начала>, новая каждые 14 дней (backup-s3-copy)
+RESTIC_REPOSITORY=s3:https://s3.fixture.test/backups/full
+RESTIC_PASSWORD=fixtureResticFull000000000000000000000000000000
+AWS_ACCESS_KEY_ID=fixtureAccessKeyFull
+AWS_SECRET_ACCESS_KEY=fixtureSecretKeyFull0000000000000000000000000
+RESTIC_FROM_REPOSITORY=/var/backups/restic
+RESTIC_FROM_PASSWORD=fixtureResticFull000000000000000000000000000000
+RESTIC_CACHE_DIR=/var/cache/restic

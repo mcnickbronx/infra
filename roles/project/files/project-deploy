@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Управляется Ansible (роль project).
+# Автовыкладка проекта из реестра образов (autodeploy: true у проекта в server.yml):
+#   project-deploy <проект>            — выложить, если в реестре новый образ (так каждые 15 секунд
+#                                        зовёт таймер project-deploy@<проект>.timer)
+#   project-deploy <проект> rollback   — вернуть версию, которая стояла до последней выкладки
+#
+# Договорённость с проектом (TEAM.md, «Автовыкладка»):
+#   - в .env проекта DEPLOY_IMAGE=ghcr.io/<владелец>/<образ>:<ветка> — его собирает CI;
+#   - в образе /deploy/compose.yml — compose проекта, в нём image: ${DEPLOY_IMAGE};
+#   - сервис deploy (профиль deploy) готовит выкладку: миграции, статика. Нет его — шаг пропускается.
+# compose.yml из образа запускается от root без проверки: кто пушит в ветку, тот root
+# на сервере (DECISIONS.md, «Автовыкладка»).
+#
+# Версия — дайджест образа в реестре (repo@sha256:...): по нему образ можно скачать снова,
+# даже если его уже удалила еженедельная очистка Docker. Сбой на любом шаге — возвращаются
+# прежний образ и прежний compose.yml (при первой выкладке — те, что запускали руками),
+# а эта версия больше не пробуется (ждём следующую). Об ошибке сообщает health-check.
+#
+# Состояние — файлы /var/lib/project-deploy/<проект>.*:
+#   current      версия, которая работает
+#   previous     версия до неё — для rollback
+#   failed-ref   версия, которая не удалась или откачена: таймер её больше не выкладывает
+#   failed       когда и на каком шаге не удалось, что работает теперь — по нему health-check
+#                шлёт уведомление
+#   lock         одна выкладка проекта за раз
+#
+# Порядок в файле: состояние, шаги выкладки, deploy и rollback, запуск — в самом конце.
+set -Eeuo pipefail
+
+NAME=${1:?Использование: project-deploy <проект> [rollback]}
+ACTION=${2:-deploy}
+[[ $NAME =~ ^[a-z][a-z0-9_]*$ ]] || { echo "Недопустимое имя проекта: $NAME" >&2; exit 1; }
+[[ $ACTION =~ ^(deploy|rollback)$ ]] ||
+  { echo "Неизвестное действие «${ACTION}»: project-deploy <проект> [rollback]" >&2; exit 1; }
+WEB=/srv/projects/$NAME/web
+STATE=/var/lib/project-deploy/$NAME
+
+# ---------- Состояние ----------
+state() { cat "$STATE.$1" 2>/dev/null || true; }       # state current — версия или пусто
+set_state() { echo "$2" > "$STATE.$1"; }               # set_state current <версия>
+
+# Версия для журнала событий: образ и начало дайджеста (repo@sha256:0123456789ab)
+short() { sed -E 's/(sha256:[0-9a-f]{12})[0-9a-f]*/\1/' <<<"${1:-—}"; }
+
+# ---------- Шаги выкладки ----------
+compose() { project-compose "$NAME" "$@"; }
+
+# Версия образа: первый дайджест реестра (repo@sha256:...); у образа без реестра — пусто
+version_of() { docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null | head -1; }
+
+# Образ (Id), на котором работают сервисы проекта с образом из .env, — до первой автовыкладки
+# проект запускали руками. Не запущен — пусто
+running_image() {
+  docker ps -q --filter "label=com.docker.compose.project=$NAME" |
+    xargs -r docker inspect -f '{{.Config.Image}} {{.Image}}' |
+    awk -v img="$IMAGE" '$1 == img { id = $2 } END { print id }' || true
+}
+
+# Проект — на версию $1: образ — под именем из .env, его compose.yml — в папку проекта
+# (прежний — в compose.yml.prev, его возвращает restore)
+switch_to() {
+  cp -p compose.yml compose.yml.prev 2>/dev/null || true
+  docker pull -q "$1" >/dev/null && docker tag "$1" "$IMAGE" &&
+    docker run --rm --entrypoint cat "$IMAGE" /deploy/compose.yml > compose.yml.new &&
+    mv compose.yml.new compose.yml
+}
+
+# Вернуть, как было до switch_to: прежний compose.yml и образ $1 (версия или Id) — и запустить.
+# Код ошибки — если возвращать нечего ($1 пуст) или проект не поднялся
+restore() {
+  [ ! -f compose.yml.prev ] || mv compose.yml.prev compose.yml
+  [ -n "$1" ] && docker tag "$1" "$IMAGE" && up
+}
+
+# Папки проекта, которые монтирует compose: нет — создать с записью для группы, как web/
+# (иначе их создаст Docker от root, и приложение не сможет туда писать). Сервисы — и запущенные,
+# и deploy: --profile в команде заменяет профили из .env, поэтому два прохода
+make_dirs() {
+  { compose config --format json; compose --profile deploy config --format json; } |
+    jq -r '.services[].volumes[]? | select(.type == "bind") | .source' |
+    sort -u | while read -r d; do
+      case $d in "$WEB"/*) [ -e "$d" ] || { mkdir -p "$d" && chmod 2770 "$d"; } || exit 1 ;; esac
+    done
+}
+
+up() { compose up -d --wait --wait-timeout 180 --remove-orphans; }
+
+# ---------- Выкладка новой версии ----------
+# OLD — версия, которая работает, NEW — версия из реестра, BACK — что вернуть при сбое: OLD,
+# а при первой выкладке — образ, на котором проект запускали руками (общие для deploy и fail)
+deploy() {
+  OLD=$(state current)
+  BACK=${OLD:-$(running_image)}
+  docker pull -q "$IMAGE" >/dev/null
+  NEW=$(version_of "$IMAGE")
+  [ -n "$NEW" ] || { echo "$NAME: у образа $IMAGE нет дайджеста реестра" >&2; exit 1; }
+  [ "$NEW" != "$OLD" ] || exit 0                         # нового нет — так почти при каждой проверке
+  if [ "$NEW" = "$(state failed-ref)" ]; then            # эта версия уже не удалась — ждём следующую;
+    [ -z "$BACK" ] || docker tag "$BACK" "$IMAGE"        # docker pull перевесил имя из .env на неё — вернуть
+    exit 0
+  fi
+
+  echo "$NAME: новая версия $NEW"
+  switch_to "$NEW" || fail "compose.yml из образа"
+  make_dirs || fail "папки проекта"
+  # Список сервисов — целиком в переменную: grep -q закрыл бы конвейер на первом совпадении,
+  # compose получил бы SIGPIPE, и с pipefail подготовка молча пропускалась бы
+  services=$(compose --profile deploy config --services) || fail "чтение compose.yml"
+  if grep -qx deploy <<<"$services"; then
+    compose run --rm deploy || fail "подготовка (сервис deploy)"
+  fi
+  up || fail "запуск"
+
+  [ -z "$OLD" ] || set_state previous "$OLD"
+  set_state current "$NEW"
+  rm -f "$STATE.failed" "$STATE.failed-ref" compose.yml.prev
+  echo "$NAME: выложено"
+  infra-log "выкладка $NAME: готово, $(short "$NEW")"
+}
+
+# Шаг $1 не удался: эту версию больше не пробовать, вернуть прежние образ и compose.yml.
+# Отметки — до возврата: оборвись он, таймер всё равно не возьмёт эту версию снова
+fail() {
+  local when result
+  when=$(date '+%F %H:%M')
+  echo "$NAME: не удалось на шаге «$1» — возвращаю прежнюю версию" >&2
+  set_state failed-ref "$NEW"
+  set_state failed "$when $1"
+  if restore "$BACK"; then
+    result="работает прежняя версия"
+  elif [ -z "$BACK" ]; then
+    result="прежней версии нет"
+  else
+    result="и прежняя версия не поднялась — нужен администратор"
+  fi
+  set_state failed "$when $1: $result"
+  echo "$NAME: $result" >&2
+  infra-log "выкладка $NAME: $(short "$NEW") не удалась на шаге «$1» — $result"
+  exit 1
+}
+
+# ---------- Откат вручную ----------
+# Откат — решение администратора, не сбой: health-check о нём не сообщает
+rollback() {
+  local prev cur
+  prev=$(state previous)
+  [ -n "$prev" ] || { echo "$NAME: прежней версии нет — откатывать нечего" >&2; exit 1; }
+  cur=$(state current)
+  echo "$NAME: возвращаю $prev"
+  if ! { switch_to "$prev" && make_dirs && up; }; then
+    if restore "$cur"; then
+      echo "$NAME: откат не удался — работает версия, которая была" >&2
+      infra-log "откат $NAME на $(short "$prev"): не удался, работает прежняя версия"
+    else
+      echo "$NAME: откат не удался, и версия, которая была, не поднялась — нужен администратор" >&2
+      infra-log "откат $NAME на $(short "$prev"): не удался, и прежняя версия не поднялась"
+    fi
+    exit 1
+  fi
+  set_state current "$prev"
+  set_state failed-ref "$cur"                            # таймер не выложит её снова — только следующую
+  rm -f "$STATE.previous" "$STATE.failed" compose.yml.prev
+  echo "$NAME: откат выполнен"
+  infra-log "откат $NAME: готово, работает $(short "$prev")"
+}
+
+# ---------- Запуск ----------
+mkdir -p /var/lib/project-deploy
+exec 9>"$STATE.lock"
+if [ "$ACTION" = deploy ]; then
+  flock -n 9 || exit 0                                  # прошлая выкладка ещё идёт — проверим через 15 секунд
+else
+  # Откат вручную ждёт, пока таймер закончит проверку (около секунды). Идёт выкладка — не ждём:
+  # после неё «прежней» станет другая версия
+  flock -w 30 9 || { echo "$NAME: идёт выкладка — откат не выполнен; посмотрите журнал и повторите" >&2; exit 1; }
+fi
+cd "$WEB"
+IMAGE=$(sed -n 's/^DEPLOY_IMAGE=//p' .env 2>/dev/null | tail -1 | tr -d "\"'") || true   # нет .env — пусто
+[ -n "$IMAGE" ] || { echo "$NAME: нет DEPLOY_IMAGE в .env — автовыкладка не настроена" >&2; exit 1; }
+
+case $ACTION in
+  deploy) deploy ;;
+  rollback) rollback ;;
+esac

@@ -1,0 +1,152 @@
+- name: Папка для ключей apt
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Есть ли ключ репозитория Docker
+  ansible.builtin.stat:
+    path: /etc/apt/keyrings/docker.asc
+  register: docker_key
+
+# Скачивается один раз: get_url в --check сообщает «изменено» даже про уже скачанный ключ,
+# и предпросмотр infra apply находил бы изменение там, где его нет
+- name: Ключ репозитория Docker
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+  when: not docker_key.stat.exists
+
+- name: Репозиторий Docker
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: deb
+    uris: https://download.docker.com/linux/ubuntu
+    suites: "{{ ansible_distribution_release }}"
+    components: stable
+    architectures: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+    signed_by: /etc/apt/keyrings/docker.asc
+
+# Исправления внутри мажорной версии ставит update.yml,
+# переход на новую — вручную: docker_major_version в main.yml, проверка на тестовой VDS.
+# containerd.io (в нём runc) не закреплён: исправления побегов из контейнеров идут через него.
+- name: Мажорная версия Docker закреплена
+  ansible.builtin.copy:
+    content: |
+      # Управляется Ansible
+      Package: docker-ce docker-ce-cli docker-ce-rootless-extras
+      Pin: version 5:{{ docker_major_version }}.*
+      Pin-Priority: 990
+    dest: /etc/apt/preferences.d/docker
+    mode: "0644"
+
+- name: Установка Docker
+  ansible.builtin.apt:
+    name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+    update_cache: true
+
+# userns-remap: контейнеры работают в диапазоне uid/gid dockremap (base .. base+65535)
+- name: Пользователь dockremap для userns-remap
+  ansible.builtin.user:
+    name: dockremap
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+
+- name: Диапазоны uid/gid для dockremap
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    regexp: "^dockremap:"
+    line: "dockremap:{{ docker_remap_base }}:65536"
+    create: true
+    mode: "0644"
+  loop: [/etc/subuid, /etc/subgid]
+  notify: Restart docker
+
+# no-new-privileges для всех контейнеров: setuid-программы внутри не дают повышения прав.
+# base.yml задаёт то же самое для сервисов с extends, но extends никто не проверяет.
+# ip 127.0.0.1: `ports: ["8080:80"]` без адреса открывает порт только на localhost.
+# Иначе Docker открыл бы его в интернет мимо ufw. Явный 0.0.0.0:... по-прежнему откроет.
+- name: Настройки демона (ротация логов, пулы адресов, userns-remap, no-new-privileges, ports на localhost)
+  ansible.builtin.template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+  notify: Restart docker
+
+- name: Docker запущен
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Применить настройки Docker до создания сетей
+  ansible.builtin.meta: flush_handlers
+
+# Лимиты проектов — systemd slice (cgroup_parent в base.yml). Это работает только с cgroup v2
+# и драйвером systemd (так по умолчанию в Ubuntu). Иначе лимиты молча не действуют.
+- name: Драйвер cgroup Docker
+  ansible.builtin.command: docker info --format "{{ '{{' }}.CgroupDriver{{ '}}' }} {{ '{{' }}.CgroupVersion{{ '}}' }}"
+  register: docker_cgroup
+  changed_when: false
+  check_mode: false     # только читает; иначе в --check stdout пустой и проверка ниже падает
+  # --check на свежем сервере: Docker ещё не установлен — проверять нечего
+  failed_when: docker_cgroup.rc != 0 and not ansible_check_mode
+
+- name: Docker управляет cgroup через systemd (cgroup v2) — иначе лимиты проектов не работают
+  ansible.builtin.assert:
+    that: docker_cgroup.stdout == 'systemd 2'
+    fail_msg: "docker info: {{ docker_cgroup.stdout }} — нужен драйвер systemd и cgroup v2"
+    quiet: true
+  when: docker_cgroup.rc == 0 or not ansible_check_mode
+
+# ---------- Сети проектов ----------
+# Проект с net: N — сеть proj-<проект>, подсеть 172.20.N.0/24; шлюз 172.20.N.1 — адрес хоста
+# (Postgres) для контейнеров проекта, та же формула в pg_hba.conf. Сети, которые
+# compose создаёт сам, берутся из 172.24.0.0/13 (daemon.json) и с этими не пересекаются.
+# Подсеть меняется только пересозданием сети; с работающими контейнерами модуль
+# откажется — поэтому net проекта после запуска не меняют.
+- name: Сети проектов (proj-<имя>)
+  community.docker.docker_network:
+    name: "proj-{{ item.key }}"
+    ipam_config:
+      - subnet: "172.20.{{ item.value.net }}.0/24"
+        gateway: "172.20.{{ item.value.net }}.1"
+  loop: "{{ projects | dict2items }}"
+  loop_control:
+    label: "proj-{{ item.key }}"
+
+- name: Общие настройки безопасности для compose (/srv/infra/compose/base.yml)
+  ansible.builtin.file:
+    path: /srv/infra/compose
+    state: directory
+    mode: "0755"
+
+- name: base.yml
+  ansible.builtin.template:
+    src: base.yml.j2
+    dest: /srv/infra/compose/base.yml
+    mode: "0644"
+
+# ---------- Очистка ----------
+# Раз в неделю — образы и кеш сборки, не нужные ни одному контейнеру и старше 7 дней.
+# Тома (данные) не трогает.
+- name: Очистка Docker — скрипт, сервис и таймер
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: docker-cleanup.sh, dest: /usr/local/bin/docker-cleanup.sh, mode: "0755" }
+    - { src: docker-cleanup.service, dest: /etc/systemd/system/docker-cleanup.service, mode: "0644" }
+    - { src: docker-cleanup.timer, dest: /etc/systemd/system/docker-cleanup.timer, mode: "0644" }
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: Таймер очистки Docker включён
+  ansible.builtin.systemd:
+    name: docker-cleanup.timer
+    enabled: true
+    state: started
+    daemon_reload: true

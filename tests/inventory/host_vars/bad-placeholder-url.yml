@@ -1,0 +1,2 @@
+expect_error: "backup_healthcheck_url"
+backup_healthcheck_url: "https://hc-ping.com/замените"

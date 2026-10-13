@@ -1,0 +1,26 @@
+[
+    {
+        "db": "postgres",
+        "every": 60,
+        "hourly": "all",
+        "name": "shop"
+    },
+    {
+        "db": "postgres",
+        "every": 5,
+        "hourly": "db",
+        "name": "crm"
+    },
+    {
+        "db": null,
+        "every": null,
+        "hourly": null,
+        "name": "blog"
+    },
+    {
+        "db": null,
+        "every": null,
+        "hourly": null,
+        "name": "static"
+    }
+]

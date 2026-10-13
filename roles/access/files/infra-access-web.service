@@ -1,0 +1,22 @@
+[Unit]
+Description=Access link page: open SSH for the visitor's IP (infra access_link)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/infra-access-web
+# Без прав: секрета не знает (только sha256), правила ufw ставит root — infra-access.path
+DynamicUser=yes
+RuntimeDirectory=infra-access/queue infra-access/done
+RuntimeDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=64M
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Управляется Ansible.
+# docker compose проекта из его папки, с его .env — для администратора
+# и скриптов (восстановление, проверки):
+#   sudo project-compose shop up -d
+#   sudo project-compose shop down
+#   sudo project-compose shop ps
+# Нет compose-файла — ничего не делает и пишет «нет compose-файла» (код 0):
+# проект может быть просто файлами.
+set -euo pipefail
+NAME=${1:?Использование: project-compose <проект> <команда docker compose...>}
+shift
+[[ $NAME =~ ^[a-z][a-z0-9_]*$ ]] || { echo "Недопустимое имя проекта: $NAME" >&2; exit 1; }
+DIR=/srv/projects/$NAME/web
+[ -d "$DIR" ] || { echo "Нет проекта $NAME ($DIR)" >&2; exit 1; }
+cd "$DIR"
+
+# Имена, которые docker compose ищет сам, в его порядке
+for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml ""; do
+  [ -z "$f" ] && { echo "нет compose-файла в $DIR — пропуск"; exit 0; }
+  [ -f "$f" ] && break
+done
+
+args=()
+[ -f .env ] && args+=(--env-file .env)
+exec docker compose "${args[@]}" "$@"

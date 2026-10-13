@@ -1,0 +1,7 @@
+[Unit]
+Description=Docker cleanup (unused images, build cache)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/docker-cleanup.sh

@@ -1,0 +1,15 @@
+# Общее для всех тестовых серверов — то, что на настоящем сервере обязательно в server.yml.
+# (Здесь, а не в group_vars/all: умолчания движка в tests/group_vars важнее группы all инвентаря.)
+# Вымышленные адреса и ключ: эталонные файлы не меняются, когда меняются ваши.
+server_name: "{{ inventory_hostname }}"
+admin_keys: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureAdminKey000000000000000000000 admin@fixture"
+admin_ips: [192.0.2.10, 198.51.100.0/29, "2001:db8::10"]
+acme_email: admin@fixture.test
+
+# Факты сервера (gather_facts не нужен: серверов нет)
+ansible_distribution: Ubuntu
+ansible_distribution_version: "26.04"
+ansible_distribution_release: resolute
+ansible_architecture: x86_64
+ansible_memtotal_mb: 4096
+ansible_processor_vcpus: 4

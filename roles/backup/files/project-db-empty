@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Управляется Ansible (роль backup). Служебная — её зовут project-restore и project-db-copy.
+# Очистить базу проекта перед заливкой копии или снимка: удалить схемы, которыми владеет роль
+# проекта, и public (в базе проекта её владелец — тоже роль проекта), public создать заново такой,
+# как в новой базе. Иначе таблицы, которых нет в заливаемом дампе (новые миграции, добавленное после
+# снимка), остались бы со старыми данными, и «вернуть как было» не было бы точным.
+# Расширения в public удаляются вместе с ней — заливка ставит их заново от postgres. Подключения
+# к базе обрываются: контейнеры проекта к этому моменту остановлены.
+#   project-db-empty <проект>
+set -Eeuo pipefail
+NAME=${1:?Использование: project-db-empty <проект>}
+[[ $NAME =~ ^[a-z][a-z0-9_]*$ ]] || { echo "Недопустимое имя проекта: $NAME" >&2; exit 1; }
+cd /tmp
+runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 -d "$NAME" <<SQL
+SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() \gset
+DO \$\$
+DECLARE s name;
+BEGIN
+  FOR s IN SELECT n.nspname FROM pg_namespace n
+           WHERE n.nspname = 'public' OR n.nspowner = (SELECT oid FROM pg_roles WHERE rolname = '$NAME')
+  LOOP
+    EXECUTE format('DROP SCHEMA %I CASCADE', s);
+  END LOOP;
+END \$\$;
+CREATE SCHEMA public AUTHORIZATION pg_database_owner;
+GRANT USAGE ON SCHEMA public TO PUBLIC;
+COMMENT ON SCHEMA public IS 'standard public schema';
+SQL

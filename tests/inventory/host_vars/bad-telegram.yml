@@ -1,0 +1,2 @@
+expect_error: "telegram_chat_id задан без telegram_bot_token"
+secrets_file: {telegram_chat_id: "-1001234567890"}

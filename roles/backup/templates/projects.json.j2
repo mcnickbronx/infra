@@ -1,0 +1,8 @@
+{#- Проекты сервера для project-backup / project-restore / backup-hourly: имя, тип базы (пользователь базы = имя
+    проекта), частые снимки (db — только база, all — база и папки, null — нет) и как часто, минут -#}
+{% set items = [] %}
+{% for name, p in projects.items() %}
+{%   set _ = items.append({'name': name, 'db': p.db | default(none), 'hourly': p.backup_hourly | default(none),
+                           'every': (p.backup_every | default(60) | int) if p.backup_hourly is defined else none}) %}
+{% endfor %}
+{{ items | to_nice_json }}

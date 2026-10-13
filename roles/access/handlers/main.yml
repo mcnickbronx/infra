@@ -1,0 +1,7 @@
+# Предпросмотр (--check) службу не устанавливает: перезапускать на новом сервере нечего
+- name: Restart infra-access-web
+  ansible.builtin.systemd:
+    name: infra-access-web.service
+    state: restarted
+    daemon_reload: true
+  when: access_link and (not ansible_check_mode or access_unit.stat.exists)

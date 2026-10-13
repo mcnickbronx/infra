@@ -1,0 +1,3 @@
+expect_error: "backup_every — минут между снимками: 1, 5, 15, 30 или 60"
+projects:
+  site: {net: 5, db: postgres, backup_hourly: db, backup_every: 10, devs: [ivan]}

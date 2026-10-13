@@ -1,0 +1,12 @@
+# Управляется Ansible (роль monitoring). Каждые 10 минут: нагрузку и место ловить вовремя.
+# Уведомление — только когда что-то появилось или прошло, не каждые 10 минут
+[Unit]
+Description=Server health check every 10 minutes
+
+[Timer]
+OnCalendar=*:0/10
+RandomizedDelaySec=1m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

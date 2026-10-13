@@ -1,0 +1,2 @@
+expect_error: "не участники проектов"
+docker_users: [pavel]

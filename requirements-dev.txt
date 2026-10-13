@@ -1,0 +1,7 @@
+# Инструменты проверок — одни и те же версии у администратора и в CI
+# (tools/check.sh, .github/workflows/lint.yml). Ставятся в .venv репозитория: make venv.
+# ansible — та же версия, на которой всё проверено (коллекции — requirements.yml).
+# Обновление: поднять версии здесь, make venv && make check, проверить на тестовой VDS.
+ansible==14.4.0
+ansible-lint==26.9.0
+shellcheck-py==0.11.0.1

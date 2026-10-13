@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# Управляется Ansible (роль monitoring). Проверки сервера: каждая — функция check_*, их список —
+# в конце файла. О проблеме проверка сообщает через problem "что" ["подробности"]: текст уходит
+# в уведомление как есть, поэтому в нём — и что делать.
+#   health-check.sh            — показать проблемы (вручную, tests/); ничего не отправляет
+#   health-check.sh --notify   — каждые 10 минут (health-check.timer): в Telegram (infra-notify) —
+#                                только что появилось и что прошло; пинг monitor_healthcheck_url
+#   health-check.sh --summary  — раз в день (health-check-summary.timer): сводка в Telegram —
+#                                всё в порядке или список проблем; диски, нагрузка, память, бэкап.
+#                                Нет утренней сводки — сервер лежит
+# Та же проблема с другими числами (диск 85% → 86%) — не новая: сравнивается «что» без цифр.
+# Выросла до критичной — новая: в тексте появляется «КРИТИЧНО».
+set -uo pipefail
+
+MODE=${1:-}
+case $MODE in ""|--notify|--summary) ;; *) echo "Использование: health-check.sh [--notify | --summary]" >&2; exit 2 ;; esac
+SERVER={{ inventory_hostname }}
+HC_URL="{{ monitor_healthcheck_url }}"
+DISK_LIMIT={{ disk_alert_percent }}
+DISK_CRITICAL={{ backup_disk_stop_percent }}    # с этого заполнения ночной бэкап не пишется
+MEM_LIMIT={{ memory_alert_percent }}
+BACKUP_REPO={{ restic_local_repo }}
+ACME={{ traefik_dir }}/acme/acme.json
+PROJECTS=" {{ projects.keys() | sort | join(' ') }} "     # проекты сервера; пробелы по краям — для поиска " имя "
+UPDATE_CMD="sudo infra update"
+EVENTS=/var/log/infra.log                      # журнал событий: итог ночного бэкапа
+HOURLY="{{ hourly_backup_projects | join(' ') }}"   # проекты с частыми снимками (backup_hourly)
+HOURLY_LATE={{ [(backup_hourly_step | int) * 3, 60] | max }}   # минут без удачных частых снимков — тревога
+STATE=${HEALTH_STATE_DIR:-/var/lib/health-check}/problems   # о чём уже сообщили (--notify)
+FAILED=${STATE%/*}/notify-failed               # не удалось отправить — повтор не раньше чем через час
+RESOLVE_MIN=${HEALTH_RESOLVE_MINUTES:-30}      # «прошло» — когда проблемы нет столько минут
+{% raw %}
+PROBLEMS=""
+# problem "что" ["подробности"]: «что» без цифр — ключ проблемы для --notify
+problem() { PROBLEMS+="$1"$'\t'"${2:-}"$'\n'; }
+
+# Проект по рабочей папке compose: /srv/projects/shop/web → shop; не из папки проекта — пусто
+project_of() {
+  case $1 in /srv/projects/*) local d=${1#/srv/projects/}; echo "${d%%/*}" ;; esac
+}
+
+# ---------- Система ----------
+
+# Диски заполнены больше порога — и кто занял место (проекты, локальные бэкапы, Docker)
+check_disk() {
+  local use mount full=() big d
+  while read -r use mount; do
+    if [ "${use%\%}" -ge "$DISK_CRITICAL" ]; then
+      full+=("КРИТИЧНО: диск $mount заполнен на $use — ночной бэкап уже не пишется")
+    elif [ "${use%\%}" -ge "$DISK_LIMIT" ]; then
+      full+=("Диск $mount заполнен на $use (порог $DISK_LIMIT%)")
+    fi
+  done < <(df --output=pcent,target -x tmpfs -x devtmpfs -x overlay -x squashfs | tail -n +2)
+  [ ${#full[@]} -gt 0 ] || return 0
+  big=$(du -sxh /srv/projects/* "$BACKUP_REPO" /var/lib/docker 2>/dev/null | sort -rh | head -5 \
+        | awk '{printf "%s %s, ", $2, $1}')
+  for d in "${full[@]}"; do
+    problem "$d" "Больше всего места: ${big%, }"
+  done
+}
+
+# Нагрузка за 15 минут выше числа ядер — сервер перегружен (майнер, зависший процесс);
+# вдвое выше — КРИТИЧНО. У каждого проекта лимит — половина CPU, так что это уже несколько
+# проблемных проектов.
+check_cpu() {
+  local load15 cores top what="Сервер перегружен"
+  read -r _ _ load15 _ < /proc/loadavg
+  cores=$(nproc)
+  awk -v l="$load15" -v c="$cores" 'BEGIN { exit !(l > c) }' || return 0
+  if awk -v l="$load15" -v c="$cores" 'BEGIN { exit !(l > 2 * c) }'; then
+    what="КРИТИЧНО: сервер перегружен"
+  fi
+  top=$(docker stats --no-stream --format '{{.Name}} {{.CPUPerc}}' 2>/dev/null | sort -k2 -rn | head -3 \
+        | awk '{printf "%s %s, ", $1, $2}')
+  problem "$what: нагрузка $load15 при $cores CPU" "Больше всех: ${top%, }"
+}
+
+# Свободной памяти (MemAvailable) меньше порога — скоро начнут убивать процессы
+check_free_memory() {
+  local total avail top
+  read -r total avail < <(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { print t, a }' /proc/meminfo)
+  [ $((avail * 100 / total)) -lt "$MEM_LIMIT" ] || return 0
+  top=$(ps -eo rss=,comm= --sort=-rss | head -3 | awk '{printf "%s %d МБ, ", $2, $1 / 1024}')
+  problem "Мало свободной памяти: $((avail / 1024)) из $((total / 1024)) МБ (порог $MEM_LIMIT%)" "Больше всех: ${top%, }"
+}
+
+# Процессы, убитые за час из-за лимита памяти (контейнер упирается в лимит или утечка)
+check_memory() {
+  local oom
+  oom=$(journalctl -k --since "1 hour ago" -q --no-pager 2>/dev/null \
+        | grep -o 'Killed process [0-9]* ([^)]*)' | sed 's/.*(\(.*\))$/\1/' | sort | uniq -c \
+        | awk '{printf "%s ×%s, ", $2, $1}')
+  if [ -n "$oom" ]; then
+    problem "Нехватка памяти, убиты процессы: ${oom%, }. Поднимите лимит памяти сервиса или ищите утечку"
+  fi
+}
+
+check_failed_units() {
+  local units
+  units=$(systemctl --failed --no-legend --plain | awk '{print $1}' | xargs)
+  if [ -n "$units" ]; then
+    problem "Упавшие сервисы: $units"
+  fi
+}
+
+# ---------- Контейнеры ----------
+
+check_restarting() {
+  local names
+  names=$(docker ps --filter status=restarting --format '{{.Names}}' 2>/dev/null | xargs)
+  if [ -n "$names" ]; then
+    problem "Контейнеры перезапускаются по кругу: $names"
+  fi
+}
+
+# Упали и лежат (restart: no, исчерпан on-failure, убиты за нехватку памяти). Не считаются:
+# остановленные вручную (docker stop, compose stop — коды 0, 130, 137, 143) и разовые
+# (docker compose run). Уведомление повторяется, пока контейнер не поднят или не удалён.
+check_crashed() {
+  local cname code oom oneoff why crashed=""
+  while IFS='|' read -r cname code oom oneoff; do
+    [ "$oneoff" = True ] && continue
+    if [ "$oom" = true ]; then
+      why="нехватка памяти"
+    else
+      case $code in 0|130|137|143) continue ;; esac
+      why="код $code"
+    fi
+    crashed+="${cname#/} ($why), "
+  done < <(docker ps -aq --filter status=exited 2>/dev/null | xargs -r docker inspect --format \
+    '{{.Name}}|{{.State.ExitCode}}|{{.State.OOMKilled}}|{{index .Config.Labels "com.docker.compose.oneoff"}}' 2>/dev/null)
+  if [ -n "$crashed" ]; then
+    problem "Контейнеры упали и не перезапускаются: ${crashed%, }. Логи: sudo docker logs <имя>; поднять — sudo project-compose <проект> up -d, не нужен — sudo docker rm <имя>"
+  fi
+}
+
+# Порты на 0.0.0.0 / [::] Docker открывает в интернет мимо ufw. По умолчанию порты
+# публикуются на 127.0.0.1 (daemon.json), так бывает только при явном 0.0.0.0:.
+check_open_ports() {
+  local open
+  open=$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null \
+    | awk '{ n = $1; for (i = 2; i <= NF; i++) if ($i ~ /^(0\.0\.0\.0|\[::\]|::):[0-9]+(-[0-9]+)?->/) { sub(/,$/, "", $i); printf "%s %s, ", n, $i } }')
+  if [ -n "$open" ]; then
+    problem "Порты открыты в интернет в обход файрвола: ${open%, }. Уберите 0.0.0.0 из ports: (сайты — через Traefik)"
+  fi
+}
+
+# Контейнеры из папок проектов. Имя compose-проекта (name: в compose.yml) должно совпадать
+# с папкой: по нему бэкап находит тома проекта, а slice — лимиты. Без name: проект называется
+# «web», и его тома молча не попадают в бэкап. Без extends контейнер вне лимитов проекта.
+check_compose_projects() {
+  local cname cproject wdir cgroup dir wrong_name="" no_limits=""
+  while IFS='|' read -r cname cproject wdir cgroup; do
+    dir=$(project_of "$wdir")
+    [ -n "$dir" ] || continue
+    if [ "$cproject" != "$dir" ]; then
+      wrong_name+="${cname#/} (name: $cproject, папка $dir), "
+    elif [ "$cgroup" != "proj-$dir.slice" ]; then
+      no_limits+="${cname#/}, "
+    fi
+  done < <(docker ps -aq 2>/dev/null | xargs -r docker inspect --format \
+    '{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{.HostConfig.CgroupParent}}' 2>/dev/null)
+  if [ -n "$wrong_name" ]; then
+    problem "Имя compose-проекта не совпадает с папкой, тома не попадают в бэкап: ${wrong_name%, }. Нужно name: <проект> в compose.yml"
+  fi
+  if [ -n "$no_limits" ]; then
+    problem "Контейнеры вне лимитов проекта (нет extends из base.yml): ${no_limits%, }"
+  fi
+}
+
+# ---------- Тома вне бэкапа ----------
+# Бэкап берёт тома проекта по метке compose-проекта, восстановление — только с именем
+# <проект>_<ключ> (project-backup, project-restore). Ошибка в compose незаметна, пока
+# не понадобится восстановление, поэтому проверяется здесь.
+
+# Тома со своим name: или external: true (созданы руками). Анонимные тома (имя из 64 знаков) —
+# временные, пропадают при docker compose down: по ним не предупреждаем.
+check_project_volumes() {
+  local cname wdir volumes dir v foreign=""
+  while IFS='|' read -r cname wdir volumes; do
+    dir=$(project_of "$wdir")
+    [ -n "$dir" ] || continue
+    for v in ${volumes//,/ }; do
+      [[ $v =~ ^[0-9a-f]{64}$ ]] && continue
+      case $v in "${dir}"_*) ;; *) foreign+="${cname#/} → $v, " ;; esac
+    done
+  done < <(docker ps -aq 2>/dev/null | xargs -r docker inspect --format \
+    '{{.Name}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}},{{end}}{{end}}' 2>/dev/null)
+  if [ -n "$foreign" ]; then
+    problem "Тома не попадут в бэкап или не восстановятся (свой name: или external): ${foreign%, }. Данные — в томе без name: (имя <проект>_<ключ>)"
+  fi
+}
+
+# Тома compose, которые не относятся ни к одному проекту сервера: остались от запуска
+# без name: или от проекта, убранного из server.yml
+check_orphan_volumes() {
+  local vname vproject orphan=""
+  while IFS='|' read -r vname vproject; do
+    [ -n "$vproject" ] && [ "$vproject" != traefik ] || continue
+    case $PROJECTS in *" $vproject "*) continue ;; esac
+    orphan+="$vname, "
+  done < <(docker volume ls --format '{{.Name}}|{{.Label "com.docker.compose.project"}}' 2>/dev/null)
+  if [ -n "$orphan" ]; then
+    problem "Тома не относятся ни к одному проекту и не попадают в бэкап: ${orphan%, }. Перенесите данные в том проекта или удалите"
+  fi
+}
+
+# ---------- Сертификаты ----------
+# Traefik продлевает сертификаты Let's Encrypt за 30 дней до конца. Осталось меньше 10 —
+# продление не работает (DNS смотрит не сюда, порт 80 закрыт, лимиты LE). Проверяются только
+# домены из labels работающих контейнеров: сертификаты убранных сайтов — не повод для тревоги.
+check_certificates() {
+  local host pem end expiring=""
+  [ -s "$ACME" ] || return 0
+  for host in $(docker ps --format '{{.Labels}}' 2>/dev/null | grep -o 'Host(`[^`]*`)' | sed 's/^Host(`//; s/`)$//' | sort -u); do
+    pem=$(jq -r --arg d "$host" \
+      '[.[].Certificates[]? | select(.domain.main == $d or ((.domain.sans // []) | index($d)))][0].certificate // empty' "$ACME")
+    [ -n "$pem" ] || continue     # ещё не выпущен (DNS не переключён) — не тревога
+    if ! base64 -d <<<"$pem" | openssl x509 -noout -checkend $((10 * 86400)) >/dev/null 2>&1; then
+      end=$(base64 -d <<<"$pem" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+      expiring+="$host (до $end), "
+    fi
+  done
+  if [ -n "$expiring" ]; then
+    problem "Сертификаты скоро истекут, Traefik не смог продлить: ${expiring%, }. Причина — в логе: cd ${ACME%/acme/acme.json} && sudo docker compose logs traefik | grep -i acme"
+  fi
+}
+
+# ---------- Автовыкладка и обновления ----------
+
+# Не удалась: project-deploy оставляет <проект>.failed — когда, на каком шаге и что работает теперь.
+# Отметки проектов без автовыкладки убирает роль project
+check_autodeploy() {
+  local f p
+  for f in /var/lib/project-deploy/*.failed; do
+    [ -e "$f" ] || continue
+    p=$(basename "$f" .failed)
+    problem "Автовыкладка $p не удалась: $(cat "$f"). Причина: sudo journalctl -u project-deploy@$p -n 50. Исправленная версия выложится сама"
+  done
+}
+
+# Ночной бэкап — по журналу событий: последний итог не «готово» или старше 26 часов (таймер
+# не сработал). Записей ещё нет (новый сервер, начало месяца после ротации) — не тревога
+check_backup() {
+  local last when
+  last=$(grep ' бэкап: ' "$EVENTS" 2>/dev/null | tail -1)
+  [ -n "$last" ] || return 0
+  when=$(cut -c1-16 <<<"$last")
+  case $last in
+    *"бэкап: готово"*)
+      if [ $(( $(date +%s) - $(date -d "$when" +%s) )) -gt $((26 * 3600)) ]; then
+        problem "Ночной бэкап не делался с $when" "sudo systemctl status backup.timer; sudo journalctl -u backup -n 30"
+      fi ;;
+    *) problem "Ночной бэкап: ${last#* бэкап: }" "$when; sudo journalctl -u backup -n 50" ;;
+  esac
+}
+
+# Частые снимки (backup_hourly): последний прогон не удался — или удачного не было дольше
+# HOURLY_LATE минут: трёх шагов таймера, но не меньше часа (таймер не срабатывает; пока идёт ночной
+# бэкап, снимки пропускаются). Удачного ещё не было вовсе (только что включили) — не тревога
+check_backup_hourly() {
+  [ -n "$HOURLY" ] || return 0
+  local dir=/var/lib/backup-hourly
+  if [ -s "$dir/failed" ]; then
+    problem "Частые снимки не получаются: $(cat "$dir/failed")" "sudo journalctl -u backup-hourly -n 50"
+  elif [ -n "$(find "$dir/last-ok" -mmin +"$HOURLY_LATE" 2>/dev/null)" ]; then
+    problem "Частых снимков не было с $(date -r "$dir/last-ok" '+%F %H:%M')" "sudo systemctl status backup-hourly.timer; sudo journalctl -u backup-hourly -n 30"
+  fi
+}
+
+# Обновления ставит update.yml раз в неделю (ADMIN.md, «Регулярно») и оставляет отметку
+check_updates() {
+  if [ -n "$(find /var/lib/update-last-run -mtime +7 2>/dev/null)" ]; then
+    problem "update.yml не запускали с $(date -r /var/lib/update-last-run +%F): ждут обновления Docker, Postgres, Traefik, пакетов и перезагрузка. Запустите: $UPDATE_CMD"
+  fi
+}
+
+# ---------- Итог: список проблем, уведомления, сводка ----------
+# Для людей: «что», под ним подробности
+render() { awk -F'\t' 'NF { print "• " $1; if ($2 != "") print "  " $2 }' <<<"$1"; }
+
+# Ключ проблемы — «что» без цифр: та же проблема с другими числами — та же
+key_of() { sed -E 's/[0-9]+([.,][0-9]+)?//g' <<<"$1"; }
+
+# --notify: в Telegram — что появилось и что прошло с прошлой проверки; ничего не изменилось —
+# ни одного запроса в Telegram. О чём сообщили — в $STATE: ключ, текст, когда видели последний раз.
+# Не долбить:
+#  - «прошло» — когда проблемы нет $RESOLVE_MIN минут: то пропадает, то появляется (нагрузка
+#    у порога, контейнер в перезапусках) — одно сообщение, а не каждые 10 минут. Сразу — если
+#    вместо неё появилась другая (диск 85% → «КРИТИЧНО»): одним сообщением;
+#  - не отправилось (Telegram недоступен) — следующая попытка не раньше чем через час,
+#    накопленное — одним сообщением.
+notify_changes() {
+  local ts now="" old old_keys new_keys added="" resolved="" key what details seen msg=""
+  ts=$(date +%s)
+  old=$(cat "$STATE" 2>/dev/null || true)
+  old_keys=$(cut -f1 <<<"$old")
+  install -d -m 0700 "${STATE%/*}"
+  while IFS=$'\t' read -r what details; do
+    [ -n "$what" ] || continue
+    key=$(key_of "$what")
+    now+="$key"$'\t'"$what"$'\t'"$ts"$'\n'
+    grep -qxF -- "$key" <<<"$old_keys" || added+="$what"$'\t'"$details"$'\n'
+  done <<<"$PROBLEMS"
+  new_keys=$(cut -f1 <<<"$now")
+  while IFS=$'\t' read -r key what seen; do
+    [ -n "$key" ] || continue
+    grep -qxF -- "$key" <<<"$new_keys" && continue
+    [[ $seen =~ ^[0-9]+$ ]] || seen=0
+    if [ -z "$added" ] && [ $((ts - seen)) -lt $((RESOLVE_MIN * 60)) ]; then
+      now+="$key"$'\t'"$what"$'\t'"$seen"$'\n'    # пропала недавно — пока не «прошло»
+    else
+      resolved+="$what"$'\n'
+    fi
+  done <<<"$old"
+  if [ -n "$added$resolved" ]; then
+    [ -z "$(find "$FAILED" -mmin -60 2>/dev/null)" ] || return 0    # недавно не вышло — ждём
+    [ -z "$added" ] || msg+="⚠️ $SERVER — новое:"$'\n'"$(render "$added")"$'\n'
+    [ -z "$resolved" ] || msg+="✅ $SERVER — прошло:"$'\n'"$(render "$resolved")"$'\n'
+    if ! infra-notify "$msg"; then
+      touch "$FAILED"
+      return 0
+    fi
+    rm -f "$FAILED"
+  fi
+  printf '%s' "$now" > "$STATE"
+}
+
+# Пинг healthchecks (monitor_healthcheck_url, если задан): есть проблемы — /fail с их списком
+ping_healthchecks() {
+  [ -n "$HC_URL" ] || return 0
+  if [ -n "$PROBLEMS" ]; then
+    curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "$(render "$PROBLEMS")" "$HC_URL/fail" || true
+  else
+    curl -fsS -m 10 --retry 3 -o /dev/null "$HC_URL" || true
+  fi
+}
+
+# --summary: раз в день — всё в порядке или проблемы; диски, нагрузка, память, последний бэкап
+summary() {
+  local head disks load15 mem backup
+  if [ -z "$PROBLEMS" ]; then head="✅ $SERVER: всё в порядке"; else head="⚠️ $SERVER: проблемы"; fi
+  disks=$(df --output=target,pcent -x tmpfs -x devtmpfs -x overlay -x squashfs | tail -n +2 | awk '{printf "%s %s, ", $1, $2}')
+  read -r _ _ load15 _ < /proc/loadavg
+  mem=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%.1f из %.1f ГБ", a / 1048576, t / 1048576 }' /proc/meminfo)
+  backup=$(grep ' бэкап: ' "$EVENTS" 2>/dev/null | tail -1 \
+           | awk '{ t = $1 " " substr($2, 1, 5); $1 = $2 = $3 = ""; sub(/^ +/, ""); print $0 " (" t ")" }')
+  infra-notify "$head
+Диски: ${disks%, }
+Нагрузка: $load15 при $(nproc) CPU · свободно памяти $mem
+Бэкап: ${backup:-записей ещё нет}${PROBLEMS:+
+$(render "$PROBLEMS")}"
+}
+
+# ---------- Все проверки ----------
+check_disk
+check_cpu
+check_free_memory
+check_memory
+check_failed_units
+check_restarting
+check_crashed
+check_open_ports
+check_compose_projects
+check_project_volumes
+check_orphan_volumes
+check_certificates
+check_autodeploy
+check_backup
+check_backup_hourly
+check_updates
+
+case $MODE in
+  --notify) notify_changes; ping_healthchecks ;;
+  --summary) summary ;;
+  *) render "$PROBLEMS" ;;
+esac
+{% endraw %}

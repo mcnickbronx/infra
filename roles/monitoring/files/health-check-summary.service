@@ -1,0 +1,7 @@
+# Управляется Ansible (роль monitoring). Утренняя сводка в Telegram: всё в порядке или проблемы
+[Unit]
+Description=Daily server summary
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/health-check.sh --summary

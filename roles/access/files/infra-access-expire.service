@@ -1,0 +1,6 @@
+[Unit]
+Description=Access link: close SSH for expired IPs (ufw)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/infra-access expire

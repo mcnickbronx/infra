@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Управляется Ansible (роль backup).
+# Дамп базы проекта в стандартный вывод — забрать базу к себе одной командой:
+#   ssh <сервер> sudo project-db-dump shop > shop.pgdump
+#   pg_restore --no-owner --no-acl -d <локальная база> shop.pgdump     # у себя, pg_restore 17+
+# Формат — custom (pg_dump -Fc). Проект при этом не останавливается. В дампе — персональные данные
+# прода: у себя держите на зашифрованном диске. Кто и когда выгрузил — в журнал событий.
+set -Eeuo pipefail
+NAME=${1:?Использование: project-db-dump <проект> > файл.pgdump}
+[[ $NAME =~ ^[a-z][a-z0-9_]*$ ]] || { echo "Недопустимое имя проекта: $NAME" >&2; exit 1; }
+jq -e --arg n "$NAME" 'any(.[]; .name == $n and .db == "postgres")' /etc/restic/projects.json >/dev/null ||
+  { echo "У проекта $NAME нет базы на этом сервере" >&2; exit 1; }
+[ ! -t 1 ] || { echo "Дамп — двоичный: перенаправьте вывод в файл (project-db-dump $NAME > $NAME.pgdump)" >&2; exit 1; }
+cd /tmp                                   # postgres не может зайти в домашнюю папку того, кто запустил
+runuser -u postgres -- pg_dump -Fc "$NAME"
+infra-log "дамп базы $NAME выгружен"

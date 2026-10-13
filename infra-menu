@@ -1,0 +1,559 @@
+#!/usr/bin/env bash
+# infra-menu — меню администратора в терминале: sudo infra (без параметров) или sudo infra menu.
+# Своей логики у меню почти нет: каждый пункт — команда из ADMIN.md (infra status, edit, apply, update,
+# upgrade; project-compose, project-deploy, project-backup, project-db-env; журналы,
+# infra-notify, cscli), её вывод —
+# как есть, а над выводом — сама команда: её можно набрать и без меню. В журнал событий пишут
+# те же команды; от меню — только запуск, остановка и перезапуск контейнеров (кто остановил сайт).
+# Кто — INFRA_WHO: пользователь и IP, его задаёт infra перед запуском меню.
+# Стрелки и Enter — выбрать, Esc — назад; Ctrl+C прерывает команду, а не меню.
+# Восстановления из бэкапа в меню нет намеренно: оно стирает всё, что появилось после снимка, и не
+# отменяется — только командами (ADMIN.md, «Восстановление и перенос»), где каждый шаг на виду.
+set -uo pipefail          # без -e: команда с ошибкой — показать её вывод и вернуться в меню
+
+ENGINE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+INFRA=$ENGINE/infra
+PROJECTS=/etc/restic/projects.json    # проекты сервера: имя и база (пишет apply)
+DEPLOY=/var/lib/project-deploy        # состояние автовыкладки, замок <проект>.lock
+SECRETS=/etc/infra/secrets.yml
+
+[ "$(id -u)" = 0 ] || { echo "infra: нужен root: sudo infra" >&2; exit 1; }
+
+# whiptail рисует буквы по локали. С Mac по SSH приезжает LC_CTYPE=UTF-8 — в Linux такой нет,
+# и кириллица в меню рассыпается; C.UTF-8 есть всегда
+[ "$(locale charmap 2>/dev/null)" = UTF-8 ] || export LC_ALL=C.UTF-8
+
+SERVER=$(sed -nE "s/^server_name:[[:space:]]*[\"']?([a-z0-9-]+).*/\1/p" /etc/infra/server.yml | head -1)
+TITLE="infra · $SERVER · $(git -C "$ENGINE" describe --tags --always 2>/dev/null || echo 'движок — копия')"
+BACK=Назад                            # подпись кнопки выхода из меню: в главном — «Выход»
+
+trap : INT                            # Ctrl+C получает команда, меню остаётся
+
+log() { "$ENGINE/roles/base/files/infra-log" "$@"; }
+
+# ---------- Окна ----------
+# box <строк кроме текста> "текст" — размер окна W×H: ширина по терминалу (до 80), высота —
+# строки текста с переносами (\n — новая строка, как у whiptail) и остальное, не больше экрана
+box() {
+  local extra=$1 rows cols line n=1             # n=1 — запас: whiptail переносит по словам
+  rows=$(tput lines 2>/dev/null || echo 24) cols=$(tput cols 2>/dev/null || echo 80)
+  W=$((cols - 4 < 80 ? cols - 4 : 80))
+  while IFS= read -r line; do
+    n=$((n + (${#line} + W - 5) / (W - 4) + (${#line} == 0)))
+  done < <(printf '%b\n' "$2")
+  H=$((n + extra < rows - 2 ? n + extra : rows - 2))
+}
+
+# menu "текст" метка описание ... — выбранная метка в REPLY; Esc или кнопка BACK — код 1
+menu() {
+  local text=$1; shift
+  box $(($# / 2 + 6)) "$text"
+  REPLY=$(whiptail --title "$TITLE" --notags --ok-button Выбрать --cancel-button "$BACK" \
+    --menu "$text" "$H" "$W" $(($# / 2)) "$@" 3>&1 1>&2 2>&3)
+}
+# confirm "вопрос" — «да» только явное: по умолчанию выбрано «Нет»
+confirm() {
+  box 6 "$1"
+  whiptail --title "$TITLE" --yes-button Да --no-button Нет --defaultno --yesno "$1" "$H" "$W"
+}
+# input "вопрос" [что вписано] — ответ в REPLY; Esc или «Отмена» — код 1
+input() {
+  box 8 "$1"
+  REPLY=$(whiptail --title "$TITLE" --ok-button Дальше --cancel-button Отмена \
+    --inputbox "$1" "$H" "$W" "${2:-}" 3>&1 1>&2 2>&3)
+}
+say() { box 6 "$1"; whiptail --title "$TITLE" --ok-button Понятно --msgbox "$1" "$H" "$W"; }
+
+# run "команда, как её набрать" команда... — в обычном терминале (команда может спрашивать),
+# потом «Enter — назад в меню»: вывод остаётся на экране, пока его читают
+run() {
+  local shown=$1 rc=0; shift
+  clear
+  echo "== $shown"
+  "$@" || rc=$?
+  echo
+  case $rc in
+    0) ;;
+    130) echo "Прервано (Ctrl+C)" ;;
+    *) echo "Завершилось с ошибкой (код $rc) — причина выше" ;;
+  esac
+  read -r -p "Enter — назад в меню " || true
+  return "$rc"
+}
+
+# view команда... — длинный вывод в less, сразу в конце (q — назад, / — поиск)
+view() { "$@" 2>&1 | less +G; }
+# page <файл> — файл в less с конца; его ещё нет — так и сказать
+page() { if [ -f "$1" ]; then less +G "$1"; else say "Пока нет: $1"; fi; }
+
+# ---------- Сервер ----------
+main() {
+  while :; do
+    BACK=Выход
+    menu "Стрелки и Enter — выбрать, Esc — выход" \
+      status   "Состояние сервера" \
+      projects "Проекты: контейнеры, логи, выкладка, бэкапы" \
+      edit     "Настройки: проекты, люди, лимиты (server.yml)" \
+      secrets  "Ключи: S3, ghcr, Telegram (secrets.yml)" \
+      apply    "Применить настройки — сначала покажет, что изменится" \
+      update   "Обновления: Docker, Postgres, пакеты (новое ядро — перезагрузка)" \
+      upgrade  "Новая версия движка" \
+      journals "Журналы: события, бэкап, проверки, apply, входы" \
+      diag     "Диагностика: диск, память и процессор, Postgres" \
+      telegram "Уведомления в Telegram: проверить, найти чат" \
+      bans     "Баны CrowdSec: кто забанен, разбанить IP" \
+      access   "Доступ по ссылке: ссылка, открытые IP" \
+      verify   "Проверить сервер (только читает)" \
+      reboot   "Перезагрузить сервер" || return 0
+    case $REPLY in
+      status) run "sudo infra status" "$INFRA" status ;;
+      projects) projects ;;
+      edit) run "sudo infra edit" "$INFRA" edit ;;
+      secrets) run "sudo infra edit secrets" "$INFRA" edit secrets ;;
+      apply) run "sudo infra apply" "$INFRA" apply ;;
+      update)
+        confirm "Обновить пакеты Ubuntu, Docker, Postgres и Traefik? Сначала будет показано, что изменится.\n\nЕсли среди обновлений новое ядро, через минуту после окончания сервер перезагрузится сам: сайты не будут отвечать минуту-две, SSH отключится." &&
+          run "sudo infra update" "$INFRA" update ;;
+      upgrade) upgrade ;;
+      journals) journals ;;
+      diag) diag ;;
+      telegram) telegram ;;
+      bans) bans ;;
+      access) access ;;
+      verify) run "sudo infra run tests/verify.yml" "$INFRA" run tests/verify.yml ;;
+      reboot) reboot_server ;;
+    esac
+  done
+}
+
+# ---------- Проекты ----------
+autodeploy() { systemctl is-enabled -q "project-deploy@$1.timer" 2>/dev/null; }
+has_db() { jq -e --arg n "$1" 'any(.[]; .name == $n and .db == "postgres")' "$PROJECTS" >/dev/null; }
+
+# Строка проекта в списке: контейнеры (кроме разовых — compose run), автовыкладка
+project_line() {
+  local up total line
+  read -r up total < <(awk -F'|' -v p="$1" '$1 == p && $3 != "True" { n++; if ($2 == "running") u++ }
+                                           END { print u + 0, n + 0 }' <<<"$CONTAINERS")
+  if [ "$total" = 0 ]; then line="не запущен"; else line="контейнеры $up из $total"; fi
+  if [ -f "$DEPLOY/$1.failed" ]; then line+=" · автовыкладка не удалась"
+  elif autodeploy "$1"; then line+=" · автовыкладка"
+  fi
+  printf '%-22s %s' "$1" "$line"
+}
+
+projects() {
+  local p items
+  if [ "$(jq length "$PROJECTS" 2>/dev/null || echo 0)" = 0 ]; then
+    say "Проектов нет. Добавить — «Настройки» (блок projects: в server.yml), затем применить."
+    return
+  fi
+  while :; do
+    CONTAINERS=$(docker ps -a --format \
+      '{{.Label "com.docker.compose.project"}}|{{.State}}|{{.Label "com.docker.compose.oneoff"}}' 2>/dev/null)
+    items=()
+    for p in $(jq -r '.[].name' "$PROJECTS"); do items+=("$p" "$(project_line "$p")"); done
+    BACK=Назад
+    menu "Проект:" "${items[@]}" || return 0
+    project "$REPLY"
+  done
+}
+
+project() {
+  local p=$1 items
+  while :; do
+    items=(ps      "Контейнеры: что запущено"
+           sites   "Сайты: отвечают ли, сертификат, DNS"
+           logs    "Логи контейнеров: последние 500 строк"
+           follow  "Логи в реальном времени (Ctrl+C — назад)"
+           shell   "Командная строка в контейнере"
+           up      "Запустить или обновить (up -d) — после правки .env или compose.yml"
+           restart "Перезапустить контейнеры"
+           down    "Остановить — сайт перестанет отвечать")
+    autodeploy "$p" && items+=(deploys "Журнал автовыкладки" rollback "Откатить на прошлую версию")
+    items+=(backup "Бэкап сейчас")
+    has_db "$p" && items+=(dbenv "Доступ к базе — в .env проекта" dbpass "Сменить пароль базы")
+    # Копия базы — только в проекты *_dev (защита прода, как в project-db-copy)
+    has_db "$p" && [[ $p == *_dev ]] && items+=(dbcopy "Заменить базу копией другого проекта (прод → dev)…")
+    BACK=Назад
+    menu "Проект $p" "${items[@]}" || return 0
+    case $REPLY in
+      ps) run "sudo project-compose $p ps" project-compose "$p" ps ;;
+      sites) run "сайты $p: ответ, сертификат, DNS" sites "$p" ;;
+      logs) view project-compose "$p" logs --no-color --tail 500 ;;
+      follow) run "sudo project-compose $p logs -f --tail 50 — остановить: Ctrl+C" project-compose "$p" logs -f --tail 50 ;;
+      shell) shell "$p" ;;
+      up) run "sudo project-compose $p up -d" containers "$p" "запуск (up -d)" up -d ;;
+      restart)
+        confirm "Перезапустить контейнеры $p? Несколько секунд сайт не будет отвечать." &&
+          run "sudo project-compose $p restart" containers "$p" перезапуск restart ;;
+      down)
+        confirm "Остановить $p? Сайт перестанет отвечать, пока его не запустят снова." &&
+          run "sudo project-compose $p down" containers "$p" остановка down ;;
+      deploys) view journalctl -u "project-deploy@$p" -n 500 --no-pager ;;
+      rollback)
+        confirm "Откатить $p на версию, которая стояла до последней выкладки? Откаченную версию автовыкладка больше не выложит — только следующую новую." &&
+          run "sudo project-deploy $p rollback" project-deploy "$p" rollback ;;
+      backup) run "sudo project-backup $p" project-backup "$p" ;;
+      dbenv) dbenv "$p" ;;
+      dbpass) dbpass "$p" ;;
+      dbcopy) dbcopy "$p" ;;
+    esac
+  done
+}
+
+# Копия базы другого проекта в этот (project-db-copy): откуда, с файлами или без, подтверждение
+dbcopy() {
+  local to=$1 from q rc=0 args=(-y) items=()
+  for q in $(jq -r '.[] | select(.db == "postgres") | .name' "$PROJECTS"); do
+    [ "$q" = "$to" ] || items+=("$q" "база проекта $q")
+  done
+  [ ${#items[@]} -gt 0 ] || { say "На сервере нет другого проекта с базой"; return 0; }
+  BACK=Назад
+  menu "Заменить базу $to копией базы проекта:" "${items[@]}" || return 0
+  from=$REPLY
+  q="Копировать и файлы $from — папки media/ и private/? Без них картинки и вложения в $to будут «битыми»."
+  box 6 "$q"
+  whiptail --title "$TITLE" --yes-button "База и файлы" --no-button "Только база" --defaultno --yesno "$q" "$H" "$W" || rc=$?
+  case $rc in 0) args+=(--files) ;; 1) ;; *) return 0 ;; esac
+  confirm "Заменить базу $to копией $from${args[1]:+ вместе с файлами}? Всё, что сейчас в базе $to, будет стёрто; $to остановится на время копии. Перед заменой — снимок: из него можно вернуть как было (номер — в выводе и журнале событий)." &&
+    run "sudo project-db-copy ${args[*]} $from $to" project-db-copy "${args[@]}" "$from" "$to"
+}
+
+# containers <проект> <что для журнала> <команда docker compose...> — и строка в журнал событий:
+# остановку сайта потом видно, кто сделал
+containers() {
+  local p=$1 what=$2 rc=0; shift 2
+  project-compose "$p" "$@" || rc=$?
+  if [ "$rc" = 0 ]; then log "контейнеры $p: $what"; else log "контейнеры $p: $what — ошибка (код $rc)"; fi
+  return "$rc"
+}
+
+# Домены — из правил Traefik (Host) у запущенных контейнеров проекта. Проверка — с самого
+# сервера, через его Traefik: ответ, сертификат (Let's Encrypt или заглушка Traefik — не выпущен),
+# куда смотрит DNS
+sites() {
+  local p=$1 hosts h code cert dns mine
+  hosts=$(docker ps --filter "label=com.docker.compose.project=$p" --format '{{.Labels}}' |
+    grep -o 'Host(`[^`]*`)' | sed 's/^Host(`//; s/`)$//' | sort -u)
+  if [ -z "$hosts" ]; then
+    echo "У $p нет запущенных контейнеров с доменами (правило Host у Traefik)"
+    return 0
+  fi
+  mine=" $(hostname -I) "
+  for h in $hosts; do
+    code=$(curl -ks -o /dev/null -m 10 -w '%{http_code} %{time_total}' --resolve "$h:443:127.0.0.1" "https://$h/" |
+      awk '{ printf "%s за %d мс", $1, $2 * 1000 }') || code="не ответил за 10 с"
+    cert=$(openssl s_client -connect 127.0.0.1:443 -servername "$h" </dev/null 2>/dev/null |
+      openssl x509 -noout -issuer -enddate 2>/dev/null)
+    case $cert in
+      *"TRAEFIK DEFAULT CERT"*) cert="не выпущен (заглушка Traefik): DNS не на сервер или закрыт 80-й порт" ;;
+      *notAfter=*) cert="до $(date -d "${cert##*notAfter=}" +%F)" ;;
+      *) cert="не прочитать" ;;
+    esac
+    dns=$(getent ahostsv4 "$h" | awk '{print $1}' | sort -u | xargs)
+    if [ -z "$dns" ]; then dns="записи нет"
+    elif [[ $mine == *" ${dns%% *} "* ]]; then dns="на этот сервер"
+    else dns="$dns — не этот сервер"
+    fi
+    echo "$h"
+    echo "  ответ: $code · сертификат: $cert · DNS: $dns"
+  done
+}
+
+# Командная строка в запущенном сервисе проекта: сервис один — сразу в него
+shell() {
+  local p=$1 services
+  mapfile -t services < <(docker ps --filter "label=com.docker.compose.project=$p" \
+    --filter label=com.docker.compose.oneoff=False --format '{{.Label "com.docker.compose.service"}}' | sort -u)
+  case ${#services[@]} in
+    0) say "У $p нет запущенных контейнеров."; return ;;
+    1) REPLY=${services[0]} ;;
+    *)
+      local items=() s
+      for s in "${services[@]}"; do items+=("$s" "$s"); done
+      BACK=Назад
+      menu "В какой контейнер $p?" "${items[@]}" || return 0 ;;
+  esac
+  run "sudo project-compose $p exec $REPLY sh — выход: exit" container_shell "$p" "$REPLY"
+}
+
+container_shell() {
+  log "контейнеры $1: командная строка в $2"
+  project-compose "$1" exec "$2" sh -c 'command -v bash >/dev/null && exec bash || exec sh'
+  return 0                              # код последней команды в контейнере — не ошибка меню
+}
+
+# ---------- Движок ----------
+# Версии новее текущей — из git движка (подписи — из их CHANGELOG), что нового — до выбора,
+# дальше infra upgrade: предпросмотр и «Применить?». Обновился — меню перезапускается новым
+upgrade() {
+  local out current base tag title items=()
+  if [ ! -d "$ENGINE/.git" ]; then
+    say "Движок поставлен копией, не из git (так бывает на тестовом сервере) — новая версия приезжает копией: tools/rollout.sh."
+    return
+  fi
+  if ! out=$(git -C "$ENGINE" fetch --quiet --tags origin 2>&1); then
+    say "Не удалось узнать новые версии (git fetch):\n\n$(tail -3 <<<"$out")"
+    return
+  fi
+  current=$(git -C "$ENGINE" describe --tags --always)
+  base=$(git -C "$ENGINE" describe --tags --abbrev=0 2>/dev/null || true)
+  for tag in $(git -C "$ENGINE" tag -l 'v*' --sort=-v:refname); do
+    [ "$tag" != "$base" ] || break                  # дальше — текущая и старее
+    title=$(git -C "$ENGINE" show "$tag:CHANGELOG.md" 2>/dev/null | sed -n "s/^## $tag — //p" | head -1)
+    items+=("$tag" "$tag — ${title:-без описания}")
+  done
+  if [ "${#items[@]}" = 0 ]; then
+    say "Новее нет: сейчас $current."
+    return
+  fi
+  BACK=Назад
+  menu "Сейчас $current. До какой версии обновить (сверху — новая)?" "${items[@]}" || return 0
+  tag=$REPLY
+  # CHANGELOG от выбранной версии до текущей: там и что сделать на сервере при обновлении
+  git -C "$ENGINE" show "$tag:CHANGELOG.md" |
+    awk -v to="## $tag " -v from="## $base " 'index($0, to) == 1 { on = 1 } on && from != "## " && index($0, from) == 1 { exit } on' |
+    less
+  confirm "Обновить движок до $tag? Затем, как всегда, покажет, что изменится на сервере, и спросит." || return 0
+  run "sudo infra upgrade $tag" "$INFRA" upgrade "$tag"
+  if [ "$(git -C "$ENGINE" describe --tags --always)" != "$current" ]; then
+    exec "$INFRA" menu
+  fi
+}
+
+# ---------- Журналы ----------
+journals() {
+  while :; do
+    BACK=Назад
+    menu "Журнал (q — назад, / — поиск):" \
+      events "События: кто, когда, что" \
+      backup "Ночной бэкап" \
+      health "Проверки сервера (health-check)" \
+      apply  "Последний apply или update — весь вывод" \
+      ssh    "Входы по SSH" \
+      sudo   "Команды через sudo — в том числе в обход меню и движка" || return 0
+    case $REPLY in
+      events) page /var/log/infra.log ;;
+      backup) view journalctl -u backup -n 500 --no-pager ;;
+      health) view journalctl -u health-check -n 500 --no-pager ;;
+      apply) page /var/lib/infra/last-run.log ;;
+      ssh) view journalctl -u ssh -n 500 --no-pager ;;
+      sudo) view journalctl _COMM=sudo -n 500 --no-pager ;;
+    esac
+  done
+}
+
+# ---------- Уведомления ----------
+# Ключ задан в secrets.yml (пустые заготовки "" — нет)
+secret_set() { grep -qE "^$1:[[:space:]]*[\"']?[^\"'[:space:]#]" "$SECRETS"; }
+
+telegram() {
+  while :; do
+    BACK=Назад
+    menu "Бот и чат — в «Ключи» (telegram_bot_token, telegram_chat_id):" \
+      test "Отправить проверочное сообщение" \
+      find "Найти id чата — сначала напишите боту в нужном чате" || return 0
+    case $REPLY in
+      test) run "sudo infra-notify \"$SERVER: проверка уведомлений\"" notify_test ;;
+      find) run "sudo infra-notify --find-chat" infra-notify --find-chat ;;
+    esac
+  done
+}
+
+# infra-notify без бота или чата молчит (код 0) — здесь об этом надо сказать
+notify_test() {
+  if ! secret_set telegram_bot_token || ! secret_set telegram_chat_id; then
+    echo "Не задан бот или чат (telegram_bot_token, telegram_chat_id) — пункт «Ключи» в главном меню"
+    return 1
+  fi
+  infra-notify "$SERVER: проверка уведомлений" && echo "Отправлено — проверьте чат"
+}
+
+# ---------- Баны ----------
+bans() {
+  while :; do
+    BACK=Назад
+    menu "CrowdSec банит по логам SSH и сайтов; IP из admin_ips не банятся:" \
+      list   "Кто забанен сейчас" \
+      alerts "Последние срабатывания" \
+      unban  "Разбанить IP…" || return 0
+    case $REPLY in
+      list) run "sudo cscli decisions list" cscli decisions list ;;
+      alerts) run "sudo cscli alerts list" cscli alerts list ;;
+      unban)
+        input "Какой IP разбанить? Свой — на 2ip.ru; чтобы его больше не банило — добавить в admin_ips." &&
+          [ -n "$REPLY" ] && run "sudo cscli decisions delete --ip $REPLY" unban "$REPLY" ;;
+    esac
+  done
+}
+
+unban() { cscli decisions delete --ip "$1" && log "crowdsec: разбанен $1"; }
+
+# ---------- Доступ по ссылке ----------
+access() {
+  [ -f /etc/infra-access/config.json ] || { say "Ссылка доступа выключена: access_link: false в server.yml"; return 0; }
+  while :; do
+    BACK=Назад
+    menu "Ссылка открывает SSH текущему IP открывшего (без ключа не войти); закрывается сама:" \
+      link  "Показать ссылку сервера" \
+      list  "Открытые сейчас по ссылке" \
+      close "Закрыть все открытые по ссылке" || return 0
+    case $REPLY in
+      link) run "sudo infra-access link" infra-access link ;;
+      list) run "sudo infra-access list" infra-access list ;;
+      close) confirm "Закрыть SSH всем, кому он открыт по ссылке? Белый список не меняется." &&
+               run "sudo infra-access close all" infra-access close all ;;
+    esac
+  done
+}
+
+# ---------- Диагностика ----------
+diag() {
+  while :; do
+    BACK=Назад
+    menu "Диагностика — только читает:" \
+      disk      "Место на диске: что его заняло" \
+      resources "Память и процессор: проекты против лимитов, контейнеры" \
+      postgres  "Postgres: размер баз, подключения, медленные запросы" || return 0
+    case $REPLY in
+      disk) run "место на диске: df, docker system df, du" disk ;;
+      resources) run "память и процессор: slice проектов, docker stats" resources ;;
+      postgres) run "Postgres: размеры, подключения, pg_stat_statements" postgres ;;
+    esac
+  done
+}
+
+disk() {
+  df -h --output=target,size,used,avail,pcent / /var /srv 2>/dev/null | awk '!seen[$0]++'
+  echo
+  echo "== Docker: образы, контейнеры, тома, кэш сборки (неиспользуемые образы раз в неделю убирает docker-cleanup)"
+  docker system df
+  echo
+  echo "== Папки (считаю, на большом диске — до минуты)"
+  du -xsh /srv/projects/* /var/backups/restic /var/backups/db /var/lib/docker /var/lib/postgresql /var/log 2>/dev/null | sort -rh
+  echo
+  journalctl --disk-usage
+}
+
+# Лимиты проекта — его systemd slice (proj-<проект>.slice): память сейчас и потолок, процессор
+# за секунду (CPUUsageNSec до и после) против квоты
+resources() {
+  local p k v cpu quota
+  declare -A before slice
+  echo "== Проекты: всё, что запущено в их slice"
+  for p in $(jq -r '.[].name' "$PROJECTS" 2>/dev/null); do
+    before[$p]=$(systemctl show "proj-$p.slice" -p CPUUsageNSec --value 2>/dev/null)
+  done
+  sleep 1
+  for p in $(jq -r '.[].name' "$PROJECTS" 2>/dev/null); do
+    slice=()
+    while IFS='=' read -r k v; do slice[$k]=$v; done < <(systemctl show "proj-$p.slice" \
+      -p MemoryCurrent -p MemoryMax -p CPUQuotaPerSecUSec -p CPUUsageNSec 2>/dev/null)
+    if ! [[ ${slice[MemoryCurrent]:-} =~ ^[0-9]+$ ]]; then
+      printf '  %-22s не запущен\n' "$p"
+      continue
+    fi
+    cpu="?"
+    if [[ ${slice[CPUUsageNSec]:-} =~ ^[0-9]+$ && ${before[$p]:-} =~ ^[0-9]+$ ]]; then
+      cpu=$(( (slice[CPUUsageNSec] - before[$p]) / 10000000 ))        # нс за секунду → % одного CPU
+    fi
+    quota="без лимита"
+    if [[ ${slice[CPUQuotaPerSecUSec]:-} =~ ^([0-9.]+)s$ ]]; then
+      quota="$(awk -v q="${BASH_REMATCH[1]}" 'BEGIN { printf "%d", q * 100 }') %"
+    fi
+    v="без лимита"
+    [[ ${slice[MemoryMax]:-} =~ ^[0-9]+$ ]] && v=$(numfmt --to=iec "${slice[MemoryMax]}")
+    printf '  %-22s память %s из %s · процессор %s %% из %s\n' "$p" \
+      "$(numfmt --to=iec "${slice[MemoryCurrent]}")" "$v" "$cpu" "$quota"
+  done
+  echo
+  echo "== Контейнеры"
+  docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}'
+}
+
+postgres() {
+  local sql=(runuser -u postgres -- psql -X -q -P pager=off -d postgres -c)
+  echo "== Базы"
+  "${sql[@]}" "SELECT datname AS база, pg_size_pretty(pg_database_size(datname)) AS размер
+               FROM pg_database WHERE NOT datistemplate ORDER BY pg_database_size(datname) DESC"
+  echo "== Подключения (всего можно $("${sql[@]}" 'SHOW max_connections' -tA))"
+  "${sql[@]}" "SELECT r.rolname AS пользователь, count(a.pid) AS сейчас,
+                      CASE r.rolconnlimit WHEN -1 THEN 'нет' ELSE r.rolconnlimit::text END AS лимит
+               FROM pg_roles r LEFT JOIN pg_stat_activity a ON a.usename = r.rolname
+               WHERE r.rolcanlogin GROUP BY r.rolname, r.rolconnlimit ORDER BY 2 DESC, 1"
+  echo "== Самые долгие запросы приложений — в среднем, с последнего сброса статистики"
+  "${sql[@]}" "SELECT d.datname AS база, s.calls AS вызовов, round(s.mean_exec_time)::int AS мс,
+                      left(regexp_replace(s.query, '\s+', ' ', 'g'), 70) AS запрос
+               FROM pg_stat_statements s JOIN pg_database d ON d.oid = s.dbid
+                    JOIN pg_roles r ON r.oid = s.userid
+               WHERE r.rolname <> 'postgres'          -- не бэкап (pg_dump) и не эта диагностика
+               ORDER BY s.mean_exec_time DESC LIMIT 15"
+}
+
+# ---------- Перезагрузка ----------
+reboot_server() {
+  local why
+  if systemctl is-active -q infra-apply; then
+    say "Идёт прогон infra-apply — перезагрузка после него."
+    return
+  fi
+  if [ -f /var/run/reboot-required ]; then
+    why="Перезагрузка нужна: $(xargs < /var/run/reboot-required.pkgs 2>/dev/null | cut -c1-150)"
+  else
+    why="Перезагрузка сейчас не требуется (обновления ставят её сами, когда нужна)."
+  fi
+  confirm "$why\n\nПерезагрузить $SERVER? Сайты не будут отвечать минуту-две, SSH отключится." || return 0
+  log "перезагрузка сервера"
+  clear
+  echo "Перезагрузка $SERVER — зайти снова через пару минут"
+  systemctl reboot
+  exit 0
+}
+
+# ---------- База ----------
+dbenv() {
+  local p=$1 prefix=""
+  [[ $p != *_dev ]] || prefix=DEV_
+  input "Доступ к базе $p — в .env проекта (прежние такие строки заменяются), пароль на экран не выводится.\n\nПриставка: пусто — DB_HOST, DB_NAME…; DEV_ — DEV_DB_HOST… (dev-проект, который читает такие):" "$prefix" || return 0
+  run "sudo project-db-env $p $REPLY" db_env "$p" "$REPLY"
+}
+
+# Сменить пароль базы — как в ADMIN.md («Пароли»): удалить строку db_password_<проект>,
+# apply создаст новый и сменит его в Postgres; затем — в .env проекта и пересоздать контейнеры
+dbpass() {
+  local p=$1 prefix=""
+  [[ $p != *_dev ]] || prefix=DEV_
+  input "Новый пароль базы $p: старый перестанет подходить сразу, приложение получит новый после пересоздания контейнеров — несколько секунд ошибок базы.\n\nВ .env — с приставкой: пусто — DB_*, DEV_ — DEV_DB_* (dev-проект, который читает такие):" "$prefix" || return 0
+  prefix=$REPLY
+  confirm "Сменить пароль базы $p сейчас?" || return 0
+  run "sudo infra apply -y --tags db (без строки db_password_$p), sudo project-db-env $p $prefix, up -d --force-recreate" \
+    dbpass_run "$p" "$prefix"
+}
+
+dbpass_run() {
+  local p=$1 prefix=$2 old
+  old=$(grep "^db_password_$p:" "$SECRETS") || { echo "В $SECRETS нет db_password_$p"; return 1; }
+  sed -i "/^db_password_$p:/d" "$SECRETS"
+  if ! "$INFRA" apply -y --tags db; then
+    # прогон не дошёл до паролей — прежний на место, ничего не поменялось
+    grep -q "^db_password_$p:" "$SECRETS" || echo "$old" >> "$SECRETS"
+    echo
+    echo "apply — с ошибкой (причина выше), .env проекта не трогал. Если пароль в secrets.yml уже"
+    echo "новый, база получит его со следующим apply — тогда сразу «Доступ к базе — в .env»."
+    return 1
+  fi
+  project-db-env "$p" "$prefix" || return
+  containers "$p" "пересоздание после смены пароля базы" up -d --force-recreate
+}
+
+db_env() {
+  local a
+  project-db-env "$1" "$2" || return
+  read -r -p "Пересоздать контейнеры $1, чтобы они прочитали новые строки? [y/N] " a || a=""
+  [[ $a =~ ^[yYдД] ]] || return 0
+  containers "$1" "пересоздание после project-db-env" up -d --force-recreate
+}
+
+main
+clear

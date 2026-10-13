@@ -1,0 +1,27 @@
+# Управляется Ansible
+#
+# Traefik работает в сети хоста (network_mode: host):
+#  - напрямую достаёт до контейнеров любого проекта, при этом проекты
+#    в своих сетях НЕ видят друг друга;
+#  - порты 80/443 подчиняются файрволу ufw (не обходят его, как обычные порты Docker);
+#  - видит реальные IP посетителей (CrowdSec банит по его access-логу);
+#  - баны CrowdSec в файрволе (firewall-bouncer) действуют и на сайты.
+#
+# Docker socket подключён к Traefik напрямую, без socket-proxy: прокси на 127.0.0.1
+# был бы доступен любому участнику с shell на сервере. ":ro" защищает только файл
+# сокета, а не API Docker — взлом Traefik по сути даёт root, отсюда еженедельный update.yml.
+services:
+  traefik:
+    image: {{ traefik_image }}
+    restart: unless-stopped
+    network_mode: host
+    # Сеть хоста и docker socket несовместимы с userns-remap: Traefik работает вне него.
+    userns_mode: host
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic:/etc/traefik/dynamic:ro
+      - ./acme:/acme
+      - ./logs:/logs

@@ -1,0 +1,4 @@
+expect_error: "net проектов повторяются"
+projects:
+  one: {net: 5, devs: [ivan]}
+  two: {net: 5, devs: [ivan]}

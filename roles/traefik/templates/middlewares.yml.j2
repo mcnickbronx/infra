@@ -1,0 +1,56 @@
+# Управляется Ansible
+http:
+  middlewares:
+    # На всех сайтах (entryPoint websecure). HSTS без includeSubdomains: иначе браузер
+    # требовал бы HTTPS и у поддоменов, которые живут не здесь (почта, старый сайт
+    # клиента по HTTP) — они перестали бы открываться на год.
+    security-headers:
+      headers:
+        stsSeconds: 31536000
+        contentTypeNosniff: true
+        referrerPolicy: strict-origin-when-cross-origin
+
+    # На всех сайтах: ограничения на один IP против HTTP-флуда (значения — в main.yml).
+    # IP берётся из соединения: Traefik в сети хоста.
+    # sourceCriterion.ipStrategy обязателен у inFlightReq: без него запросы группируются
+    # по Host, и лимит становится общим на весь сайт — один медленный клиент занял бы
+    # все места, и сайт отвечал бы 429 всем. IPv6 — по подсети /64: у клиента обычно
+    # целая /64, и он может менять адрес на каждый запрос.
+    # Сайт за CDN: все его посетители придут с нескольких адресов CDN и упрутся в эти
+    # лимиты. Настоящий IP — в X-Forwarded-For, и верить ему можно только от CDN, а не
+    # на всех сайтах сразу. Перед подключением CDN — отдельная доработка: свой entryPoint
+    # для трафика CDN (порт, открытый в ufw только адресам CDN) с forwardedHeaders.trustedIPs
+    # и лимитами по X-Forwarded-For (ipStrategy.depth). Проверить на тестовой VDS.
+    site-ratelimit:
+      rateLimit:
+        average: {{ traefik_ratelimit_average }}
+        period: 1s
+        burst: {{ traefik_ratelimit_burst }}
+        sourceCriterion:
+          ipStrategy:
+            ipv6Subnet: 64
+    site-inflight:
+      inFlightReq:
+        amount: {{ traefik_inflight_max }}
+        sourceCriterion:
+          ipStrategy:
+            ipv6Subnet: 64
+
+    # Ограничение частоты запросов к форме входа любого проекта:
+    # отдельный router на Path(`/login`) с middlewares=login-ratelimit@file (пример — в TEAM.md)
+    login-ratelimit:
+      rateLimit:
+        average: 10
+        period: 1m
+        burst: 5
+
+    # Служебные панели (Flower, админки): только с admin_ips.
+    # В labels сервиса: traefik.http.routers.<имя>.middlewares=admin-only@file
+    admin-only:
+      ipAllowList:
+        sourceRange:
+{% for ip in admin_ips %}
+          - "{{ ip }}"
+{% else %}
+          - "127.0.0.1/32"    # admin_ips пуст — не пускаем никого
+{% endfor %}

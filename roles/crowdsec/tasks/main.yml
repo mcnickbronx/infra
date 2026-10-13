@@ -1,0 +1,106 @@
+# Репозиторий подключается как Docker и PGDG, без их скрипта (curl | sh от root).
+# Сборка «any» — общая для всех версий Debian/Ubuntu (её же подключает официальный скрипт);
+# отдельной для 26.04 у packagecloud нет. Ключ лежит в роли, а не скачивается:
+# подмену ключа на стороне packagecloud apt не примет. Ключ подписи — C358C5638A13ACC3A665A9419EB2753BF09DFB77.
+- name: Старые файлы репозитория CrowdSec от официального скрипта удалены
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/crowdsec_crowdsec.list      # иначе apt: разные Signed-By у одного адреса
+    - /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg
+
+- name: Ключ репозитория CrowdSec
+  ansible.builtin.copy:
+    src: crowdsec.asc
+    dest: /etc/apt/keyrings/crowdsec.asc
+    mode: "0644"
+
+- name: Репозиторий CrowdSec
+  ansible.builtin.deb822_repository:
+    name: crowdsec
+    types: deb
+    uris: https://packagecloud.io/crowdsec/crowdsec/any/
+    suites: any
+    components: main
+    signed_by: /etc/apt/keyrings/crowdsec.asc
+
+# В Ubuntu (universe, ESM) есть свой, намного более старый пакет crowdsec. Без закрепления
+# apt может поставить его вместо пакета CrowdSec — так советует их документация.
+- name: CrowdSec — только из репозитория CrowdSec
+  ansible.builtin.copy:
+    content: |
+      # Управляется Ansible
+      Package: *
+      Pin: release o=packagecloud.io/crowdsec/crowdsec
+      Pin-Priority: 1001
+    dest: /etc/apt/preferences.d/crowdsec
+    mode: "0644"
+
+# Отдельными задачами: bouncer при установке берёт ключ у уже работающего CrowdSec.
+- name: Установка CrowdSec
+  ansible.builtin.apt:
+    name: crowdsec
+    update_cache: true
+
+- name: Установка firewall-bouncer
+  ansible.builtin.apt:
+    name: crowdsec-firewall-bouncer-nftables
+
+- name: Коллекции правил (SSH и Traefik)
+  ansible.builtin.command: cscli collections install crowdsecurity/sshd crowdsecurity/traefik
+  args:
+    creates: /etc/crowdsec/collections/traefik.yaml
+  notify: Restart crowdsec
+
+- name: Чтение access-лога Traefik
+  ansible.builtin.template:
+    src: acquis-traefik.yaml.j2
+    dest: /etc/crowdsec/acquis.d/traefik.yaml
+    mode: "0644"
+  notify: Restart crowdsec
+
+- name: "Свой сценарий: запрос к .env — бан с первого раза"
+  ansible.builtin.copy:
+    src: infra-http-env.yaml
+    dest: /etc/crowdsec/scenarios/infra-http-env.yaml
+    mode: "0644"
+  notify: Restart crowdsec
+
+- name: Ваши IP никогда не банятся
+  ansible.builtin.template:
+    src: whitelist-admins.yaml.j2
+    dest: /etc/crowdsec/parsers/s02-enrich/ansible-admin-whitelist.yaml
+    mode: "0644"
+  notify: Restart crowdsec
+
+- name: Применить настройки CrowdSec
+  ansible.builtin.meta: flush_handlers
+
+# Баны применяет только firewall-bouncer: блокирует IP в nftables на всех портах,
+# и SSH, и сайты (Traefik в сети хоста). Не запущен — баны не действуют вовсе.
+# Ключ к CrowdSec пакет получает при установке, но на новом сервере CrowdSec в этот
+# момент часто ещё не готов: в конфиге остаётся заглушка <API_KEY>, и переустановка
+# пакета её уже не заменит. Поэтому ключ без заглушки выдаём сами.
+- name: Ключ firewall-bouncer к CrowdSec
+  ansible.builtin.shell: |
+    set -euo pipefail
+    conf=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+    grep -qE '^api_key: *(<API_KEY>|\$\{API_KEY\})? *$' "$conf" || exit 0
+    key=$(cscli -oraw bouncers add "cs-firewall-bouncer-$(date +%s)")
+    sed -i "s|^api_key:.*|api_key: ${key}|" "$conf"
+    systemctl restart crowdsec-firewall-bouncer || true
+    echo key-added
+  args:
+    executable: /bin/bash
+  register: bouncer_key
+  changed_when: "'key-added' in bouncer_key.stdout"
+
+- name: firewall-bouncer запущен
+  ansible.builtin.systemd:
+    name: crowdsec-firewall-bouncer
+    state: started
+    enabled: true
+
+# Пакеты CrowdSec обновляет update.yml, а правила (парсеры, сценарии) из хаба — сам пакет:
+# таймер crowdsec-hubupdate раз в сутки, crowdsec перечитывает их, только если что-то обновилось.

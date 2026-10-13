@@ -1,0 +1,11 @@
+/srv/infra/traefik/logs/*.log {
+    daily
+    # Флуд или сканеры: новый файл раньше срока (logrotate — каждый час, роль base)
+    maxsize 200M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -1,0 +1,39 @@
+# Управляется Ansible. Общие настройки для сервисов: безопасность и время сервера.
+# Подключение в compose проекта:
+#   services:
+#     api:
+#       extends: { file: /srv/infra/compose/base.yml, service: hardened }
+services:
+  # Для большинства сервисов, в т.ч. тех, что стартуют от root (nginx, apache, php-fpm).
+  # Убирает права, которые веб-сервисам не нужны, но полезны атакующему
+  # (NET_RAW — подделка сетевых пакетов, MKNOD — создание устройств и т.д.).
+  hardened:
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [NET_RAW, MKNOD, SYS_CHROOT, AUDIT_WRITE, SETFCAP, SETPCAP, FSETID]
+    # Все контейнеры проекта — в его systemd slice с лимитами памяти и CPU на весь проект
+    # (proj-<проект>.slice создаёт Ansible). Имя берётся из name: в compose.yml —
+    # поэтому оно обязано совпадать с папкой проекта, иначе лимитов не будет.
+    cgroup_parent: "proj-${COMPOSE_PROJECT_NAME}.slice"
+    deploy:
+      resources:
+        limits:
+          pids: 512          # защита от fork-бомб и майнеров с тысячами процессов (и потоков)
+    # Открытых файлов на процесс, а каждое соединение — файл. Без этого контейнер наследует
+    # умолчание systemd у служб docker и containerd — 1024, и веб-сервер на ~1000
+    # одновременных соединений падает с «Too many open files». Жёсткий предел — как у служб
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+    # Часовой пояс сервера (Europe/Moscow): логи, cron и date в контейнере — по нему.
+    # Не нужен tzdata в образе, в отличие от TZ=... (без tzdata TZ молча даёт UTC).
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+
+  # Для сервисов, которые работают НЕ от root (большинство приложений на Node, Python, Go, Java).
+  # Никаких особых прав Linux вообще.
+  hardened-strict:
+    extends: { service: hardened }
+    cap_drop: [ALL]

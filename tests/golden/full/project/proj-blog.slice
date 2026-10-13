@@ -1,0 +1,8 @@
+# Управляется Ansible. Лимиты проекта blog: все его контейнеры
+# (через extends в /srv/infra/compose/base.yml) работают в этом slice.
+[Unit]
+Description=Project blog
+
+[Slice]
+MemoryMax=512M
+CPUQuota=50%

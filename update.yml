@@ -1,0 +1,123 @@
+# Обновление сервера — раз в неделю (ADMIN.md, «Регулярно»): всё, что не ставится само
+# (сами — только обновления безопасности Ubuntu): Docker, Postgres, CrowdSec, остальные
+# пакеты Ubuntu, образ Traefik и перезагрузка, если её ждёт новое ядро.
+#
+#   sudo infra update            # сначала на тестовом сервере, потом на остальных
+#   sudo infra update --check    # что будет обновлено, ничего не меняя
+#
+# Мажорные версии не меняются: Docker закреплён (docker_major_version), Postgres — именем
+# пакета (postgres_version), Traefik — тегом (traefik_image). Их переход — отдельно, см.
+# group_vars/all/main.yml; о новой минорной версии Traefik плейбук скажет в конце.
+#
+# Во время обновления Docker и Postgres перезапускаются: контейнеры продолжают работать
+# (live-restore), у Postgres — разрыв соединений на секунды; перезагрузка — минута-две простоя.
+
+- name: Обновление сервера
+  hosts: all
+  become: true
+  vars_files:
+    - /etc/infra/server.yml          # = infra_dir: здесь переменные движка ещё не прочитаны
+  module_defaults:
+    ansible.builtin.apt:
+      lock_timeout: 900     # не мешаем ночным автообновлениям, ждём их
+  pre_tasks:
+    - name: Пароли сервера (/etc/infra/secrets.yml)
+      ansible.builtin.include_vars:
+        file: "{{ infra_dir }}/secrets.yml"
+        name: secrets_file
+      no_log: true
+    - name: Настройки сервера как есть — preflight проверяет их ключи
+      ansible.builtin.include_vars:
+        file: "{{ infra_dir }}/server.yml"
+        name: server_settings
+  roles:
+    - preflight             # ошибка в описании сервера — не обновляем
+  tasks:
+    - name: Состояние ночного бэкапа
+      ansible.builtin.systemd:
+        name: backup.service
+      register: backup_unit
+
+    - name: Ночной бэкап сейчас не идёт (перезагрузка оборвала бы снимок)
+      ansible.builtin.assert:
+        that: backup_unit.status.ActiveState not in ['active', 'activating']
+        fail_msg: "На {{ inventory_hostname }} идёт ночной бэкап — запустите позже"
+        quiet: true
+
+    - name: Пакеты (Ubuntu, Docker, Postgres, CrowdSec)
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist         # как apt full-upgrade: и новое ядро, которому нужны новые пакеты
+      register: apt_upgrade
+
+    # С --check apt только симулирует (строки Inst), без него — ставит (строки Setting up)
+    - name: Что обновилось (с --check — что будет обновлено)
+      ansible.builtin.debug:
+        msg: "{{ apt_upgrade.stdout_lines | default([]) | select('match', '^(Inst|Setting up) ') | list }}"
+
+    # Контейнер пересоздаётся, только если образ новее — сайты недоступны пару секунд
+    - name: Traefik — свежий образ в пределах минорной версии
+      community.docker.docker_compose_v2:
+        project_src: "{{ traefik_dir }}"
+        pull: always
+        state: present
+        remove_orphans: true
+
+    - name: Нужна ли перезагрузка
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    # По ней health-check напоминает, если update.yml не запускали больше недели
+    - name: Отметка «update.yml выполнен»
+      ansible.builtin.file:
+        path: /var/lib/update-last-run
+        state: touch
+        mode: "0644"
+
+    # Контейнеры с restart: unless-stopped (он в extends base.yml) поднимаются сами;
+    # health-check сразу сообщит об упавших или не поднявшихся.
+    - name: Проверка состояния сервера после обновления
+      ansible.builtin.systemd:
+        name: health-check.service
+        state: started
+      changed_when: false
+
+    # Исправления безопасности получает только последняя минорная версия Traefik
+    - name: Релизы Traefik на GitHub
+      ansible.builtin.uri:
+        url: https://api.github.com/repos/traefik/traefik/releases?per_page=30
+      register: traefik_releases
+      check_mode: false
+      failed_when: false      # нет связи с GitHub — обновлению это не мешает
+
+    - name: Вышла новая минорная версия Traefik
+      vars:
+        traefik_tag: "{{ traefik_image.split(':')[-1] }}"     # v3.7
+        traefik_newest: >-
+          {{ (traefik_releases.json if traefik_releases.status | default(0) == 200 else [])
+             | rejectattr('prerelease') | map(attribute='tag_name') | select('match', traefik_tag.split('.')[0] ~ '[.]')
+             | community.general.version_sort | last | default('') }}
+      ansible.builtin.debug:
+        msg: >-
+          Вышел Traefik {{ traefik_newest }}, на серверах {{ traefik_tag }}: исправления безопасности
+          получает только последняя минорная версия. Прочитайте migration guide, поднимите traefik_image
+          в group_vars/all/main.yml движка (или в server.yml) и примените: sudo infra apply --tags traefik,
+          сначала на тестовом сервере
+      when: traefik_newest != '' and traefik_newest.split('.')[:2] | join('.') is version(traefik_tag, '>')
+
+    # Ansible работает на самом сервере и не может перезагрузить его и дождаться: перезагрузка —
+    # через минуту, когда прогон уже закончился (поэтому эта задача последняя: служба infra-apply
+    # успевает записать итог в журнал событий). Контейнеры поднимутся сами (restart в base.yml)
+    - name: Перезагрузка через минуту (новое ядро или библиотеки)
+      ansible.builtin.command: shutdown -r +1 "Перезагрузка после обновления (infra update)"
+      when: reboot_required.stat.exists
+      changed_when: true
+
+    - name: Итог
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: пакеты {{ 'обновлены' if apt_upgrade is changed else 'уже свежие' }},
+          {{ 'перезагрузка через минуту — потом проверьте сайты' if reboot_required.stat.exists
+             else 'перезагрузка не нужна' }}. Проблемы health-check пришлёт в уведомлениях
+          (или: sudo journalctl -u health-check -n 20).

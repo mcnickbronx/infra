@@ -1,0 +1,203 @@
+# Проект — это папка /srv/projects/<проект>:
+#   web/       файлы проекта, compose.yml и .env — всё, что заливают участники (git, SFTP)
+# Участники проекта — группа <проект>-dev. Чужие проекты им не видны.
+
+- name: Корень проектов (войти можно, список проектов не виден)
+  ansible.builtin.file:
+    path: /srv/projects
+    state: directory
+    owner: root
+    group: root
+    mode: "0711"
+
+# nosuid,nodev: setuid-биты и файлы устройств в папках проектов на хосте не действуют,
+# иначе участник без доступа к Docker мог бы получить root через такой файл.
+- name: Папки проектов смонтированы с nosuid,nodev
+  ansible.posix.mount:
+    src: /srv/projects
+    path: /srv/projects
+    fstype: none
+    opts: bind,nosuid,nodev
+    state: mounted
+
+# Саму папку проекта участники менять не могут: так web/ нельзя подменить
+# ссылкой на чужую папку.
+- name: Папки проектов
+  ansible.builtin.file:
+    path: "/srv/projects/{{ item }}"
+    state: directory
+    owner: root
+    group: "{{ item }}-dev"
+    mode: "0750"
+  loop: "{{ projects.keys() | list }}"
+
+- name: Папки web (сюда участники заливают файлы)
+  ansible.builtin.file:
+    path: "/srv/projects/{{ item }}/web"
+    state: directory
+    owner: root
+    group: "{{ item }}-dev"
+    mode: "2770"              # setgid: новые файлы получают группу проекта
+  loop: "{{ projects.keys() | list }}"
+
+# В --check папки нового проекта ещё нет (её создание только показано): ACL для неё
+# не проверить, иначе --check --diff падал бы на каждом новом проекте
+- name: Какие папки web/ уже есть
+  ansible.builtin.stat:
+    path: /srv/projects/{{ item }}/web
+  loop: "{{ projects.keys() | list }}"
+  register: web_dirs
+  check_mode: false
+
+- name: Проекты, у которых папки уже есть
+  ansible.builtin.set_fact:
+    projects_with_dirs: "{{ web_dirs.results | selectattr('stat.exists') | map(attribute='item') | list }}"
+
+# ACL по умолчанию: всё, что создано в web/ (кем угодно — участником по SFTP,
+# git, контейнером), доступно группе проекта. Права, с которыми файл создан (644 у SFTP
+# и tar), урезают ACL маской до чтения: папки, куда пишет приложение (media и т.п.),
+# создают с записью для группы — mkdir и chmod 2770 (так делает автовыкладка).
+- name: Права группы проекта на новые файлы в web/
+  ansible.posix.acl:
+    path: "/srv/projects/{{ item.0 }}/web"
+    etype: group
+    entity: "{{ item.0 }}-dev"
+    permissions: rwX
+    default: "{{ item.1 }}"
+    state: present
+  loop: "{{ projects.keys() | product([false, true]) | list }}"
+  loop_control:
+    label: "{{ item.0 }}{{ ' (по умолчанию)' if item.1 else '' }}"
+  when: not ansible_check_mode or item.0 in projects_with_dirs
+
+# userns-remap: процессы контейнеров на хосте — не root и не участники проекта,
+# а uid/gid из диапазона dockremap. Их основным группам открываем web/ через ACL
+# (и на новые файлы), иначе контейнер не прочитает код проекта.
+- name: Доступ контейнеров к web/ (userns-remap)
+  ansible.posix.acl:
+    path: "/srv/projects/{{ item.0 }}/web"
+    etype: group
+    entity: "{{ docker_remap_base + item.1[0] }}"
+    permissions: rwX
+    default: "{{ item.1[1] }}"
+    state: present
+  loop: "{{ projects.keys() | product(docker_remap_web_gids | product([false, true])) | list }}"
+  loop_control:
+    label: "{{ item.0 }}: gid {{ item.1[0] }} в контейнере{{ ' (по умолчанию)' if item.1[1] else '' }}"
+  when: not ansible_check_mode or item.0 in projects_with_dirs
+
+# project-compose — docker compose проекта с его .env; project-db-env — доступ к базе в его .env
+- name: Скрипты администратора project-compose и project-db-env
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    mode: "0755"
+  loop: [project-compose, project-db-env]
+
+# Автовыкладка (autodeploy: true у проекта): каждые 15 секунд таймер проверяет реестр образов,
+# новый образ выкладывает project-deploy. Договорённость с проектом — TEAM.md, «Автовыкладка»
+- name: Автовыкладка — скрипт и юниты systemd
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: project-deploy, dest: /usr/local/bin/project-deploy, mode: "0755" }
+    - { src: project-deploy@.service, dest: /etc/systemd/system/project-deploy@.service, mode: "0644" }
+    - { src: project-deploy@.timer, dest: /etc/systemd/system/project-deploy@.timer, mode: "0644" }
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: Папка состояния автовыкладки
+  ansible.builtin.file:
+    path: /var/lib/project-deploy
+    state: directory
+    mode: "0755"
+
+# Образы проектов приватные: скачивает их root (таймер), вход — токеном только на чтение
+- name: Вход в реестр образов ghcr.io
+  community.docker.docker_login:
+    registry_url: ghcr.io
+    username: "{{ ghcr_user }}"
+    password: "{{ ghcr_token }}"
+  no_log: true
+  when: autodeploy_projects | length > 0
+
+# В --check на новом сервере юнитов ещё нет (их установка только показана) — тогда включение
+# и выключение пропускаются. Если они есть, предпросмотр показывает и эти изменения: иначе
+# infra apply, решив «изменений нет», не применил бы autodeploy, убранный или добавленный в server.yml
+- name: Юниты автовыкладки уже установлены
+  ansible.builtin.stat:
+    path: /etc/systemd/system/project-deploy@.timer
+  register: deploy_unit
+
+- name: Автовыкладка включена у проектов с autodeploy
+  ansible.builtin.systemd:
+    name: "project-deploy@{{ item }}.timer"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: "{{ autodeploy_projects }}"
+  when: not ansible_check_mode or deploy_unit.stat.exists
+
+# Включённые таймеры ищутся на сервере: у проекта, убранного из server.yml (перенос на другой
+# сервер), таймер иначе продолжал бы выкладывать его здесь при каждом push
+- name: Включённые таймеры автовыкладки на сервере
+  ansible.builtin.find:
+    paths: /etc/systemd/system/timers.target.wants
+    patterns: "project-deploy@*.timer"
+    file_type: link
+  register: deploy_timers
+
+- name: Автовыкладка выключена у остальных проектов, в том числе убранных из server.yml
+  vars:
+    enabled_here: "{{ deploy_timers.files | map(attribute='path') | map('basename')
+                      | map('replace', 'project-deploy@', '') | map('replace', '.timer', '') | list }}"
+  ansible.builtin.systemd:
+    name: "project-deploy@{{ item }}.timer"
+    enabled: false
+    state: stopped
+    daemon_reload: true
+  loop: "{{ (projects.keys() | list + enabled_here) | unique | difference(autodeploy_projects) }}"
+  when: not ansible_check_mode or deploy_unit.stat.exists
+
+# Отметка сбоя остаётся до следующей удачной выкладки: у проекта, которому выключили
+# автовыкладку (или убрали из server.yml), health-check повторял бы её каждый час
+- name: Отметки сбоя автовыкладки на сервере
+  ansible.builtin.find:
+    paths: /var/lib/project-deploy
+    patterns: "*.failed"
+  register: deploy_failed
+
+- name: Отметки сбоя убраны у проектов без автовыкладки
+  ansible.builtin.file:
+    path: "/var/lib/project-deploy/{{ item }}.failed"
+    state: absent
+  loop: "{{ deploy_failed.files | map(attribute='path') | map('basename') | map('replace', '.failed', '')
+            | difference(autodeploy_projects) }}"
+
+# web/ принадлежит root, а git (2.35+) не работает в чужой папке («dubious ownership»).
+# Папки проектов объявлены безопасными для всех — иначе git clone/pull у участников не работает.
+- name: git доверяет папкам web/ проектов
+  ansible.builtin.blockinfile:
+    path: /etc/gitconfig
+    create: true
+    mode: "0644"
+    marker: "# {mark} ANSIBLE safe.directory"
+    block: |
+      [safe]
+      {% for name in projects.keys() | sort %}
+        directory = /srv/projects/{{ name }}/web
+      {% endfor %}
+
+# Лимиты на весь проект: контейнеры попадают сюда через cgroup_parent в base.yml.
+# Изменения применяются к работающему проекту после daemon-reload (handler), без перезапуска.
+- name: Лимиты проектов (systemd slice proj-<проект>.slice)
+  ansible.builtin.template:
+    src: project.slice.j2
+    dest: "/etc/systemd/system/proj-{{ item.key }}.slice"
+    mode: "0644"
+  loop: "{{ projects | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}: {{ item.value.memory | default(project_default_memory) }}, {{ item.value.cpus | default(project_default_cpus) }} CPU"
+  notify: Reload systemd

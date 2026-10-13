@@ -1,0 +1,4 @@
+# Лимиты проектов (slice) применяются к работающим контейнерам без их перезапуска
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true

@@ -1,0 +1,46 @@
+# Управляется Ansible
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+    http:
+      # Все роутеры на 443 автоматически получают SSL и заголовки безопасности,
+      # командам не нужно прописывать это в labels. Баны CrowdSec действуют раньше,
+      # в файрволе (firewall-bouncer, роль crowdsec): забаненный IP сюда не доходит.
+      # Лимиты от HTTP-флуда — тоже на всех сайтах. Таймауты соединений не задаём:
+      # в Traefik v3 по умолчанию readTimeout 60s (медленная отправка запроса, slowloris),
+      # idleTimeout 180s; меньший readTimeout оборвал бы загрузку больших файлов.
+      tls:
+        certResolver: le
+      middlewares:
+        - site-ratelimit@file
+        - site-inflight@file
+        - security-headers@file
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+certificatesResolvers:
+  le:
+    acme:
+      email: admin@fixture.test
+      storage: /acme/acme.json
+      httpChallenge:
+        entryPoint: web
+
+accessLog:
+  filePath: /logs/access.log
+
+log:
+  level: INFO

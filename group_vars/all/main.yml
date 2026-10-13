@@ -1,0 +1,104 @@
+# Умолчания движка — для всех серверов. Сервер задаёт свои значения в /etc/infra/server.yml,
+# они важнее этих (все настройки с пояснениями — server.yml.example). Разделы:
+#   1. Версии         — меняются вместе с движком (ADMIN.md, «Обновления»)
+#   2. По умолчанию   — для сервера и проекта; другое значение — в server.yml
+#   3. Внутреннее     — пути и пароли из /etc/infra/secrets.yml; менять не нужно
+
+# ======================= 1. Версии =======================
+# Внутри версии исправления ставит update.yml раз в неделю. Переход на новую — вручную, через
+# тестовую VDS; как — для каждой своё (ADMIN.md, «Обновления»).
+
+# Все серверы — Ubuntu 26.04 LTS (resolute): новые VDS заказывайте с этим образом.
+# Плейбук проверяет версию и останавливается на другой.
+ubuntu_version: "26.04"
+
+# В мажорных релизах Docker бывают несовместимые изменения — поэтому закреплена
+docker_major_version: 29
+
+# Новая мажорная — не сменой числа: базы переносятся в новый кластер (ADMIN.md, «Обновления»)
+postgres_version: 17
+
+# Исправления безопасности получает только ПОСЛЕДНЯЯ минорная версия Traefik (3–4 выхода в год),
+# о новой скажет update.yml
+traefik_image: traefik:v3.7
+
+# ======================= 2. По умолчанию =======================
+
+# --- Для сервера: другое значение — в server.yml ---
+# Обязательные (здесь их нет): server_name, admin_keys, admin_ips, acme_email — server.yml.example
+admin_user: admin   # логин администратора на сервере: вход только по ключу, sudo без пароля
+timezone: Europe/Moscow   # сервер и контейнеры (через base.yml)
+projects: {}        # проекты сервера; все ключи проекта — server.yml.example
+people: {}          # люди сервера: SSH-ключ и IP
+docker_users: []    # кто запускает контейнеры (группа docker = root на сервере)
+
+# Копия бэкапов в S3 (уровень 3, README, «Бэкапы»). Пусто — без S3;
+# например "s3:https://storage.yandexcloud.net/my-backups". Ключи — s3_access_key и
+# s3_secret_key в /etc/infra/secrets.yml
+restic_s3_repository_base: ""
+
+# Уведомления — в Telegram: бот, чат и прокси в /etc/infra/secrets.yml (ADMIN.md, «Уведомления»)
+disk_alert_percent: 80          # уведомление: диск заполнен на столько процентов
+backup_disk_stop_percent: 90    # ночной бэкап не пишет локальный снимок, чтобы не заполнить диск; «КРИТИЧНО»
+memory_alert_percent: 10        # уведомление: свободной памяти меньше стольких процентов
+notify_summary_time: "09:00"    # утренняя сводка в Telegram: всё в порядке или проблемы
+# Вдобавок, по желанию — пинг healthchecks (свой экземпляр: облачный не принимает российские IP).
+# Пусто — без пинга
+backup_healthcheck_url: ""      # ночной бэкап
+monitor_healthcheck_url: ""     # health-check каждые 10 минут: есть проблемы — /fail со списком
+
+postgres_memory_share: 0.4      # доля RAM сервера под кеши Postgres
+
+# Вход по SSH с меняющегося IP (мобильный интернет, поездка): одна секретная ссылка на сервер
+# (sudo infra-access link). Открыть её и нажать кнопку — SSH открыт текущему IP на access_link_hours
+# часов; в Telegram — кто открыт. Без SSH-ключа ссылка не впускает: она только открывает порт.
+# Адрес — access_link_host; пусто — <IP сервера>.sslip.io (сертификат Let's Encrypt выпускается сам)
+access_link: true
+access_link_host: ""
+access_link_hours: 24
+
+# Защита всех сайтов от HTTP-флуда: лимиты на один IP. С запасом: страница с картинками —
+# десятки запросов разом, а за одним IP бывает целый офис или мобильный оператор (CGNAT).
+# Расчёт — личный кабинет: страница — ~15 запросов к API разом, офис из 10 человек
+# за одним NAT — до 150 одновременных, и копятся они как раз когда бэкенд замедлился.
+# Превышение — ответ 429 без обращения к приложению.
+traefik_ratelimit_average: 200    # запросов в секунду в среднем
+traefik_ratelimit_burst: 600      # разовый всплеск сверх среднего
+traefik_inflight_max: 150         # одновременных незавершённых запросов
+
+# userns-remap: процессы контейнеров на хосте — не root (DECISIONS.md, «Защита от взломанного
+# контейнера»). web/ проекта открыт этим группам внутри контейнера: 0 — root,
+# 33 — www-data (nginx, apache, php), 1000 — типичный пользователь приложения.
+# «Permission denied» у образа — user: "1000:1000" в compose или gid образа в этот список.
+docker_remap_web_gids: [0, 33, 1000]
+
+# --- Для проекта: другое значение — ключом в блоке проекта в server.yml (memory, cpus...) ---
+# Все контейнеры проекта (через extends в base.yml) работают в systemd slice
+# proj-<проект>.slice: память и CPU ограничены на весь проект, как его сервисы их ни делят.
+# Утечка памяти или майнер во взломанном контейнере не займут весь сервер.
+project_default_memory: 2g
+project_default_cpus: "{{ [1, (ansible_processor_vcpus | default(2) | int) / 2] | max }}"   # половина CPU сервера
+project_default_db_conn_limit: 50              # подключений к базе у пользователя проекта
+project_default_db_statement_timeout: 60s      # предел времени запроса; "0" — без предела
+
+# ======================= 3. Внутреннее =======================
+
+infra_dir: /etc/infra                   # server.yml и secrets.yml этого сервера (только root); путь есть и в vars_files плейбуков
+traefik_dir: /srv/infra/traefik         # compose.yml, настройки, сертификаты и логи Traefik
+restic_local_repo: /var/backups/restic  # бэкап на сервере (уровень 1)
+docker_remap_base: 100000               # root в контейнере = uid 100000 на хосте; не менять на работающем сервере
+access_web_port: 8099                   # страница ссылки доступа на 127.0.0.1 — снаружи только через Traefik
+access_max_open: 10                     # открытых по ссылке IP одновременно; новый вытесняет самый старый
+
+# Пароли — из /etc/infra/secrets.yml: его читает site.yml, недостающие пароли дописывает роль
+# secrets. Пароль базы проекта — db_password_<проект>
+secrets: "{{ secrets_file | default({}) | combine(generated_secrets | default({})) }}"
+db_passwords: "{{ dict(db_projects | map(attribute='key')
+                       | zip(db_projects | map(attribute='key') | map('regex_replace', '^', 'db_password_') | map('extract', secrets))) }}"
+postgres_admin_password: "{{ secrets.postgres_admin_password }}"   # вы, пользователь admin_user: все базы, через туннель
+restic_password: "{{ secrets.restic_password }}"
+# Ключи, которые вписывает администратор; пустые ("" или без значения) — не заданы
+restic_aws_access_key_id: "{{ secrets.s3_access_key | default('', true) }}"
+restic_aws_secret_access_key: "{{ secrets.s3_secret_key | default('', true) }}"
+ghcr_user: "{{ secrets.ghcr_user | default('', true) }}"             # вход в ghcr.io для автовыкладки
+ghcr_token: "{{ secrets.ghcr_token | default('', true) }}"

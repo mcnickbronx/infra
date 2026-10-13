@@ -1,0 +1,15 @@
+# Управляется Ansible.
+[Unit]
+Description=Frequent project snapshots timer (backup_hourly, backup_every)
+
+[Timer]
+# С шагом самого частого проекта (backup_every, минут; сейчас {{ backup_hourly_step }}): в :05 каждого
+# часа и через каждый шаг от неё (15 — :05, :20, :35, :50; 5 — :00, :05, :10...). Отсчёт от :05,
+# а не от :00 — в :00 запускается многое системное. Без случайной задержки: снимки локальные,
+# разводить их по времени не с кем; AccuracySec — иначе systemd сдвигает запуск на величину до минуты
+{% set step = backup_hourly_step | int %}
+OnCalendar={{ '*-*-* *:05:00' if step == 60 else '*-*-* *:%02d/%d:00' | format(5 % step, step) }}
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

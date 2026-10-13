@@ -1,0 +1,9 @@
+[Unit]
+Description=Access link requests queue
+
+[Path]
+DirectoryNotEmpty=/run/infra-access/queue
+Unit=infra-access.service
+
+[Install]
+WantedBy=paths.target

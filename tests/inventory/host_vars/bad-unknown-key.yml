@@ -1,0 +1,3 @@
+expect_error: "неизвестные ключи ['dev']"
+projects:
+  site: {net: 5, db: postgres, dev: [ivan]}

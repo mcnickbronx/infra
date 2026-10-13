@@ -1,0 +1,5 @@
+#!/bin/sh
+# Все проверки без серверов (tools/check.sh) перед git push: сломанное не уходит в репозиторий.
+# Установка: cp tools/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# Срочно и осознанно без проверок: git push --no-verify
+exec "$(git rev-parse --show-toplevel)/tools/check.sh"

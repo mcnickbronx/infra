@@ -1,0 +1,307 @@
+# Все проверки описания сервера (/etc/infra/server.yml и ключи в secrets.yml) в одном месте.
+# Выполняются при любом запуске, даже с --tags: ошибка в описании должна
+# останавливать плейбук до того, как что-то поменяется на сервере.
+# Только описание, сервер не спрашивают: поэтому работают и без сервера
+# (tests/render.yml, tests/invalid.yml). Проверки состояния сервера — в ролях base и users.
+
+# ---------- Сервер и администратор ----------
+# Стандарт — одна версия Ubuntu на всех серверах (ubuntu_version в main.yml, сейчас 26.04):
+# одинаковые пакеты, одинаковое поведение, одна проверка на тестовой VDS.
+- name: Сервер — Ubuntu {{ ubuntu_version }}
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_version == ubuntu_version | string
+    fail_msg: >-
+      {{ inventory_hostname }}: {{ ansible_distribution }} {{ ansible_distribution_version }},
+      а серверы должны быть на Ubuntu {{ ubuntu_version }}. Переустановите сервер
+      на Ubuntu {{ ubuntu_version }} в панели хостера
+    quiet: true
+
+# Без них движку не из чего строить сервер; значений по умолчанию у них нет
+- name: В server.yml заданы server_name, admin_keys, admin_ips, acme_email
+  vars:
+    required: [server_name, admin_keys, admin_ips, acme_email]
+    missing: "{{ required | difference(query('ansible.builtin.varnames', '^(' ~ required | join('|') ~ ')$')) }}"
+  ansible.builtin.assert:
+    that:
+      - missing | length == 0
+      - missing | length > 0 or server_name is match('^[a-z0-9][a-z0-9-]{0,62}$')
+    fail_msg: >-
+      В {{ infra_dir }}/server.yml нет: {{ missing | join(', ') or '—' }}; server_name — строчные латинские
+      буквы, цифры и - (пример всех настроек — server.yml.example)
+    quiet: true
+
+# Опечатка в ключе молча значила бы «настройки нет» — то есть умолчание движка, иногда
+# разрушительное: docker_user: вместо docker_users: убрала бы людей из группы docker,
+# restic_s3_repository: — выключила бы копию в S3. Известны обязательные ключи, test_server
+# и любое умолчание движка (group_vars/all/main.yml). server_settings — сам server.yml,
+# его читают site.yml и update.yml
+- name: В server.yml только известные ключи
+  vars:
+    known: "{{ ['server_name', 'admin_keys', 'admin_ips', 'acme_email', 'test_server']
+               + (lookup('ansible.builtin.file', role_path ~ '/../../group_vars/all/main.yml') | from_yaml | list) }}"
+    unknown: "{{ server_settings | list | difference(known) }}"
+  ansible.builtin.assert:
+    that: unknown | length == 0
+    fail_msg: >-
+      В {{ infra_dir }}/server.yml неизвестные ключи {{ unknown }} — опечатка? Все настройки —
+      server.yml.example; любое умолчание движка — group_vars/all/main.yml
+    quiet: true
+  when: server_settings is defined
+
+# Раздел, где закомментированы все строки, — пустое значение (null), а не пустой словарь или
+# список: дальше была бы непонятная ошибка Jinja
+- name: projects и people — словари, admin_ips и docker_users — списки
+  ansible.builtin.assert:
+    that:
+      - projects is mapping
+      - people is mapping
+      - admin_ips is sequence and admin_ips is not string
+      - docker_users is sequence and docker_users is not string
+    fail_msg: >-
+      В {{ infra_dir }}/server.yml projects и people — словари (имя: настройки), admin_ips и docker_users —
+      списки. Пустые — {} и [], а не раздел из одних комментариев
+    quiet: true
+
+# SSH пускает только с admin_ips и IP участников: без admin_ips после включения файрвола
+# администратор на сервер не войдёт
+- name: admin_ips не пуст
+  ansible.builtin.assert:
+    that: admin_ips | length > 0
+    fail_msg: "admin_ips пуст: после включения файрвола на сервер не войти. Впишите свои IP в server.yml"
+    quiet: true
+
+# ---------- Проекты ----------
+- name: Имена проектов подходят для групп Linux и баз (a-z, 0-9, _; до 28 символов)
+  ansible.builtin.assert:
+    that: item is match('^[a-z][a-z0-9_]{0,27}$')
+    fail_msg: "Имя проекта '{{ item }}': только строчные латинские буквы, цифры и _, начинается с буквы"
+    quiet: true
+  loop: "{{ projects.keys() | list }}"
+
+# Имя проекта становится именем базы, пользователя базы и compose-проекта. Эти заняты:
+# postgres — суперпользователь Postgres (роль проекта переписала бы его права);
+# template0/1 — шаблоны Postgres; traefik — compose-проект самого Traefik
+# (docker compose down остановил бы все сайты).
+- name: Имена проектов не заняты системой
+  vars:
+    reserved: [postgres, template0, template1, traefik]
+  ansible.builtin.assert:
+    that: projects.keys() | intersect(reserved) | length == 0
+    fail_msg: "Имя проекта занято системой: {{ projects.keys() | intersect(reserved) }}. Выберите другое"
+    quiet: true
+
+# Опечатка в ключе молча значила бы «ключа нет», а это разрушительно: dev: вместо devs: удалила бы
+# аккаунт участника, bd: вместо db: закрыла бы вход в базу и остановила её дампы.
+# Все ключи с пояснениями — server.yml.example
+- name: У проектов только известные ключи
+  vars:
+    known: [net, domains, db, db_conn_limit, db_statement_timeout, memory, cpus, autodeploy, backup_hourly, backup_every, devs]
+  ansible.builtin.assert:
+    that: item.value.keys() | difference(known) | length == 0
+    fail_msg: >-
+      Проект '{{ item.key }}': неизвестные ключи {{ item.value.keys() | difference(known) }} — опечатка?
+      Известные: {{ known | join(', ') }} (server.yml.example)
+    quiet: true
+  loop: "{{ projects | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: "У каждого проекта есть net (1..254), db — только postgres"
+  ansible.builtin.assert:
+    that:
+      - item.value.net is defined and item.value.net | int >= 1 and item.value.net | int <= 254
+      - item.value.db is not defined or item.value.db == 'postgres'
+    fail_msg: "Проект '{{ item.key }}': нужен net (1..254); db — только postgres (или без базы)"
+    quiet: true
+  loop: "{{ projects | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Номера сетей проектов не повторяются
+  vars:
+    nets: "{{ projects.values() | map(attribute='net') | map('int') | list }}"
+  ansible.builtin.assert:
+    that: nets | length == nets | unique | length
+    fail_msg: "net проектов повторяются: {{ nets }}"
+    quiet: true
+
+- name: "Лимиты проектов: memory — число с m или g (512m, 2g), cpus — число больше 0"
+  ansible.builtin.assert:
+    that:
+      - item.value.memory is not defined or (item.value.memory | string) is match('^[0-9]+[mMgG]$')
+      - item.value.cpus is not defined or (item.value.cpus | float) > 0
+    fail_msg: "Проект '{{ item.key }}': memory как 512m или 2g, cpus — число (1, 1.5, 2)"
+    quiet: true
+  loop: "{{ projects | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# autodeploy: "yes" (строка) выглядело бы включённым. Образы приватные — без токена таймер
+# падал бы каждые 15 секунд
+# Ссылка доступа: true/false; срок — целые часы, не больше трёх суток (порт открыт и соседям IP
+# по оператору); свой адрес — имя хоста, без https:// и пути
+- name: "access_link — true или false, access_link_hours — 1..72, access_link_host — имя хоста"
+  ansible.builtin.assert:
+    that:
+      - access_link is boolean
+      - access_link_hours | string is match('^[0-9]+$') and access_link_hours | int >= 1 and access_link_hours | int <= 72
+      - access_link_host == '' or access_link_host is match('^[a-z0-9]([a-z0-9-]*[a-z0-9])?([.][a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
+    fail_msg: >-
+      access_link — true или false (без кавычек); access_link_hours — число часов от 1 до 72;
+      access_link_host — имя хоста (access.example.ru), без https:// и пути, или пусто (<IP>.sslip.io)
+    quiet: true
+
+# Частые снимки: backup_hourly — что (db — только база, у проекта должна быть база; all — база
+# и папки проекта), backup_every — как часто, минут. true или опечатка выглядели бы включёнными,
+# а снимков бы не было. Значения backup_every делят друг друга: таймер срабатывает с шагом самого
+# частого проекта, и минута каждого попадает на срабатывание (10 и 15 так не сошлись бы)
+- name: "backup_hourly у проекта — db или all; backup_every — 1, 5, 15, 30 или 60 минут"
+  ansible.builtin.assert:
+    that:
+      - item.value.backup_hourly is not defined or item.value.backup_hourly in ['db', 'all']
+      - item.value.backup_hourly | default('') != 'db' or item.value.db is defined
+      - item.value.backup_every is not defined or (item.value.backup_hourly is defined
+        and item.value.backup_every | string in ['1', '5', '15', '30', '60'])
+    fail_msg: >-
+      Проект '{{ item.key }}': backup_hourly — db (только база; у проекта должна быть db: postgres)
+      или all (база и папки проекта); backup_every — минут между снимками: 1, 5, 15, 30 или 60
+      (по умолчанию 60), только вместе с backup_hourly
+    quiet: true
+  loop: "{{ projects | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: "autodeploy у проекта — true или false; при автовыкладке — токен реестра в secrets.yml"
+  ansible.builtin.assert:
+    that:
+      - projects.values() | selectattr('autodeploy', 'defined') | rejectattr('autodeploy', 'boolean') | list | length == 0
+      - autodeploy_projects | length == 0 or (ghcr_user != '' and ghcr_token != '')
+    fail_msg: >-
+      autodeploy — true или false, без кавычек; при autodeploy: true в {{ infra_dir }}/secrets.yml нужны
+      ghcr_user и ghcr_token (токен GitHub classic с правом read:packages)
+    quiet: true
+
+# Автовыкладка без проверки запускает от root compose.yml из образа, а образ выбирает .env проекта:
+# участник проекта (пишет в web/) фактически root на сервере, как docker_users. Пусть это будет
+# видно в описании (DECISIONS.md, «Автовыкладка»)
+- name: Участники проектов с автовыкладкой — в docker_users
+  vars:
+    not_docker: "{{ projects | dict2items | selectattr('key', 'in', autodeploy_projects)
+                    | map(attribute='value.devs', default=[]) | flatten | unique | difference(docker_users) }}"
+  ansible.builtin.assert:
+    that: not_docker | length == 0
+    fail_msg: >-
+      {{ not_docker }}: участники проектов с автовыкладкой, но не в docker_users. Автовыкладка запускает
+      compose.yml проекта от root — его участник фактически root на сервере. Добавьте их в docker_users
+      или уберите autodeploy (DECISIONS.md, «Автовыкладка»)
+    quiet: true
+
+# ---------- Люди ----------
+- name: Все участники проектов описаны в people, администратора там нет
+  ansible.builtin.assert:
+    that:
+      - host_people | difference(people.keys()) | length == 0
+      - admin_user not in people
+      - people.keys() | reject('match', '^[a-z][a-z0-9_-]{0,31}$') | list | length == 0
+    fail_msg: >-
+      Нет в people: {{ host_people | difference(people.keys()) }};
+      {{ admin_user }} не должен быть в people (иначе его можно случайно удалить);
+      имена — строчные латинские буквы, цифры, _ и -
+    quiet: true
+
+# В Postgres локальный вход (peer) пускает пользователя Linux в роль с тем же именем:
+# человек по имени shop вошёл бы в базу проекта shop без пароля.
+- name: Имена людей и администратора не совпадают с именами проектов
+  ansible.builtin.assert:
+    that: (people.keys() | list + [admin_user]) | intersect(projects.keys()) | length == 0
+    fail_msg: >-
+      Совпадают имена человека и проекта: {{ (people.keys() | list + [admin_user]) | intersect(projects.keys()) }}.
+      Переименуйте проект (или человека)
+    quiet: true
+
+# Человеку с группой docker нужен и доступ к папке проекта (compose.yml читается с его правами),
+# поэтому docker_users — только из участников проектов этого сервера.
+- name: docker_users — участники проектов этого сервера
+  ansible.builtin.assert:
+    that: docker_users | difference(host_people) | length == 0
+    fail_msg: "docker_users: {{ docker_users | difference(host_people) }} — не участники проектов этого сервера (devs)"
+    quiet: true
+
+# exclusive: true оставляет на сервере только ключи из описания: заготовка или обрывок вместо
+# ключа закрыли бы вход администратору или участнику. Ключей может быть несколько — по строке.
+- name: SSH-ключи — настоящие ключи, а не заготовки
+  vars:
+    key_re: '^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp\d+|sk-\S+) [A-Za-z0-9+/]{40,}={0,3}( .*)?$'
+    key_msg: "незаполненный или испорченный SSH-ключ. Нужна строка вида «ssh-ed25519 AAAAC3... имя»"
+  block:
+    - name: SSH-ключи администратора (admin_keys)
+      vars:
+        lines: "{{ admin_keys | trim | split('\n') | map('trim') | reject('eq', '') | list }}"
+      ansible.builtin.assert:
+        that:
+          - lines | length > 0
+          - lines | reject('match', key_re) | list | length == 0
+        fail_msg: "admin_keys: {{ key_msg }}"
+        quiet: true
+
+    - name: SSH-ключи участников (people)
+      vars:
+        lines: "{{ people[item].key | default('') | trim | split('\n') | map('trim') | reject('eq', '') | list }}"
+      ansible.builtin.assert:
+        that:
+          - lines | length > 0
+          - lines | reject('match', key_re) | list | length == 0
+        fail_msg: "people.{{ item }}: {{ key_msg }}"
+        quiet: true
+      loop: "{{ host_people }}"
+
+# ---------- Ключи, которые вписывает администратор (secrets.yml) ----------
+# Пароли баз, Postgres и restic создаёт роль secrets сама; ключи S3 — из панели хранилища
+- name: При включённом S3 в secrets.yml есть его ключи
+  ansible.builtin.assert:
+    that: restic_s3_repository_base == '' or (restic_aws_access_key_id != '' and restic_aws_secret_access_key != '')
+    fail_msg: >-
+      Задан restic_s3_repository_base, но в {{ infra_dir }}/secrets.yml нет s3_access_key и s3_secret_key
+      (ключи бакета; у каждого сервера свои)
+    quiet: true
+
+# Уведомления в Telegram: чат без бота молча не получал бы ничего. Бот без чата — шаг настройки
+# (id чата подсказывает infra-notify --find-chat по токену): не ошибка, а напоминание
+- name: Telegram — чат только с ботом, прокси — адрес, сводка — время ЧЧ:ММ
+  vars:
+    tg_proxy: "{{ secrets.telegram_proxy | default('', true) }}"
+  ansible.builtin.assert:
+    that:
+      - secrets.telegram_chat_id | default('', true) | string == '' or secrets.telegram_bot_token | default('', true) != ''
+      - tg_proxy == '' or tg_proxy is match('^(https?|socks5h?)://')
+      - notify_summary_time | string is match('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+    fail_msg: >-
+      В {{ infra_dir }}/secrets.yml telegram_chat_id задан без telegram_bot_token;
+      telegram_proxy — адрес вида socks5h://логин:пароль@хост:порт или http://хост:порт;
+      notify_summary_time — время ЧЧ:ММ в кавычках, например "09:00"
+    quiet: true
+
+- name: Telegram — бот задан, чат ещё нет
+  ansible.builtin.debug:
+    msg: >-
+      В {{ infra_dir }}/secrets.yml есть telegram_bot_token, но пустой telegram_chat_id — уведомления
+      не уходят. id чата подскажет sudo infra-notify --find-chat (ADMIN.md, «Уведомления в Telegram»)
+  when: secrets.telegram_bot_token | default('', true) != '' and secrets.telegram_chat_id | default('', true) | string == ''
+
+# Заготовка в адресе уведомлений молча выключила бы мониторинг
+- name: Нет незаполненных заготовок («замените», example.com) в адресах, email и ключах S3
+  vars:
+    filled:
+      acme_email: "{{ acme_email }}"
+      backup_healthcheck_url: "{{ backup_healthcheck_url }}"
+      monitor_healthcheck_url: "{{ monitor_healthcheck_url }}"
+      s3_access_key: "{{ restic_aws_access_key_id }} {{ restic_aws_secret_access_key }}"
+    placeholders: >-
+      {{ filled | dict2items | selectattr('value', 'search', 'замените|(@|//)example\.(com|org|net)\b')
+         | map(attribute='key') | list }}
+  ansible.builtin.assert:
+    that: placeholders | length == 0
+    fail_msg: "Заполните (сейчас там заготовка): {{ placeholders | join(', ') }}"
+    quiet: true

@@ -1,0 +1,3 @@
+expect_error: "Совпадают имена человека и проекта"
+projects:
+  ivan: {net: 5, devs: [olga]}

@@ -1,0 +1,47 @@
+# Вычисляемые значения. Редактировать не нужно.
+
+# Все люди с доступом к этому серверу (участники его проектов)
+host_people: "{{ projects.values() | map(attribute='devs', default=[]) | flatten | unique }}"
+
+# Проекты с автовыкладкой из реестра образов (autodeploy: true)
+autodeploy_projects: "{{ projects | dict2items | selectattr('value.autodeploy', 'defined') | selectattr('value.autodeploy') | map(attribute='key') | list }}"
+
+# Адрес ссылки доступа (access_link): свой домен или <IP сервера>.sslip.io — его DNS отвечает
+# адресом из имени, поэтому Let's Encrypt выдаёт сертификат без своего домена
+access_host: >-
+  {{ access_link_host if access_link_host else
+     (ansible_facts['default_ipv4']['address'] | default('127.0.0.1') | replace('.', '-')) ~ '.sslip.io' }}
+
+# Проекты с частыми снимками (backup_hourly: db | all, как часто — backup_every)
+hourly_backup_projects: >-
+  {{ projects | dict2items | selectattr('value.backup_hourly', 'defined') | selectattr('value.backup_hourly')
+     | map(attribute='key') | list }}
+
+# Шаг таймера частых снимков, минут: самый частый backup_every (1, 5, 15, 30 или 60 — каждое
+# делит следующее, поэтому шаг делит и остальные). Нет таких проектов — 60
+backup_hourly_step: >-
+  {{ projects.values() | selectattr('backup_hourly', 'defined') | selectattr('backup_hourly')
+     | map(attribute='backup_every', default=60) | map('int') | min | default(60, true) }}
+
+# Проекты с базой (db: postgres). У каждого один пользователь базы: имя = имя проекта,
+# он владелец базы.
+db_projects: "{{ projects | dict2items | selectattr('value.db', 'defined') | list }}"
+
+# Группы Linux каждого участника сервера, например {ivan: [devs, shop-dev, crm-dev, docker]}:
+#   devs          — все участники сервера (ограничения SSH, метка «аккаунт создан плейбуком»);
+#   <проект>-dev  — по группе на каждый его проект (доступ к папке проекта);
+#   docker        — если он в docker_users (это root на сервере).
+people_groups: >-
+  {%- set groups = {} -%}
+  {%- for person in host_people -%}
+  {%-   set own_projects = projects | dict2items | selectattr('value.devs', 'defined')
+                           | selectattr('value.devs', 'contains', person) | map(attribute='key') | list -%}
+  {%-   set _ = groups.update({person: ['devs']
+                                       + (own_projects | map('regex_replace', '$', '-dev') | list)
+                                       + (['docker'] if person in docker_users else [])}) -%}
+  {%- endfor -%}
+  {{ groups }}
+
+# IP, которым открыт SSH/SFTP: администратор и участники проектов сервера.
+people_ips: "{{ host_people | map('extract', people) | map(attribute='ips', default=[]) | flatten }}"
+ssh_allowed_ips: "{{ (admin_ips + people_ips) | unique }}"

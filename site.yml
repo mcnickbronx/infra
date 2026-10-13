@@ -1,0 +1,58 @@
+# Главный плейбук: приводит сервер к его описанию — /etc/infra/server.yml.
+# Запускается на самом сервере командой infra (она и подставляет имя сервера):
+#   sudo infra apply            # показать, что изменится, и после подтверждения применить
+#   sudo infra apply --check    # только показать
+- name: Настройка сервера
+  hosts: all
+  become: true
+  vars_files:
+    - /etc/infra/server.yml          # = infra_dir: здесь переменные движка ещё не прочитаны
+  # На свежем сервере unattended-upgrades долго ставит накопившиеся обновления
+  # и держит блокировку apt: ждём его до 15 минут, а не 60 секунд по умолчанию.
+  module_defaults:
+    ansible.builtin.apt:
+      lock_timeout: 900
+  # Пароли сервера — до проверок: preflight проверяет и их (ключи S3, токен ghcr)
+  pre_tasks:
+    - name: Пароли сервера (/etc/infra/secrets.yml)
+      ansible.builtin.include_vars:
+        file: "{{ infra_dir }}/secrets.yml"
+        name: secrets_file
+      no_log: true
+      tags: [always]
+    - name: Настройки сервера как есть — preflight проверяет их ключи
+      ansible.builtin.include_vars:
+        file: "{{ infra_dir }}/server.yml"
+        name: server_settings
+      tags: [always]
+  # У каждой роли своя метка: можно применить часть, например только файрвол
+  # и доступы: sudo infra apply --tags base,users
+  # Порядок важен: secrets — после проверок (пишет файл), traefik — после docker
+  # (Traefik — контейнер), crowdsec — после traefik (читает его лог), project — после
+  # users (папки проектов принадлежат группам <проект>-dev, их создаёт users).
+  roles:
+    # Проверки описания до любых изменений — при любом запуске, в том числе с --tags
+    - role: preflight
+      tags: [always]
+    - role: secrets       # недостающие пароли — создать и дописать в secrets.yml
+      tags: [always]
+    - role: base          # пакеты, SSH, файрвол с белыми списками, автообновления, админ
+      tags: [base]
+    - role: docker        # Docker, сеть на каждый проект, base.yml для compose, очистка образов
+      tags: [docker]
+    - role: postgres      # нативный Postgres, база и роль на проект
+      tags: [postgres, db]
+    - role: traefik       # reverse proxy + автоматический SSL
+      tags: [traefik]
+    - role: crowdsec      # защита SSH и сайтов
+      tags: [crowdsec]
+    - role: access        # ссылка доступа: SSH с меняющегося IP (после base — ufw, traefik — маршрут)
+      tags: [access]
+    - role: users         # участники проектов: SSH/SFTP, ключи, группа docker
+      tags: [users]
+    - role: project       # папки проектов, лимиты, автовыкладка
+      tags: [project]
+    - role: backup        # ночные бэкапы restic
+      tags: [backup]
+    - role: monitoring    # health-check каждый час: диск, память, упавшие службы и контейнеры...
+      tags: [monitoring]

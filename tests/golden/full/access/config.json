@@ -1,0 +1,8 @@
+{
+    "host": "access.fixture.test",
+    "hours": 12,
+    "max_open": 10,
+    "port": 8099,
+    "server": "full",
+    "token_sha256": "2054c07d7a81b4fe8e4a7b0a47c707d3e63ac832097424bd48cf54a3884c069e"
+}

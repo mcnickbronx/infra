@@ -1,0 +1,119 @@
+# Метка «аккаунт создан плейбуком» — членство в группе devs. Плейбук меняет и удаляет
+# только такие аккаунты: опечатка в people (postgres, www-data, ubuntu...) не отдаст
+# вход по ключу в системного или чужого пользователя и не удалит его.
+- name: Аккаунты, созданные плейбуком (группа devs)
+  ansible.builtin.getent:
+    database: group
+    key: devs
+    fail_key: false             # новый сервер: группы ещё нет
+
+- name: Какие аккаунты уже есть на сервере
+  ansible.builtin.getent:
+    database: passwd
+
+# getent group devs → [пароль, gid, "участники,через,запятую"]; группы ещё нет — пусто
+- name: Список аккаунтов плейбука
+  ansible.builtin.set_fact:
+    playbook_accounts: "{{ (getent_group.devs | default(['', '', ''], true))[2] | split(',') | reject('eq', '') | list }}"
+
+- name: Имена участников не заняты чужими аккаунтами
+  vars:
+    taken: "{{ host_people | select('in', getent_passwd) | reject('in', playbook_accounts) | list }}"
+  ansible.builtin.assert:
+    that: taken | length == 0
+    fail_msg: >-
+      На сервере уже есть пользователи {{ taken }}, созданные не плейбуком (системные или
+      хостера). Плейбук не будет их менять: переименуйте человека в people (server.yml)
+    quiet: true
+
+# devs — все участники проектов сервера (ограничения SSH);
+# <проект>-dev — участники конкретного проекта (доступ к его папке);
+# docker — те, кто запускает контейнеры (docker_users в server.yml). Это root на сервере.
+- name: Группа devs
+  ansible.builtin.group:
+    name: devs
+
+- name: Группы проектов (<проект>-dev)
+  ansible.builtin.group:
+    name: "{{ item }}-dev"
+  loop: "{{ projects.keys() | list }}"
+
+# В --check новые группы (<проект>-dev нового проекта) ещё не созданы,
+# а модуль user с несуществующей группой падает: в --check — только уже существующие
+- name: Какие группы уже есть
+  ansible.builtin.getent:
+    database: group
+  check_mode: false
+
+- name: Аккаунты участников проектов
+  ansible.builtin.user:
+    name: "{{ item }}"
+    shell: /bin/bash
+    # devs, <проект>-dev, docker (derived.yml)
+    groups: "{{ people_groups[item] | select('in', getent_group) | list if ansible_check_mode else people_groups[item] }}"
+    append: false             # убран из проекта или из docker_users — теряет группу
+  loop: "{{ host_people }}"
+
+# go <проект> — в папку проекта сразу после входа (вход попадает в домашнюю папку)
+- name: Команда go (переход в папку проекта)
+  ansible.builtin.copy:
+    src: projects.sh
+    dest: /etc/profile.d/projects.sh
+    mode: "0644"
+
+- name: Домашние папки закрыты от остальных
+  ansible.builtin.file:
+    path: "/home/{{ item }}"
+    state: directory
+    owner: "{{ item }}"
+    group: "{{ item }}"
+    mode: "0750"
+  loop: "{{ host_people }}"
+
+# В --check аккаунта нового участника ещё нет (его создание только показано), а модуль
+# без существующего пользователя падает — иначе --check --diff ломался бы на каждом новом человеке
+- name: SSH-ключи (лишние ключи удаляются)
+  ansible.posix.authorized_key:
+    user: "{{ item }}"
+    key: "{{ people[item].key }}"
+    exclusive: true
+  loop: "{{ host_people }}"
+  when: not ansible_check_mode or item in getent_passwd
+
+# Удаляется каждый аккаунт плейбука (группа devs), которого нет в проектах этого сервера:
+# убрали из devs всех проектов сервера или из people совсем. Сначала — его процессы
+# и crontab: открытая SSH-сессия иначе продолжала бы работать и после удаления.
+# ВНИМАНИЕ: удаляется и домашняя папка человека. Проекты в /srv не затрагиваются.
+- name: Сессии и crontab людей без доступа к этому серверу
+  ansible.builtin.shell: |
+    pkill -KILL -u {{ item | quote }} || true
+    crontab -r -u {{ item | quote }} 2>/dev/null || true
+  loop: "{{ playbook_accounts | difference(host_people) }}"
+  changed_when: true
+
+- name: Удаление людей без доступа к этому серверу
+  ansible.builtin.user:
+    name: "{{ item }}"
+    state: absent
+    remove: true
+    force: true
+  loop: "{{ playbook_accounts | difference(host_people) }}"
+
+# В конец sshd_config, а не в sshd_config.d/: Include стоит в начале файла, и блок Match
+# из drop-in «проглотил» бы все глобальные настройки, идущие после него.
+# Проброс портов — только туннель к Postgres (DBeaver через SSH): с любого IP, по ключу.
+# Куда-то ещё (контейнеры, Docker, наружу) и обратный проброс (-R) запрещены.
+- name: SSH — участникам проектов проброс только к Postgres
+  ansible.builtin.blockinfile:
+    path: /etc/ssh/sshd_config
+    marker: "# {mark} ANSIBLE DEVS"
+    insertafter: EOF
+    validate: /usr/sbin/sshd -t -f %s
+    block: |
+      Match Group devs
+          AllowTcpForwarding local
+          PermitOpen 127.0.0.1:5432
+          AllowStreamLocalForwarding no
+          X11Forwarding no
+          PermitTunnel no
+  notify: Restart ssh           # обработчик — в роли base

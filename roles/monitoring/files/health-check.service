@@ -1,0 +1,7 @@
+# Управляется Ansible (роль monitoring). Проверки сервера; о новом и прошедшем — в Telegram
+[Unit]
+Description=Server health check (disk, load, memory, services, containers, backups)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/health-check.sh --notify

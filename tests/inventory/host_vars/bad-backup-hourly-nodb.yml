@@ -1,0 +1,3 @@
+expect_error: "у проекта должна быть db: postgres"
+projects:
+  site: {net: 5, backup_hourly: db, devs: [ivan]}

@@ -1,0 +1,3 @@
+expect_error: "['ivan']: участники проектов с автовыкладкой, но не в docker_users"
+projects:
+  site: {net: 5, db: postgres, autodeploy: true, devs: [ivan]}

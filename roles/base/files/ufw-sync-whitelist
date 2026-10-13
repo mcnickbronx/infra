@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+# Управляется Ansible.
+# Приводит правила SSH в ufw с комментарием ansible-wl к списку IP из JSON-файла:
+# добавляет недостающие, удаляет лишние (и с другим портом — остатки прежних правил).
+# Правила без этого комментария не трогает.
+#   ufw-sync-whitelist <файл.json>          — привести ufw к списку
+#   ufw-sync-whitelist --check <файл.json>  — только показать расхождения (код 1, если есть)
+# Логика — в функциях, их проверяет tests/test_scripts.py.
+import ipaddress
+import json
+import re
+import subprocess
+import sys
+
+TAG = "ansible-wl"
+PORT = "22"
+RULE = re.compile(r"^ufw allow from (\S+) to any port (\d+) proto tcp comment '" + TAG + "'$")
+
+
+def norm(addr):
+    """Адрес так, как его хранит ufw: подсеть без битов хоста, одиночный IP без /32.
+    Иначе 203.0.113.5/29 из инвентаря не совпал бы с 203.0.113.0/29 в ufw,
+    и правило удалялось бы при каждом запуске."""
+    net = ipaddress.ip_network(addr, strict=False)
+    return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+
+
+def desired_rules(ips):
+    """Список IP из JSON (роль base, whitelist.json.j2): {(адрес, порт SSH)}."""
+    return {(norm(ip), PORT) for ip in ips}
+
+
+def existing_rules(added):
+    """Наши правила (с пометкой ansible-wl) из вывода `ufw show added`: {(адрес, порт)}."""
+    found = set()
+    for line in added.splitlines():
+        m = RULE.match(line.strip())
+        if m:
+            found.add((norm(m.group(1)), m.group(2)))
+    return found
+
+
+def plan(desired, existing):
+    """Что добавить и что удалить — в постоянном порядке."""
+    return sorted(desired - existing), sorted(existing - desired)
+
+
+def ufw(*args):
+    subprocess.run(["ufw", *args], check=True, stdout=subprocess.DEVNULL)
+
+
+def main(path, check=False):
+    with open(path) as f:
+        desired = desired_rules(json.load(f))
+    added = subprocess.run(["ufw", "show", "added"], check=True, capture_output=True, text=True).stdout
+    to_add, to_delete = plan(desired, existing_rules(added))
+    for ip, port in to_add:
+        if not check:
+            ufw("allow", "from", ip, "to", "any", "port", port, "proto", "tcp", "comment", TAG)
+        print(f"+ {ip} -> {port}")
+    for ip, port in to_delete:
+        if not check:
+            ufw("delete", "allow", "from", ip, "to", "any", "port", port, "proto", "tcp")
+        print(f"- {ip} -> {port}")
+    print("CHANGED" if to_add or to_delete else "OK")
+    return 1 if check and (to_add or to_delete) else 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "--check":
+        sys.exit(main(sys.argv[2], check=True))
+    sys.exit(main(sys.argv[1]))

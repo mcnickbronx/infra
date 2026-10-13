@@ -1,0 +1,34 @@
+# Всё включено: каждая настройка, которая влияет на шаблоны.
+restic_s3_repository_base: "s3:https://s3.fixture.test/backups"
+backup_healthcheck_url: "https://hc.fixture.test/backup"
+monitor_healthcheck_url: "https://hc.fixture.test/monitor"
+access_link_host: access.fixture.test
+access_link_hours: 12
+
+docker_users: [dina]
+projects:
+  shop:
+    domains: [shop.fixture.test, "*.shop.fixture.test"]
+    net: 11
+    db: postgres
+    db_conn_limit: 100
+    autodeploy: true              # участники проекта с автовыкладкой — только из docker_users
+    backup_hourly: all
+    memory: 4g
+    cpus: 2
+    devs: [dina]
+  crm:
+    net: 12
+    db: postgres
+    db_statement_timeout: "0"
+    backup_hourly: db
+    backup_every: 5               # таймер — с шагом 5 минут, shop (60) снимается в :05
+    devs: [ivan, gone]
+  blog:
+    net: 13
+    memory: 512m
+    cpus: 0.5
+    devs: [olga, vera]
+  static:
+    net: 20
+    devs: [olga, kira]

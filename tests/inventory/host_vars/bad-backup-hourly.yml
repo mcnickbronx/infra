@@ -1,0 +1,3 @@
+expect_error: "backup_hourly — db (только база"
+projects:
+  site: {net: 5, db: postgres, backup_hourly: true, devs: [ivan]}

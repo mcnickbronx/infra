@@ -1,0 +1,9 @@
+[Unit]
+Description=Frequent project snapshots (restic, backup_hourly)
+After=postgresql.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backup-hourly.sh
+Nice=10
+IOSchedulingClass=idle

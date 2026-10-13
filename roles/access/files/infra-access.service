@@ -1,0 +1,6 @@
+[Unit]
+Description=Access link: open SSH for requested IPs (ufw)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/infra-access process

@@ -1,0 +1,16 @@
+# Управляется Ansible (роль project). Каждые 15 секунд: не вышел ли новый образ проекта %i.
+[Unit]
+Description=Autodeploy of project %i (every 15 s)
+
+[Timer]
+# После загрузки и после включения таймера, затем — через 15 секунд после каждой проверки.
+# Проверка — один запрос к реестру: около секунды, 0,1 с процессора.
+# AccuracySec: по умолчанию systemd сдвигает срабатывание до минуты, чтобы объединять таймеры,
+# и 15 секунд стали бы минутой
+OnBootSec=2min
+OnActiveSec=30s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+# Управляется Ansible (роль access). Вход по SSH с меняющегося IP: правила ufw с пометкой
+# «infra-access <до, unix-время>». Их добавляет ссылка доступа (страница infra-access-web), убирает
+# таймер по сроку. Правила белого списка (пометка ansible-wl) не трогаются.
+#   infra-access link            — ссылка этого сервера (секрет — access_token в /etc/infra/secrets.yml)
+#   infra-access list            — открытые сейчас по ссылке: IP и до какого времени
+#   infra-access close <IP>|all  — закрыть раньше срока
+#   infra-access process         — заявки со страницы → правила ufw (запускает infra-access.path)
+#   infra-access expire [--now <unix-время>]  — убрать истёкшие (infra-access-expire.timer, каждые
+#                                  5 минут; --now — для проверок)
+# Открыто — в журнал событий и в Telegram. Логика — в функциях, их проверяет tests/test_scripts.py.
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+
+CONF = "/etc/infra-access/config.json"
+SECRETS = "/etc/infra/secrets.yml"
+WHITELIST = "/etc/ufw/ansible-whitelist.json"
+QUEUE = "/run/infra-access/queue"
+DONE = "/run/infra-access/done"
+TAG = "infra-access"
+PORT = "22"
+RULE = re.compile(r"^ufw allow from (\S+) to any port " + PORT + r" proto tcp comment '" + TAG + r" (\d+)'$")
+
+
+def norm(addr):
+    """Адрес так, как его хранит ufw (как в ufw-sync-whitelist)."""
+    net = ipaddress.ip_network(addr, strict=False)
+    return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+
+
+def open_rules(added):
+    """Открытые по ссылке IP из `ufw show added`: {ip: до (unix-время)}."""
+    found = {}
+    for line in added.splitlines():
+        m = RULE.match(line.strip())
+        if m:
+            found[norm(m.group(1))] = int(m.group(2))
+    return found
+
+
+def public_ip(value):
+    """Только публичный одиночный IP — заявку проверяем заново: в очередь пишет не root."""
+    try:
+        ip = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return None
+    return str(ip) if ip.is_global else None
+
+
+def whitelisted(ip, whitelist):
+    """IP в белом списке сервера ровно этим адресом: тогда открывать нечего. Правило «IP»
+    и правило «подсеть с этим IP» для ufw разные — с подсетью отдельное временное правило не мешает."""
+    return norm(ip) in {norm(a) for a in whitelist}
+
+
+def plan_open(rules, ip, until, max_open):
+    """Что удалить, чтобы открыть ip до until: прежнее правило этого IP (продлится заново)
+    и самые старые сверх max_open — утёкшей ссылкой не открыть сотню адресов."""
+    delete = [ip] if ip in rules else []
+    rest = sorted((u, a) for a, u in rules.items() if a != ip)
+    while len(rest) >= max_open:
+        delete.append(rest.pop(0)[1])
+    return delete
+
+
+def expired(rules, now):
+    return sorted(ip for ip, until in rules.items() if until <= now)
+
+
+def when(ts):
+    return time.strftime("%d.%m %H:%M", time.localtime(ts))
+
+
+def ufw(*args):
+    subprocess.run(["ufw", *args], check=True, stdout=subprocess.DEVNULL)
+
+
+def current_rules():
+    added = subprocess.run(["ufw", "show", "added"], check=True, capture_output=True, text=True).stdout
+    return open_rules(added)
+
+
+def allow(ip, comment):
+    ufw("allow", "from", ip, "to", "any", "port", PORT, "proto", "tcp", "comment", comment)
+
+
+def remove(ip):
+    ufw("delete", "allow", "from", ip, "to", "any", "port", PORT, "proto", "tcp")
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+
+def event(text, notify=False, server=""):
+    """В журнал событий; открытие — ещё и в Telegram (не настроен или недоступен — не страшно)."""
+    subprocess.run(["infra-log", text], check=False)
+    if notify:
+        subprocess.run(["infra-notify", f"{server}: {text}"], check=False, stdout=subprocess.DEVNULL)
+
+
+def host_of(ip):
+    """Имя хоста по IP (у операторов — обычно их домен): подсказка в Telegram, чей это адрес."""
+    socket.setdefaulttimeout(3)
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except OSError:
+        return ""
+
+
+def open_ip(ip, conf, now):
+    """Открыть ip на conf['hours'] часов. Возвращает текст для страницы."""
+    if whitelisted(ip, load(WHITELIST, [])):
+        return f"{ip} уже в белом списке сервера — SSH открыт и так."
+    until = now + int(conf["hours"]) * 3600
+    rules = current_rules()
+    for old in plan_open(rules, ip, until, int(conf["max_open"])):
+        remove(old)
+    allow(ip, f"{TAG} {until}")
+    host = host_of(ip)
+    event(f"доступ по ссылке: SSH открыт для {ip}{f' ({host})' if host else ''} до {when(until)}",
+          notify=True, server=conf["server"])
+    return f"Готово: SSH открыт для {ip} до {when(until)}."
+
+
+def cmd_process(conf):
+    """Заявки со страницы: файл с IP, ответ — файл с тем же именем в DONE."""
+    try:
+        names = sorted(n for n in os.listdir(QUEUE) if not n.startswith("."))
+    except FileNotFoundError:
+        return 0
+    for name in names:
+        path = os.path.join(QUEUE, name)
+        try:
+            with open(path) as f:
+                ip = public_ip(f.read(64))
+            os.remove(path)
+        except OSError:
+            continue
+        text = open_ip(ip, conf, int(time.time())) if ip else "Не вышло: заявка без публичного IP."
+        if re.fullmatch(r"[0-9a-f]{16}", name):
+            with open(os.path.join(DONE, name), "w") as f:
+                f.write(text + "\n")
+    return 0
+
+
+def cmd_expire(now):
+    whitelist = load(WHITELIST, [])
+    for ip in expired(current_rules(), now):
+        remove(ip)
+        # IP успели внести в белый список, пока он был открыт ссылкой: ufw не добавил второе такое же
+        # правило — вернуть его с пометкой белого списка, иначе SSH закрылся бы до следующего apply
+        if whitelisted(ip, whitelist):
+            allow(ip, "ansible-wl")
+        event(f"доступ по ссылке: SSH для {ip} закрыт — срок вышел")
+    return 0
+
+
+def cmd_list():
+    rules = current_rules()
+    if not rules:
+        print("По ссылке сейчас ничего не открыто")
+    for ip, until in sorted(rules.items(), key=lambda r: r[1]):
+        print(f"{ip}  до {when(until)}")
+    return 0
+
+
+def cmd_close(target):
+    rules = current_rules()
+    try:
+        ips = list(rules) if target == "all" else [norm(target)]
+    except ValueError:
+        print(f"Не IP: {target}", file=sys.stderr)
+        return 1
+    for ip in ips:
+        if ip not in rules:
+            print(f"{ip} по ссылке не открыт", file=sys.stderr)
+            return 1
+        remove(ip)
+        event(f"доступ по ссылке: SSH для {ip} закрыт вручную")
+    print("Закрыто: " + (", ".join(ips) if ips else "нечего закрывать"))
+    return 0
+
+
+def cmd_link(conf):
+    token = ""
+    with open(SECRETS) as f:
+        for line in f:
+            m = re.match(r"""^access_token:\s*["']?([A-Za-z0-9]+)""", line)
+            if m:
+                token = m.group(1)
+    if not token:
+        print(f"Нет access_token в {SECRETS}: sudo infra apply его создаст", file=sys.stderr)
+        return 1
+    print(f"https://{conf['host']}/access/{token}")
+    print(f"Открыть ссылку → кнопка: SSH открыт вашему IP на {conf['hours']} ч. Перевыпустить ссылку —"
+          " удалить строку access_token в secrets.yml и sudo infra apply --tags access", file=sys.stderr)
+    return 0
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if os.geteuid() != 0:
+        print("Нужен root: sudo infra-access ...", file=sys.stderr)
+        return 1
+    conf = load(CONF, None)
+    if conf is None and cmd in ("process", "link"):
+        print("Ссылка доступа выключена на этом сервере (access_link: false)", file=sys.stderr)
+        return 1
+    if cmd == "process":
+        return cmd_process(conf)
+    if cmd == "expire":
+        now = int(argv[3]) if len(argv) > 3 and argv[2] == "--now" else int(time.time())
+        return cmd_expire(now)
+    if cmd == "list":
+        return cmd_list()
+    if cmd == "close" and len(argv) > 2:
+        return cmd_close(argv[2])
+    if cmd == "link":
+        return cmd_link(conf)
+    print("Использование: infra-access link | list | close <IP>|all | process | expire", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

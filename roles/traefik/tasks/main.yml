@@ -1,0 +1,42 @@
+- name: Папки Traefik
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ traefik_dir }}", mode: "0755" }
+    - { path: "{{ traefik_dir }}/dynamic", mode: "0700" }
+    - { path: "{{ traefik_dir }}/acme", mode: "0700" }
+    - { path: "{{ traefik_dir }}/logs", mode: "0750" }   # access-лог закрыт от участников
+
+- name: compose.yml Traefik
+  ansible.builtin.template:
+    src: compose.yml.j2
+    dest: "{{ traefik_dir }}/compose.yml"
+    mode: "0644"
+
+- name: Статическая конфигурация Traefik
+  ansible.builtin.template:
+    src: traefik.yml.j2
+    dest: "{{ traefik_dir }}/traefik.yml"
+    mode: "0644"
+  notify: Restart traefik
+
+- name: Middlewares (заголовки безопасности, ограничения доступа)
+  ansible.builtin.template:
+    src: middlewares.yml.j2
+    dest: "{{ traefik_dir }}/dynamic/middlewares.yml"
+    mode: "0600"
+
+- name: Ротация access-лога
+  ansible.builtin.copy:
+    src: logrotate-traefik
+    dest: /etc/logrotate.d/traefik
+    mode: "0644"
+
+# Свежий образ в пределах минорной версии (traefik_image) ставит update.yml
+- name: Запуск Traefik
+  community.docker.docker_compose_v2:
+    project_src: "{{ traefik_dir }}"
+    state: present
+    remove_orphans: true

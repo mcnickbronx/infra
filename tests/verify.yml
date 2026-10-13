@@ -1,0 +1,371 @@
+# Проверка сервера после apply — то, что обещает README, на самом сервере:
+# службы и таймеры, файрвол, SSH, права на папки проектов, аккаунты,
+# доступ к базам, health-check. Ничего не меняет — можно и на рабочем сервере:
+#   sudo infra run tests/verify.yml
+# tools/rollout.sh запускает её сам после apply.
+- name: Проверка сервера
+  hosts: all
+  become: true
+  vars_files:
+    - /etc/infra/server.yml          # = infra_dir: здесь переменные движка ещё не прочитаны
+  vars:
+    services:
+      - docker.service
+      - ssh.service
+      - ufw.service
+      - crowdsec.service
+      - crowdsec-firewall-bouncer.service
+      - backup.timer
+      - health-check.timer
+      - health-check-summary.timer
+      - docker-cleanup.timer
+      - crowdsec-hubupdate.timer        # правила CrowdSec — таймер самого пакета
+      - postgresql.service
+    autodeploy_timers: "{{ autodeploy_projects | map('regex_replace', '^', 'project-deploy@') | map('regex_replace', '$', '.timer') | list }}"
+    access_units: "{{ ['infra-access-web.service', 'infra-access.path', 'infra-access-expire.timer'] if access_link else [] }}"
+    # Путь, права и владелец — как их ставит роль project
+    project_perms: >-
+      {%- set r = [['/srv/projects', '711 root:root']] -%}
+      {%- for p in projects -%}
+      {%-   set _ = r.append(['/srv/projects/' ~ p, '750 root:' ~ p ~ '-dev']) -%}
+      {%-   set _ = r.append(['/srv/projects/' ~ p ~ '/web', '2770 root:' ~ p ~ '-dev']) -%}
+      {%- endfor -%}
+      {{ r }}
+  pre_tasks:
+    - name: Пароли сервера (/etc/infra/secrets.yml)
+      ansible.builtin.include_vars:
+        file: "{{ infra_dir }}/secrets.yml"
+        name: secrets_file
+      no_log: true
+  tasks:
+    # ---------- Службы ----------
+    - name: Состояние служб и таймеров
+      ansible.builtin.command:
+        argv: "{{ ['systemctl', 'is-active'] + services + autodeploy_timers + access_units }}"
+      register: units
+      changed_when: false
+      failed_when: false
+
+    - name: Службы и таймеры работают
+      ansible.builtin.assert:
+        that: units.stdout_lines | select('ne', 'active') | list | length == 0
+        fail_msg: >-
+          Не работают: {{ (services + autodeploy_timers + access_units) | zip(units.stdout_lines)
+                          | rejectattr(1, 'eq', 'active') | map('join', ' — ') | list }}
+        quiet: true
+
+    - name: Включённые таймеры автовыкладки
+      ansible.builtin.find:
+        paths: /etc/systemd/system/timers.target.wants
+        patterns: "project-deploy@*.timer"
+        file_type: link
+      register: deploy_timers
+
+    # Таймер проекта без autodeploy (или убранного из server.yml) выкладывал бы его при каждом push
+    - name: Автовыкладка включена только у проектов с autodeploy
+      vars:
+        extra: "{{ deploy_timers.files | map(attribute='path') | map('basename') | difference(autodeploy_timers) }}"
+      ansible.builtin.assert:
+        that: extra | length == 0
+        fail_msg: "Включены лишние таймеры автовыкладки: {{ extra }}"
+        quiet: true
+
+    - name: Таймер частых снимков
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, backup-hourly.timer]
+      register: hourly_timer
+      changed_when: false
+      failed_when: false
+
+    # Выключен — у проектов с backup_hourly нет снимков, которых от них ждут; включён без них — лишний
+    - name: Частые снимки включены, только если у проектов есть backup_hourly
+      ansible.builtin.assert:
+        that: (hourly_timer.stdout == 'enabled') == (hourly_backup_projects | length > 0)
+        fail_msg: "backup-hourly.timer: {{ hourly_timer.stdout }}, проекты с backup_hourly: {{ hourly_backup_projects }}"
+        quiet: true
+
+    # Работающий таймер берёт новое расписание только после перезапуска (роль backup) — следующий
+    # запуск должен быть на минуте нового шага: :05 и через каждый шаг от неё
+    - name: Следующий запуск частых снимков — минута
+      ansible.builtin.shell: |
+        set -o pipefail
+        date -d "$(systemctl show backup-hourly.timer -p NextElapseUSecRealtime --value --timestamp=unix)" +%M
+      args:
+        executable: /bin/bash
+      register: hourly_next
+      changed_when: false
+      when: hourly_backup_projects | length > 0
+
+    - name: Частые снимки — по расписанию шага самого частого проекта
+      ansible.builtin.assert:
+        that: ((hourly_next.stdout | int) + 55) % (backup_hourly_step | int) == 0
+        fail_msg: "следующий запуск в :{{ hourly_next.stdout }}, а шаг — {{ backup_hourly_step }} минут от :05"
+        quiet: true
+      when: hourly_backup_projects | length > 0
+
+    - name: Сценарии CrowdSec
+      ansible.builtin.command: cscli scenarios list -o raw
+      register: cs_scenarios
+      changed_when: false
+
+    - name: "CrowdSec знает свой сценарий: запрос к .env — бан"
+      ansible.builtin.assert:
+        that: "'infra/http-env-file' in cs_scenarios.stdout"
+        fail_msg: "Нет сценария infra/http-env-file (/etc/crowdsec/scenarios/infra-http-env.yaml): sudo journalctl -u crowdsec -n 30"
+        quiet: true
+
+    # Только GET: страница показывает форму и ничего не открывает
+    - name: Страница ссылки доступа
+      ansible.builtin.shell: |
+        set -uo pipefail
+        url=http://127.0.0.1:{{ access_web_port }}/access
+        echo "wrong=$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Real-Ip: 1.1.1.1' $url/wrong-token)"
+        echo "right=$(curl -s -H 'X-Real-Ip: 1.1.1.1' $url/$TOKEN | grep -c 'Ваш IP: <code>1.1.1.1</code>')"
+        echo "route=$(grep -c 'Host(`{{ access_host }}`)' {{ traefik_dir }}/dynamic/infra-access.yml)"
+      args:
+        executable: /bin/bash
+      environment:
+        TOKEN: "{{ secrets_file.access_token }}"
+      register: access_page
+      changed_when: false
+      no_log: true
+      when: access_link
+
+    - name: "Страница ссылки: чужой секрет — 404, верный — форма с IP посетителя; маршрут Traefik на месте"
+      vars:
+        r: "{{ dict(access_page.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that: r.wrong == '404' and r.right == '1' and r.route == '1'
+        fail_msg: "{{ r | to_json }}"
+        quiet: true
+      when: access_link
+
+    - name: Контейнер Traefik
+      ansible.builtin.command: docker compose -f {{ traefik_dir }}/compose.yml ps --status running -q traefik
+      register: traefik_ps
+      changed_when: false
+
+    - name: Traefik работает
+      ansible.builtin.assert:
+        that: traefik_ps.stdout | length > 0
+        fail_msg: "Контейнер Traefik не запущен: cd {{ traefik_dir }} && sudo docker compose ps"
+        quiet: true
+
+    # ---------- Файрвол ----------
+    - name: Файрвол
+      ansible.builtin.command: ufw status verbose
+      register: ufw_status
+      changed_when: false
+
+    # SSH — только с белого списка, Postgres снаружи — никогда (только SSH-туннель)
+    - name: Файрвол включён, входящие запрещены, SSH и Postgres не открыты всем
+      vars:
+        open_to_all: >-
+          {{ ufw_status.stdout_lines
+             | select('match', '^(22|5432)(/tcp)?( \(v6\))?\s+(ALLOW|LIMIT)( IN)?\s+Anywhere')
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in ufw_status.stdout"
+          - "'deny (incoming)' in ufw_status.stdout"
+          - open_to_all | length == 0
+        fail_msg: "ufw: выключен, не deny по умолчанию или открыто всем: {{ open_to_all }}"
+        quiet: true
+
+    - name: Белый список в ufw совпадает с описанием
+      ansible.builtin.command: /usr/local/sbin/ufw-sync-whitelist --check /etc/ufw/ansible-whitelist.json
+      changed_when: false
+
+    # ---------- SSH ----------
+    - name: Настройки SSH
+      ansible.builtin.command: sshd -T
+      register: sshd_global
+      changed_when: false
+
+    - name: SSH — только по ключу, root не входит
+      ansible.builtin.assert:
+        that:
+          - "'passwordauthentication no' in sshd_global.stdout_lines"
+          - "'kbdinteractiveauthentication no' in sshd_global.stdout_lines"
+          - "'permitrootlogin no' in sshd_global.stdout_lines"
+        fail_msg: "sshd пускает по паролю или root"
+        quiet: true
+
+    - name: Настройки SSH для участников
+      ansible.builtin.command: sshd -T -C user={{ item }},host=verify,addr=192.0.2.1
+      loop: "{{ host_people }}"
+      register: sshd_people
+      changed_when: false
+
+    - name: Участникам — проброс только к Postgres на 127.0.0.1
+      ansible.builtin.assert:
+        that:
+          - "'allowtcpforwarding local' in item.stdout_lines"
+          - "'permitopen 127.0.0.1:5432' in item.stdout_lines"
+          - "'permittunnel no' in item.stdout_lines"
+        fail_msg: "{{ item.item }}: пробросы SSH шире, чем туннель к Postgres"
+        quiet: true
+      loop: "{{ sshd_people.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ---------- Папки и аккаунты ----------
+    - name: Параметры монтирования /srv/projects и /proc
+      ansible.builtin.command: findmnt -no OPTIONS {{ item }}
+      loop: [/srv/projects, /proc]
+      register: mounts
+      changed_when: false
+
+    - name: /srv/projects — nosuid,nodev; чужие процессы скрыты (hidepid)
+      ansible.builtin.assert:
+        that:
+          - "'nosuid' in mounts.results[0].stdout and 'nodev' in mounts.results[0].stdout"
+          - mounts.results[1].stdout is search('hidepid=(2|invisible)')
+        fail_msg: "Параметры: /srv/projects — {{ mounts.results[0].stdout }}; /proc — {{ mounts.results[1].stdout }}"
+        quiet: true
+
+    - name: Права на папки проектов
+      ansible.builtin.command:
+        argv: "{{ ['stat', '-c', '%n %a %U:%G'] + (project_perms | map('first') | list) }}"
+      register: perms
+      changed_when: false
+
+    - name: Папки проектов закрыты от чужих, web/ — группе проекта
+      vars:
+        expected: "{{ project_perms | map('join', ' ') | list }}"
+      ansible.builtin.assert:
+        that: perms.stdout_lines == expected
+        fail_msg: "Ожидали {{ expected | difference(perms.stdout_lines) }}, на сервере {{ perms.stdout_lines | difference(expected) }}"
+        quiet: true
+
+    - name: Аккаунты плейбука (группа devs)
+      ansible.builtin.getent:
+        database: group
+        key: devs
+        fail_key: false
+
+    - name: Группы участников
+      ansible.builtin.command: id -nG {{ item }}
+      loop: "{{ host_people }}"
+      register: person_groups
+      changed_when: false
+
+    - name: Аккаунты — ровно участники проектов, группы — их проекты
+      vars:
+        # getent group devs → [пароль, gid, "участники,через,запятую"]
+        devs_now: "{{ (getent_group.devs | default(['', '', ''], true))[2] | split(',') | reject('eq', '') | list }}"
+      ansible.builtin.assert:
+        that:
+          - devs_now | sort == host_people | sort
+          - person_groups.results | rejectattr('stdout', 'eq', '') | list | length == host_people | length
+        fail_msg: >-
+          Лишние аккаунты: {{ devs_now | difference(host_people) }}, нет аккаунтов: {{ host_people | difference(devs_now) }}
+        quiet: true
+
+    - name: Группы каждого участника совпадают с описанием
+      ansible.builtin.assert:
+        that: (item.stdout.split() | reject('eq', item.item) | sort) == (people_groups[item.item] | sort)
+        fail_msg: "{{ item.item }}: группы {{ item.stdout.split() }}, ожидали {{ people_groups[item.item] }}"
+        quiet: true
+      loop: "{{ person_groups.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ---------- Базы ----------
+    # Пароль — из secrets.yml (db_password_<проект>); вход через 127.0.0.1, как по SSH-туннелю
+    - name: Postgres — пользователь проекта входит в свою базу
+      ansible.builtin.command: psql -h 127.0.0.1 -U {{ item.key }} -d {{ item.key }} -tAc "SELECT current_user"
+      environment:
+        PGPASSWORD: "{{ db_passwords[item.key] }}"
+        PGCONNECT_TIMEOUT: "5"
+      loop: "{{ db_projects }}"
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: false
+      no_log: true
+
+    # Без перезапуска после правки 90-ansible.conf библиотека не загружена, и запрос упадёт
+    - name: Postgres — статистика запросов работает (pg_stat_statements)
+      ansible.builtin.command: psql -d postgres -tAc "SELECT count(*) FROM pg_stat_statements"
+      become: true
+      become_user: postgres
+      changed_when: false
+
+    - name: Postgres — в чужую базу не пускает (REVOKE CONNECT, pg_hba)
+      ansible.builtin.command: psql -h 127.0.0.1 -U {{ item.0.key }} -d {{ item.1.key }} -tAc "SELECT 1"
+      environment:
+        PGPASSWORD: "{{ db_passwords[item.0.key] }}"
+        PGCONNECT_TIMEOUT: "5"
+      loop: "{{ db_projects | product(db_projects) | list }}"
+      loop_control:
+        label: "{{ item.0.key }} → {{ item.1.key }}"
+      when: item.0.key != item.1.key
+      register: pg_cross
+      changed_when: false
+      failed_when: pg_cross.rc == 0
+      no_log: true
+
+    # ---------- Журнал событий ----------
+    - name: Журнал событий /var/log/infra.log
+      ansible.builtin.command: stat -c '%a %U:%G' /var/log/infra.log /usr/local/sbin/infra-log
+      register: event_log
+      changed_when: false
+
+    - name: Журнал событий есть, читает только root и группа adm
+      ansible.builtin.assert:
+        that: event_log.stdout_lines == ['640 root:adm', '755 root:root']
+        fail_msg: "Ожидали 640 root:adm и 755 root:root, на сервере: {{ event_log.stdout_lines }}"
+        quiet: true
+
+    - name: В secrets.yml есть строки всех ключей администратора (из secrets.yml.example)
+      vars:
+        blanks: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../secrets.yml.example').splitlines()
+                    | select('match', '^[a-z0-9_]+: \"\"') | map('regex_replace', ':.*$', '') | list }}"
+      ansible.builtin.assert:
+        that: blanks | difference(secrets_file | list) | length == 0
+        fail_msg: "Нет строк: {{ blanks | difference(secrets_file | list) | join(', ') }}"
+        quiet: true
+
+    # ---------- Скрипты и health-check ----------
+    - name: Список проектов для бэкапа
+      ansible.builtin.command: jq -r '.[].name' /etc/restic/projects.json
+      register: backup_list
+      changed_when: false
+
+    - name: Бэкап знает все проекты сервера
+      ansible.builtin.assert:
+        that: backup_list.stdout_lines | sort == projects.keys() | sort
+        fail_msg: "projects.json: {{ backup_list.stdout_lines }}, в server.yml: {{ projects.keys() | list }}"
+        quiet: true
+
+    - name: project-compose работает для каждого проекта
+      ansible.builtin.command: project-compose {{ item }} ps
+      loop: "{{ projects.keys() | list }}"
+      changed_when: false
+
+    - name: health-check выполняется без ошибок
+      ansible.builtin.command: /usr/local/bin/health-check.sh
+      environment:
+        HC_URL: ""            # без уведомления: это проверка, а не ежечасный запуск
+      register: health
+      changed_when: false
+
+    - name: Что сейчас сообщает health-check
+      ansible.builtin.debug:
+        msg: "{{ health.stdout_lines if health.stdout else 'проблем нет' }}"
+
+    # ---------- Команда infra ----------
+    - name: infra status
+      ansible.builtin.command: /usr/local/sbin/infra status
+      register: status
+      changed_when: false
+
+    - name: infra status называет сервер и все проекты
+      vars:
+        shown: "{{ status.stdout_lines | select('match', '^  [a-z]') | map('split', ' — ') | map('first') | map('trim') | list }}"
+      ansible.builtin.assert:
+        that:
+          - status.stdout_lines[0] is match('== ' ~ inventory_hostname ~ ' · движок ')
+          - shown | sort == projects.keys() | sort
+        fail_msg: "{{ status.stdout_lines }}"
+        quiet: true

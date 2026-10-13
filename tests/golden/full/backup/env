@@ -1,0 +1,7 @@
+# Локальный репозиторий (уровень 1)
+RESTIC_REPOSITORY=/var/backups/restic
+RESTIC_PASSWORD=fixtureResticFull000000000000000000000000000000
+HC_URL=https://hc.fixture.test/backup
+# Кэш restic. У служб systemd нет $HOME, и без этой строки restic работает без кэша: каждый
+# запуск заново читает индекс хранилища, из S3 — по сети (частые снимки — до сотен раз в сутки)
+RESTIC_CACHE_DIR=/var/cache/restic

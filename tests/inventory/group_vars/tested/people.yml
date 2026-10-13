@@ -1,0 +1,25 @@
+# Вымышленные люди тестового инвентаря (people из server.yml). Ключи — не настоящие.
+people:
+  dina:                            # в docker_users на full; два ключа
+    key: |
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureDinaLaptopKey000000000000000000 dina@laptop
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureDinaDesktopKey00000000000000000 dina@desktop
+    ips: [192.0.2.21]
+  ivan:                            # подсеть в ips
+    key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureIvanKey0000000000000000000000 ivan@laptop"
+    ips: [198.51.100.30, 198.51.100.70/29]
+  olga:                            # подсеть IPv6
+    key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureOlgaKey0000000000000000000000 olga@laptop"
+    ips: [203.0.113.40, "2001:db8:40::/64"]
+  vera:                            # одиночный IPv6
+    key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureVeraKey0000000000000000000000 vera@laptop"
+    ips: ["2001:db8::77"]
+  gone:
+    key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureGoneKey0000000000000000000000 gone@laptop"
+    ips: [203.0.113.99]
+  kira:
+    key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureKiraKey0000000000000000000000 kira@laptop"
+    ips: [203.0.113.50]
+  pavel:                           # не участвует ни в одном проекте
+    key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixturePavelKey000000000000000000000 pavel@laptop"
+    ips: [203.0.113.60]
