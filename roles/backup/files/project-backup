@@ -45,6 +45,9 @@ PATHS=("/srv/projects/$NAME" "$DUMPS")
 # неудавшимся, пока том не переименуют: узнать об этом надо сейчас, а не при восстановлении.
 # Анонимные тома (без имени) метки не получают: они временные и в бэкап не входят.
 SKIPPED=()
+# Проект без root (rootless): тома — в его Docker, в /home/<проект>-run/.local/share/docker/volumes
+DOCKER_HOST=$(project-docker-host "$NAME")
+[ -n "$DOCKER_HOST" ] && export DOCKER_HOST || unset DOCKER_HOST
 for v in $(docker volume ls -q --filter "label=com.docker.compose.project=$NAME"); do
   case $v in
     "${NAME}"_*) ;;

@@ -1,0 +1,10 @@
+[Unit]
+Description=Маршруты Traefik к контейнерам проекта без root %i (labels → dynamic/rootless-%i.yml)
+
+[Service]
+ExecStart=/usr/local/sbin/project-traefik --watch %i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -21,7 +21,7 @@ DISK_CRITICAL=90    # с этого заполнения ночной бэкап
 MEM_LIMIT=10
 BACKUP_REPO=/var/backups/restic
 ACME=/srv/infra/traefik/acme/acme.json
-PROJECTS=" blog crm shop static "     # проекты сервера; пробелы по краям — для поиска " имя "
+PROJECTS=" blog crm lab shop static "     # проекты сервера; пробелы по краям — для поиска " имя "
 UPDATE_CMD="sudo infra update"
 EVENTS=/var/log/infra.log                      # журнал событий: итог ночного бэкапа
 HOURLY="shop crm"   # проекты с частыми снимками (backup_hourly)
@@ -114,6 +114,21 @@ check_ssh_open() {
     paste -sd ';' - | sed 's/;/; /g')
   if [ -n "$rules" ]; then
     problem "SSH открыт мимо белого списка, правила ufw: $rules. Убрать: sudo ufw delete allow <правило> (свои адреса — admin_ips и ips людей в server.yml)"
+  fi
+}
+
+# Проекты без root (rootless: true): Docker пользователя <проект>-run и маршруты Traefik к его
+# контейнерам (project-traefik@<проект>) работают. Упавший Docker пользователя в «упавших службах»
+# не виден — это служба его systemd, а не системного
+check_rootless() {
+  local p u down=""
+  for p in $(jq -r 'keys[]' /usr/local/etc/infra-rootless.json 2>/dev/null); do
+    u=$(jq -r --arg p "$p" '.[$p].user' /usr/local/etc/infra-rootless.json)
+    systemctl --user -M "$u@" is-active -q infra-docker 2>/dev/null || down+="$p (Docker), "
+    systemctl is-active -q "project-traefik@$p" || down+="$p (маршруты Traefik), "
+  done
+  if [ -n "$down" ]; then
+    problem "Проекты без root не работают: ${down%, }. sudo systemctl --user -M <проект>-run@ status infra-docker; sudo systemctl status project-traefik@<проект>"
   fi
 }
 
@@ -386,14 +401,20 @@ check_free_memory
 check_memory
 check_failed_units
 check_ssh_open
-check_restarting
-check_crashed
-check_open_ports
-check_compose_projects
-check_web_mounts
-check_project_volumes
-check_orphan_volumes
-check_certificates
+check_rootless
+# Контейнеры — в общем Docker и в Docker каждого проекта без root (rootless: true)
+for DOCKER_HOST in "" $(jq -r '.[].sock' /usr/local/etc/infra-rootless.json 2>/dev/null); do
+  if [ -n "$DOCKER_HOST" ]; then export DOCKER_HOST; else unset DOCKER_HOST; fi
+  check_restarting
+  check_crashed
+  check_open_ports
+  check_compose_projects
+  check_web_mounts
+  check_project_volumes
+  check_orphan_volumes
+  check_certificates
+done
+unset DOCKER_HOST
 check_autodeploy
 check_backup
 check_backup_hourly

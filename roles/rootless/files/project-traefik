@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# Управляется Ansible (роль rootless). Маршруты Traefik к контейнерам проекта без root.
+# Traefik читает labels только у общего Docker сервера, а контейнеры проекта без root — в Docker
+# его пользователя <проект>-run. Поэтому labels Traefik работающих контейнеров проекта переводятся
+# в файл /srv/infra/traefik/dynamic/rootless-<проект>.yml (Traefik подхватывает его сам), а сервис
+# ведёт на порт контейнера на 127.0.0.1 — его открывает project-compose.
+#   project-traefik <проект>           — записать маршруты сейчас
+#   project-traefik --watch <проект>   — и после каждого запуска, остановки, смены здоровья контейнера
+#                                        (служба project-traefik@<проект>)
+# Как у Traefik с labels: контейнер с проверкой здоровья получает запросы, только когда здоров.
+# Поддерживаются http-маршруты (routers, services, middlewares); tcp и udp — нет.
+import json
+import os
+import subprocess
+import sys
+import time
+
+DYNAMIC = "/srv/infra/traefik/dynamic"
+LIST = "/usr/local/etc/infra-rootless.json"
+
+# Ключи-списки в labels (через запятую), остальное — строки, числа и true/false
+LISTS = {"entrypoints", "middlewares", "sourcerange", "prefixes", "users", "excludedips", "status",
+         "accesscontrolallowheaders", "accesscontrolallowmethods", "accesscontrolalloworiginlist",
+         "accesscontrolalloworiginlistregex", "accesscontrolexposeheaders", "allowedhosts",
+         "hostsproxyheaders", "excludedcontenttypes", "includedcontenttypes"}
+# Внутри этих ключей — имена и значения заголовков как есть
+RAW = {"customrequestheaders", "customresponseheaders", "sslproxyheaders"}
+
+
+def value(path, text):
+    """Значение label по типу ключа: список, true/false, число или строка."""
+    if any(p in RAW for p in path[:-1]):
+        return text
+    key = path[-1]
+    if key in LISTS or (key == "regex" and len(path) > 1 and path[-2] == "stripprefixregex"):
+        return [v.strip() for v in text.split(",") if v.strip()]
+    if text in ("true", "false"):
+        return text == "true"
+    if text.isdigit() and key != "rule":
+        return int(text)
+    return text
+
+
+def put(tree, path, val):
+    for p in path[:-1]:
+        tree = tree.setdefault(p, {})
+    tree[path[-1]] = val
+
+
+def healthy(c):
+    health = (c.get("State") or {}).get("Health")
+    return health is None or health.get("Status") == "healthy"
+
+
+def build(containers):
+    """Маршруты из labels: {"http": {"routers": ..., "services": ..., "middlewares": ...}}."""
+    http = {}
+    for c in containers:
+        labels = (c.get("Config") or {}).get("Labels") or {}
+        if labels.get("traefik.enable") != "true" or not (c.get("State") or {}).get("Running") or not healthy(c):
+            continue
+        ports = (c.get("NetworkSettings") or {}).get("Ports") or {}
+        own, routers = [], set()                    # сервисы и маршруты этого контейнера
+        for key, text in sorted(labels.items()):
+            parts = key.lower().split(".")
+            if parts[:2] != ["traefik", "http"] or len(parts) < 5:
+                continue
+            kind, name, rest = parts[2], key.split(".")[3], parts[4:]
+            if kind not in ("routers", "services", "middlewares"):
+                continue
+            if kind == "services" and rest == ["loadbalancer", "server", "port"]:
+                bound = [b for b in ports.get(f"{text}/tcp") or [] if b.get("HostIp") == "127.0.0.1"]
+                if not bound:
+                    print(f"project-traefik: {c['Name'].lstrip('/')}: порт {text} не открыт на 127.0.0.1 — "
+                          "запускайте через project-compose", file=sys.stderr)
+                    continue
+                put(http, ["services", name, "loadbalancer", "servers"],
+                    [{"url": f"http://127.0.0.1:{bound[0]['HostPort']}"}])
+                own.append(name)
+                continue
+            put(http, [kind, name] + rest, value([kind, name] + rest, text))
+            if kind == "routers":
+                routers.add(name)
+        # Маршрут без service — к единственному сервису контейнера, как у Traefik с labels
+        for name in routers:
+            router = http["routers"][name]
+            if "service" not in router and len(own) == 1:
+                router["service"] = own[0]
+    # Сервисы без адреса (порт не открыт) Traefik не примет — их и маршруты к ним не пишем
+    services = http.get("services") or {}
+    for name in [n for n, s in services.items() if "servers" not in (s.get("loadbalancer") or {})]:
+        del services[name]
+    routers = http.get("routers") or {}
+    for name in [n for n, r in routers.items() if r.get("service") not in services]:
+        del routers[name]
+    return {"http": http} if routers else None
+
+
+def docker(sock, *args):
+    return subprocess.run(["docker", "--host", sock, *args], check=True, capture_output=True, text=True).stdout
+
+
+def sync(project, sock):
+    ids = docker(sock, "ps", "-q", "--filter", f"label=com.docker.compose.project={project}").split()
+    containers = json.loads(docker(sock, "inspect", *ids)) if ids else []
+    conf = build(containers)
+    path = os.path.join(DYNAMIC, f"rootless-{project}.yml")
+    text = json.dumps(conf, indent=2, ensure_ascii=False, sort_keys=True) + "\n" if conf else None
+    try:
+        with open(path) as f:
+            old = f.read()
+    except FileNotFoundError:
+        old = None
+    if text == old:
+        return
+    if text is None:
+        os.remove(path)
+    else:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    print(f"project-traefik: маршруты {project}: {', '.join(sorted(conf['http']['routers'])) if conf else 'нет'}")
+
+
+def main(argv):
+    watch = "--watch" in argv
+    names = [a for a in argv if a != "--watch"]
+    if len(names) != 1:
+        print("Использование: project-traefik [--watch] <проект>", file=sys.stderr)
+        return 2
+    project = names[0]
+    with open(LIST) as f:
+        sock = (json.load(f).get(project) or {}).get("sock")
+    if not sock:
+        print(f"project-traefik: {project} — не проект без root ({LIST})", file=sys.stderr)
+        return 1
+    sync(project, sock)
+    if not watch:
+        return 0
+    events = subprocess.Popen(["docker", "--host", sock, "events", "--filter", "type=container",
+                               "--filter", f"label=com.docker.compose.project={project}",
+                               "--format", "{{.Action}}"], stdout=subprocess.PIPE, text=True)
+    for _ in events.stdout:
+        time.sleep(0.5)                             # пачка событий одного up — один пересчёт
+        sync(project, sock)
+    return events.wait() or 1                       # Docker перезапустился — служба перезапустит нас
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

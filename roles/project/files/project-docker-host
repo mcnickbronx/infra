@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Управляется Ansible.
+# Docker проекта. У проекта без root (rootless: true в server.yml) — свой Docker его пользователя
+# <проект>-run; у остальных — общий Docker сервера (тогда пусто). Для скриптов:
+#   DOCKER_HOST=$(project-docker-host shop)     # пусто — общий Docker
+#   project-docker-host shop user               # <проект>-run; uid, ports (первый порт для Traefik),
+#                                               # db_host (адрес Postgres для его контейнеров)
+# Список — /usr/local/etc/infra-rootless.json (пишет роль rootless).
+set -euo pipefail
+NAME=${1:?Использование: project-docker-host <проект> [sock|user|uid|ports|db_host]}
+FIELD=${2:-sock}
+LIST=/usr/local/etc/infra-rootless.json
+[ -f "$LIST" ] || exit 0
+jq -r --arg n "$NAME" --arg f "$FIELD" '.[$n][$f] // empty' "$LIST"

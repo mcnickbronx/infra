@@ -1,0 +1,6 @@
+# Управляется Ansible (роль rootless). Лимиты проекта {{ item.key }} (без root) — на всего его
+# пользователя {{ item.value.user }}: Docker и контейнеры. Сам Docker без root занимает ~200 МБ из них.
+[Slice]
+MemoryMax={{ (projects[item.key].memory | default(project_default_memory)) | upper }}
+CPUQuota={{ ((projects[item.key].cpus | default(project_default_cpus)) | float * 100) | round | int }}%
+TasksMax=4096

@@ -31,6 +31,9 @@ trap : INT                            # Ctrl+C получает команда, 
 
 log() { "$ENGINE/roles/base/files/infra-log" "$@"; }
 
+# docker для проекта: у проекта без root (rootless: true) — его собственный Docker
+pdocker() { local h; h=$(project-docker-host "$1"); shift; env ${h:+DOCKER_HOST="$h"} docker "$@"; }
+
 # ---------- Окна ----------
 # box <строк кроме текста> "текст" — размер окна W×H: ширина по терминалу (до 80), высота —
 # строки текста с переносами (\n — новая строка, как у whiptail) и остальное, не больше экрана
@@ -149,8 +152,10 @@ projects() {
     return
   fi
   while :; do
-    CONTAINERS=$(docker ps -a --format \
-      '{{.Label "com.docker.compose.project"}}|{{.State}}|{{.Label "com.docker.compose.oneoff"}}' 2>/dev/null)
+    CONTAINERS=$(for h in "" $(jq -r '.[].sock' /usr/local/etc/infra-rootless.json 2>/dev/null); do
+      env ${h:+DOCKER_HOST="$h"} docker ps -a --format \
+        '{{.Label "com.docker.compose.project"}}|{{.State}}|{{.Label "com.docker.compose.oneoff"}}' 2>/dev/null
+    done)
     items=()
     for p in $(jq -r '.[].name' "$PROJECTS"); do items+=("$p" "$(project_line "$p")"); done
     BACK=Назад
@@ -234,7 +239,7 @@ containers() {
 # куда смотрит DNS
 sites() {
   local p=$1 hosts h code cert dns mine
-  hosts=$(docker ps --filter "label=com.docker.compose.project=$p" --format '{{.Labels}}' |
+  hosts=$(pdocker "$p" ps --filter "label=com.docker.compose.project=$p" --format '{{.Labels}}' |
     grep -o 'Host(`[^`]*`)' | sed 's/^Host(`//; s/`)$//' | sort -u)
   if [ -z "$hosts" ]; then
     echo "У $p нет запущенных контейнеров с доменами (правило Host у Traefik)"
@@ -264,7 +269,7 @@ sites() {
 # Командная строка в запущенном сервисе проекта: сервис один — сразу в него
 shell() {
   local p=$1 services
-  mapfile -t services < <(docker ps --filter "label=com.docker.compose.project=$p" \
+  mapfile -t services < <(pdocker "$p" ps --filter "label=com.docker.compose.project=$p" \
     --filter label=com.docker.compose.oneoff=False --format '{{.Label "com.docker.compose.service"}}' | sort -u)
   case ${#services[@]} in
     0) say "У $p нет запущенных контейнеров."; return ;;

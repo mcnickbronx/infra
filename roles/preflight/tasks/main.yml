@@ -99,7 +99,7 @@
 # Все ключи с пояснениями — server.yml.example
 - name: У проектов только известные ключи
   vars:
-    known: [net, domains, db, db_conn_limit, db_statement_timeout, memory, cpus, autodeploy, backup_hourly, backup_every, devs]
+    known: [net, domains, db, db_conn_limit, db_statement_timeout, memory, cpus, autodeploy, backup_hourly, backup_every, devs, rootless]
   ansible.builtin.assert:
     that: item.value.keys() | difference(known) | length == 0
     fail_msg: >-
@@ -175,22 +175,24 @@
   loop_control:
     label: "{{ item.key }}"
 
-- name: "autodeploy у проекта — true или false; при автовыкладке — токен реестра в secrets.yml"
+- name: "autodeploy и rootless у проекта — true или false; при автовыкладке — токен реестра в secrets.yml"
   ansible.builtin.assert:
     that:
       - projects.values() | selectattr('autodeploy', 'defined') | rejectattr('autodeploy', 'boolean') | list | length == 0
+      - projects.values() | selectattr('rootless', 'defined') | rejectattr('rootless', 'boolean') | list | length == 0
       - autodeploy_projects | length == 0 or (ghcr_user != '' and ghcr_token != '')
     fail_msg: >-
-      autodeploy — true или false, без кавычек; при autodeploy: true в {{ infra_dir }}/secrets.yml нужны
+      autodeploy и rootless — true или false, без кавычек; при autodeploy: true в {{ infra_dir }}/secrets.yml нужны
       ghcr_user и ghcr_token (токен GitHub classic с правом read:packages)
     quiet: true
 
 # Автовыкладка без проверки запускает от root compose.yml из образа, а образ выбирает .env проекта:
 # участник проекта (пишет в web/) фактически root на сервере, как docker_users. Пусть это будет
-# видно в описании (DECISIONS.md, «Автовыкладка»)
+# видно в описании (DECISIONS.md, «Автовыкладка»). У проекта без root (rootless) compose запускает
+# его пользователь <проект>-run — там участникам Docker не нужен
 - name: Участники проектов с автовыкладкой — в docker_users
   vars:
-    not_docker: "{{ projects | dict2items | selectattr('key', 'in', autodeploy_projects)
+    not_docker: "{{ projects | dict2items | selectattr('key', 'in', autodeploy_projects | difference(rootless_projects))
                     | map(attribute='value.devs', default=[]) | flatten | unique | difference(docker_users) }}"
   ansible.builtin.assert:
     that: not_docker | length == 0
@@ -207,10 +209,12 @@
       - host_people | difference(people.keys()) | length == 0
       - admin_user not in people
       - people.keys() | reject('match', '^[a-z][a-z0-9_-]{0,31}$') | list | length == 0
+      - people.keys() | select('match', '.*-(run|dev)$') | list | length == 0
     fail_msg: >-
       Нет в people: {{ host_people | difference(people.keys()) }};
       {{ admin_user }} не должен быть в people (иначе его можно случайно удалить);
-      имена — строчные латинские буквы, цифры, _ и -
+      имена — строчные латинские буквы, цифры, _ и -, не на -run и -dev (так называются
+      пользователь и группа проекта)
     quiet: true
 
 # В Postgres локальный вход (peer) пускает пользователя Linux в роль с тем же именем:

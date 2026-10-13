@@ -7,6 +7,12 @@
 #   sudo project-compose shop ps
 # Нет compose-файла — ничего не делает и пишет «нет compose-файла» (код 0):
 # проект может быть просто файлами.
+#
+# Проект без root (rootless: true в server.yml): compose запускает его пользователь <проект>-run
+# со своим Docker — от кого бы ни пришёл вызов, root на сервере его compose.yml не получит.
+# Участники такого проекта запускают его сами, без sudo: project-compose shop up -d.
+# Сервисам с labels Traefik (loadbalancer.server.port) добавляются порты на 127.0.0.1 — через них
+# Traefik ходит к контейнерам (маршруты из labels пишет служба project-traefik@<проект>).
 set -euo pipefail
 NAME=${1:?Использование: project-compose <проект> <команда docker compose...>}
 shift
@@ -23,4 +29,47 @@ done
 
 args=()
 [ -f .env ] && args+=(--env-file .env)
-exec docker compose "${args[@]}" "$@"
+
+HOST=$(project-docker-host "$NAME")
+[ -n "$HOST" ] || exec docker compose "${args[@]}" "$@"
+
+# ---------- Проект без root ----------
+RUN=$(project-docker-host "$NAME" user)
+RUN_UID=$(project-docker-host "$NAME" uid)
+PORTS=$(project-docker-host "$NAME" ports)
+if [ "$(id -u)" = 0 ]; then as=(runuser -u "$RUN" --); else as=(sudo -n -u "$RUN" --); fi
+as+=(env HOME="/home/$RUN" XDG_RUNTIME_DIR="/run/user/$RUN_UID" DOCKER_HOST="$HOST")
+
+# Файлы compose — как их нашёл бы сам compose (основной и override), плюс порты для Traefik
+files=$f
+for o in compose.override.yaml compose.override.yml docker-compose.override.yaml docker-compose.override.yml; do
+  [ -f "$o" ] && { files+=":$o"; break; }
+done
+
+# Параметры compose до команды (--profile full up) — и для чтения настроек ниже
+global=()
+while [ $# -gt 0 ] && [[ $1 == -* ]]; do
+  global+=("$1")
+  case $1 in
+    --profile|--env-file|-f|--file|-p|--project-name|--project-directory|--ansi|--progress|--parallel)
+      [ $# -gt 1 ] && { global+=("$2"); shift; } ;;
+  esac
+  shift
+done
+
+# Порт на 127.0.0.1 каждому порту из labels Traefik: PORTS, PORTS+1… (до 20 на проект). Файл пишет
+# сам <проект>-run в своей папке: root не пишет туда, куда пишут участники
+ports_file="/home/$RUN/.infra-ports.json"
+if config=$("${as[@]}" COMPOSE_FILE="$files" docker compose "${args[@]}" "${global[@]}" config --format json 2>/dev/null); then
+  jq --argjson base "$PORTS" '
+    [ .services | to_entries[] | select(.value.labels["traefik.enable"] == "true") | .key as $s
+      | .value.labels | to_entries[]
+      | select(.key | test("^traefik\\.http\\.services\\.[^.]+\\.loadbalancer\\.server\\.port$"))
+      | {s: $s, p: .value} ] | unique | sort_by(.s, .p) | to_entries
+    | if length > 20 then error("больше 20 портов для Traefik") else . end
+    | reduce .[] as $e ({services: {}};
+        .services[$e.value.s].ports += ["127.0.0.1:\($base + $e.key):\($e.value.p)"])' <<<"$config" |
+    "${as[@]}" tee "$ports_file" >/dev/null
+  files+=":$ports_file"
+fi
+exec "${as[@]}" COMPOSE_FILE="$files" docker compose "${args[@]}" "${global[@]}" "$@"

@@ -1,0 +1,3 @@
+expect_error: "autodeploy и rootless — true или false"
+projects:
+  shop: {net: 5, rootless: "yes", devs: [ivan]}

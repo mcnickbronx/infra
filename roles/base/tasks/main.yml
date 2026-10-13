@@ -122,13 +122,32 @@
     mode: "0644"
   notify: Restart logrotate timer
 
+# Пользователи проектов без root (<проект>-run, rootless: true у проекта) видят все процессы:
+# их Docker без root узнаёт свой systemd через /proc (runc — busctl, podman — /proc/1). Скрой их —
+# лимиты не ставятся и контейнеры не запускаются («Interactive authentication required»)
+- name: Группа пользователей проектов без root
+  ansible.builtin.group:
+    name: rootless
+    system: true
+  when: rootless_projects | length > 0
+
+- name: Номер группы rootless
+  ansible.builtin.getent:
+    database: group
+    key: rootless
+    fail_key: false             # --check на сервере, где её ещё нет
+  check_mode: false
+  when: rootless_projects | length > 0
+
 # Участники проектов не видят чужие процессы (ps, top, /proc/<pid>) — и аргументы их команд
 - name: Процессы других пользователей скрыты (hidepid=2)
+  vars:
+    rootless_gid: "{{ ((getent_group | default({})).rootless | default(['', ''], true))[1] if rootless_projects else '' }}"
   ansible.posix.mount:
     path: /proc
     src: proc
     fstype: proc
-    opts: defaults,hidepid=2
+    opts: "defaults,hidepid=2{{ ',gid=' ~ rootless_gid if rootless_gid else '' }}"
     state: mounted
 
 # Сами — только обновления безопасности Ubuntu (так настроен unattended-upgrades в Ubuntu),

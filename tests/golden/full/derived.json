@@ -1,12 +1,14 @@
 {
     "access_host": "access.fixture.test",
     "autodeploy_projects": [
-        "shop"
+        "shop",
+        "lab"
     ],
     "backup_hourly_step": 5,
     "db_projects": [
         "shop",
-        "crm"
+        "crm",
+        "lab"
     ],
     "host_people": [
         "dina",
@@ -36,7 +38,8 @@
         ],
         "kira": [
             "devs",
-            "static-dev"
+            "static-dev",
+            "lab-dev"
         ],
         "olga": [
             "devs",
@@ -50,6 +53,9 @@
     },
     "postgres_memory_share": 0.4,
     "project_default_cpus": 2.0,
+    "rootless_projects": [
+        "lab"
+    ],
     "ssh_allowed_ips": [
         "192.0.2.10",
         "198.51.100.0/29",

@@ -107,13 +107,14 @@
 # compose создаёт сам, берутся из 172.24.0.0/13 (daemon.json) и с этими не пересекаются.
 # Подсеть меняется только пересозданием сети; с работающими контейнерами модуль
 # откажется — поэтому net проекта после запуска не меняют.
+# У проекта без root (rootless) сеть — в его собственном Docker (роль rootless)
 - name: Сети проектов (proj-<имя>)
   community.docker.docker_network:
     name: "proj-{{ item.key }}"
     ipam_config:
       - subnet: "172.20.{{ item.value.net }}.0/24"
         gateway: "172.20.{{ item.value.net }}.1"
-  loop: "{{ projects | dict2items }}"
+  loop: "{{ projects | dict2items | rejectattr('key', 'in', rootless_projects) }}"
   loop_control:
     label: "proj-{{ item.key }}"
 

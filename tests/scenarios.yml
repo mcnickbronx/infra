@@ -38,6 +38,10 @@
 #      до замены; база заменена целиком (таблица только dev исчезла), владелец — роль dev; расширение
 #      прода (pg_trgm) и индекс на нём — в dev; --files с группой dev; откат снимком — точно как было
 #      (project-restore очищает базу); project-db-dump.
+#  10. Проект без root (если в server.yml есть rootless: true): участник запускает его сам, без
+#      docker_users; маршрут Traefik из labels, база с адреса infra0, лимит на пользователя; privileged
+#      с корнем диска и env_file: /etc/shadow root не дают; том в бэкапе; health-check видит упавший Docker;
+#      автовыкладка (реестр на infra0): выкладка, отказ подготовки, маршрут Traefik переезжает, откат.
 - name: Сценарии на тестовом сервере
   hosts: all
   become: true
@@ -945,3 +949,220 @@
           - r.dump == '0:1'
         fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
         quiet: true
+
+    # ================= 10. Проект без root (rootless) =================
+    # Проект с rootless: true (на тестовом сервере — lab): свой пользователь <проект>-run и свой Docker
+    # без root. Участник tester (не в docker_users) запускает проект сам; compose.yml, который написал
+    # участник, root не даёт — ни запуском от администратора, ни privileged с корнем диска, ни env_file
+    # с чужим файлом. Маршрут Traefik — из labels, база — с адреса infra0, том — в бэкапе.
+    - name: "10. Проект без root: участник запускает сам, маршрут, база, лимиты, root не получить, бэкап тома"
+      vars:
+        p: "{{ rootless_projects | first }}"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        p={{ p }} w=/srv/projects/{{ p }}/web host=rl-verify.invalid
+        as_tester() { runuser -u tester -- bash -c "cd $w && $1"; }
+        restic_p() { (set -a; . /etc/restic/env; set +a; restic "$@"); }
+        rm -rf $w/compose.yml $w/compose.override.yml $w/files $w/.env
+        # .env и compose.yml — от участника, доступ к базе в .env — от администратора (project-db-env)
+        as_tester "touch .env && chmod 660 .env && mkdir files && chmod 2770 files"
+        project-db-env $p >/dev/null
+        cat > /tmp/verify-rl.yml <<'Y'
+        name: {{ p }}
+        services:
+          app:
+            extends: { file: /srv/infra/compose/base.yml, service: hardened-strict }
+            image: python:3.12-alpine
+            user: "1000:1000"
+            working_dir: /data
+            command: sh -c 'echo app > /data/w.txt; exec python -m http.server 8000'
+            healthcheck: {test: [CMD, python, -c, "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/')"], interval: 2s, retries: 30}
+            volumes: [./files:/data, data:/vol]
+            labels:
+              - traefik.enable=true
+              - traefik.http.services.{{ p }}-app.loadbalancer.server.port=8000
+              - traefik.http.routers.{{ p }}-app.rule=Host(`rl-verify.invalid`)
+              - traefik.http.routers.{{ p }}-app.entrypoints=websecure
+          psql:
+            extends: { file: /srv/infra/compose/base.yml, service: hardened-strict }
+            image: postgres:17-alpine
+            profiles: [test]
+            env_file: [.env]
+            environment: {PGPASSWORD: "${DB_PASSWORD}"}
+            command: psql -h "${DB_HOST}" -U {{ p }} -d {{ p }} -tAc 'select current_user'
+          evil:
+            image: alpine
+            profiles: [evil]
+            privileged: true
+            volumes: [/:/host]
+            command:
+              - sh
+              - -c
+              - >-
+                cat /host/etc/shadow >/dev/null 2>&1 && echo SHADOW || echo noshadow;
+                touch /host/etc/verify-rootless 2>/dev/null;
+                ls /host/root >/dev/null 2>&1 && echo ROOTHOME || echo noroothome
+        volumes:
+          data:
+        networks:
+          default:
+            name: proj-{{ p }}
+            external: true
+        Y
+        install -o tester -g $p-dev -m 664 /tmp/verify-rl.yml $w/compose.yml
+        # участник — сам, без sudo и без docker_users
+        as_tester "project-compose $p up -d --wait --quiet-pull" >/dev/null 2>&1; echo "up=$?"
+        echo "tester_docker=$(runuser -u tester -- docker ps 2>&1 | grep -c 'permission denied')"
+        pid=$(DOCKER_HOST=$(project-docker-host $p) docker inspect -f '{{ '{{' }}.State.Pid{{ '}}' }}' "$(project-compose $p ps -q app)")
+        sub=$(awk -F: -v u=$p-run '$1 == u {print $2}' /etc/subuid)
+        echo "proc_uid=$([ "$(ps -o uid= -p "$pid" | tr -d ' ')" = "$((sub + 999))" ] && echo subuid || ps -o uid= -p "$pid")"
+        echo "file=$(cat $w/files/w.txt 2>&1):$(runuser -u tester -- cat $w/files/w.txt 2>&1)"
+        # маршрут Traefik — из labels (служба project-traefik@<проект>)
+        for i in $(seq 1 30); do [ -f /srv/infra/traefik/dynamic/rootless-$p.yml ] && break; sleep 1; done
+        for i in $(seq 1 15); do
+          code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve $host:443:127.0.0.1 https://$host/w.txt)
+          [ "$code" = 200 ] && break; sleep 1
+        done
+        echo "route=$code"
+        echo "db=$(project-compose $p --profile test run --rm -T psql 2>/dev/null | tail -1)"
+        echo "limit=$(systemctl show "user-$(id -u $p-run).slice" -p MemoryMax --value)"
+        # privileged и корень диска — запуск администратором: root в контейнере — это <проект>-run
+        echo "evil=$(project-compose $p --profile evil run --rm -T evil 2>&1 | grep -E 'shadow|roothome' | tr '\n' ' ')"
+        echo "etc=$([ -e /etc/verify-rootless ] && echo WRITTEN || echo clean)"
+        # env_file с чужим файлом: compose читает файлы от имени <проект>-run, а не root
+        printf 'services:\n  app:\n    env_file: [/etc/shadow]\n' > /tmp/verify-rl-shadow.yml
+        install -o tester -g $p-dev -m 664 /tmp/verify-rl-shadow.yml $w/compose.override.yml
+        echo "shadow=$(project-compose $p config 2>&1 | grep -c 'permission denied')"
+        rm -f $w/compose.override.yml
+        echo "tester_root=$(runuser -u tester -- sudo -n true 2>&1 | grep -c 'password is required\|not allowed\|may not run')"
+        # том проекта — в бэкапе, восстанавливается
+        project-compose $p exec -T -u 0 app sh -c 'echo v1 > /vol/m'   # том — root контейнера (на сервере <проект>-run)
+        project-backup $p >/dev/null 2>&1; echo "backup=$?"
+        snap=$(restic_p snapshots --tag "project:$p" --json | jq -r 'sort_by(.time) | last | .short_id')
+        project-compose $p exec -T -u 0 app sh -c 'echo v2 > /vol/m'
+        project-compose $p down >/dev/null 2>&1
+        project-restore $p /etc/restic/env "$snap" >/dev/null 2>&1; echo "restore=$?"
+        project-compose $p up -d --wait >/dev/null 2>&1
+        echo "vol=$(project-compose $p exec -T app cat /vol/m)"
+        # Docker проекта остановлен — health-check сообщает
+        systemctl --user -M $p-run@ stop infra-docker
+        echo "hc_down=$(/usr/local/bin/health-check.sh | grep -c "Проекты без root не работают: $p (Docker)")"
+        systemctl --user -M $p-run@ start infra-docker
+        echo "infra_status=$(infra status | grep -c "^  $p — контейнеры")"
+        # уборка: маршрут уходит вместе с контейнерами
+        project-compose $p down -v >/dev/null 2>&1
+        for i in $(seq 1 15); do [ -f /srv/infra/traefik/dynamic/rootless-$p.yml ] || break; sleep 1; done
+        echo "route_gone=$([ -f /srv/infra/traefik/dynamic/rootless-$p.yml ] && echo left || echo gone)"
+        rm -rf $w/compose.yml $w/files $w/.env /tmp/verify-rl.yml /tmp/verify-rl-shadow.yml /etc/verify-rootless
+      args:
+        executable: /bin/bash
+      register: rootless
+      changed_when: true
+      when: rootless_projects | length > 0
+
+    - name: "10. Проект без root работает, а root через него не получить"
+      vars:
+        r: "{{ dict(rootless.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.up == '0'                       # участник запустил сам
+          - r.tester_docker == '1'            # а общий Docker ему закрыт
+          - r.proc_uid == 'subuid'            # процесс контейнера — subuid пользователя проекта
+          - r.file == 'app:app'               # приложение пишет в папку, участник её читает
+          - r.route == '200'                  # маршрут Traefik из labels
+          - r.db == (rootless_projects | first)   # база — с адреса infra0, паролем проекта
+          - r.limit == '536870912'            # memory: 512m — на всего пользователя
+          - "'noshadow' in r.evil and 'noroothome' in r.evil and 'SHADOW' not in r.evil"
+          - r.etc == 'clean'
+          - r.shadow == '1'                   # env_file: /etc/shadow — отказ
+          - r.tester_root == '1'
+          - r.backup == '0' and r.restore == '0' and r.vol == 'v1'
+          - r.hc_down == '1'
+          - r.infra_status == '1'
+          - r.route_gone == 'gone'
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
+        quiet: true
+      when: rootless_projects | length > 0
+
+    # Автовыкладка в проект без root. Реестр — на адресе infra0 (из Docker без root хост виден только
+    # по нему), на время сценария без TLS (insecure-registries в настройках Docker без root). Образы
+    # собирает Docker проекта; v1 и v3 — хорошие, у v2 падает подготовка. Сайт проверяется через
+    # Traefik: маршрут переезжает на новую версию сам. Процессы выложенной версии — <проект>-run
+    - name: "10. Автовыкладка в проект без root: выкладка, отказ, маршрут Traefik, откат"
+      vars:
+        p: "{{ rootless_projects | first }}"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        p={{ p }} w=/srv/projects/{{ p }}/web reg={{ rootless_db_ip }}:5001 host=rl-deploy.invalid
+        cfg=/etc/infra-rootless/daemon.json
+        DOCKER_HOST=$(project-docker-host $p); export DOCKER_HOST
+        cp -p $cfg /tmp/verify-rl-daemon.json
+        jq --arg r "$reg" '. + {"insecure-registries": [$r]}' /tmp/verify-rl-daemon.json > $cfg
+        systemctl --user -M $p-run@ restart infra-docker
+        for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+        env -u DOCKER_HOST docker run -d --name verify-rl-registry -p $reg:5000 registry:2 >/dev/null
+        b=$(mktemp -d)
+        for v in v1 v2 v3; do
+          if [ $v = v2 ]; then step='exit 1'; else step="echo $v > /data/deployed"; fi
+          cat > "$b/compose.yml" <<COMPOSE
+        name: $p
+        services:
+          web:
+            extends: { file: /srv/infra/compose/base.yml, service: hardened }
+            image: \${DEPLOY_IMAGE}
+            command: httpd -f -p 8080 -h /www
+            healthcheck: { test: [CMD, wget, -q, -O-, "http://127.0.0.1:8080/"], interval: 2s, retries: 15 }
+            labels:
+              - traefik.enable=true
+              - traefik.http.services.$p-web.loadbalancer.server.port=8080
+              - traefik.http.routers.$p-web.rule=Host(\`$host\`)
+              - traefik.http.routers.$p-web.entrypoints=websecure
+          deploy:
+            extends: { file: /srv/infra/compose/base.yml, service: hardened }
+            image: \${DEPLOY_IMAGE}
+            profiles: [deploy]
+            command: sh -c '$step'
+            volumes: [./data:/data]
+        networks:
+          default: { name: proj-$p, external: true }
+        COMPOSE
+          printf 'FROM busybox\nRUN mkdir /www && echo %s > /www/index.html\nCOPY compose.yml /deploy/compose.yml\n' $v > "$b/Dockerfile"
+          docker build -q -t $reg/verify-rl:$v "$b" >/dev/null && docker push -q $reg/verify-rl:$v >/dev/null
+        done
+        rm -rf "$b"
+        echo "DEPLOY_IMAGE=$reg/verify-rl:test" > $w/.env
+        put() { docker tag $reg/verify-rl:$1 $reg/verify-rl:test && docker push -q $reg/verify-rl:test >/dev/null; }
+        page() { curl -sk --resolve $host:443:127.0.0.1 https://$host/; }
+        wait_page() { for i in $(seq 1 20); do [ "$(page)" = "$1" ] && break; sleep 1; done; page; }
+        put v1; project-deploy $p >/dev/null 2>&1; echo "v1=$?:$(wait_page v1):$(cat $w/data/deployed 2>&1)"
+        put v2; project-deploy $p >/dev/null 2>&1; echo "v2=$?:$(wait_page v1):$(cut -d' ' -f3- /var/lib/project-deploy/$p.failed)"
+        put v3; project-deploy $p >/dev/null 2>&1; echo "v3=$?:$(wait_page v3):$(cat $w/data/deployed)"
+        pid=$(docker inspect -f '{{ '{{' }}.State.Pid{{ '}}' }}' "$(project-compose $p ps -q web)")
+        echo "deploy_user=$(ps -o user= -p "$pid")"
+        project-deploy $p rollback >/dev/null 2>&1; echo "rollback=$?:$(wait_page v1)"
+        # уборка: проект, реестр, образы, настройки Docker без root — как были
+        project-compose $p down -v >/dev/null 2>&1
+        env -u DOCKER_HOST docker rm -f verify-rl-registry >/dev/null 2>&1
+        docker images -q "$reg/verify-rl" | sort -u | xargs -r docker rmi -f >/dev/null 2>&1
+        cp -p /tmp/verify-rl-daemon.json $cfg && rm -f /tmp/verify-rl-daemon.json
+        systemctl --user -M $p-run@ restart infra-docker
+        rm -rf $w/data $w/compose.yml $w/compose.yml.prev $w/.env /var/lib/project-deploy/$p.*
+      args:
+        executable: /bin/bash
+      register: rootless_deploy
+      changed_when: true
+      when: rootless_projects | length > 0
+
+    - name: "10. Автовыкладка без root: выложено, отказ вернул прежнюю, маршрут переехал, откат"
+      vars:
+        r: "{{ dict(rootless_deploy.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.v1 == '0:v1:v1'
+          - "r.v2 == '1:v1:подготовка (сервис deploy): работает прежняя версия'"
+          - r.v3 == '0:v3:v3'
+          - r.deploy_user == (rootless_projects | first) ~ '-run'   # root в контейнере — пользователь проекта
+          - r.rollback == '0:v1'
+        fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
+        quiet: true
+      when: rootless_projects | length > 0

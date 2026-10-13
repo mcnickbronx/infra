@@ -52,6 +52,9 @@
       tags: [users]
     - role: project       # папки проектов, лимиты, автовыкладка
       tags: [project]
+    - role: rootless      # проекты без root: свой пользователь и свой Docker (rootless: true)
+      tags: [rootless, project]
+      when: rootless_projects | length > 0
     - role: backup        # ночные бэкапы restic
       tags: [backup]
     - role: monitoring    # health-check каждый час: диск, память, упавшие службы и контейнеры...

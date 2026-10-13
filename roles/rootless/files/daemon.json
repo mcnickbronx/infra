@@ -1,0 +1,6 @@
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "5" },
+  "no-new-privileges": true,
+  "ip": "127.0.0.1"
+}

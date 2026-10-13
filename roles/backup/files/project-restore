@@ -75,6 +75,8 @@ for p in "${PATHS[@]}"; do
     ""|*/../*|*/..) echo "В снимке некорректный путь '$p' — восстановление остановлено" >&2; exit 1 ;;
     "/srv/projects/$NAME"|"/var/backups/db/$NAME") ;;
     /var/lib/docker/volumes/"${NAME}"_*|/var/lib/docker/*/volumes/"${NAME}"_*) ;;
+    # проект без root (rootless): тома в Docker его пользователя
+    /home/"${NAME}"-run/.local/share/docker/volumes/"${NAME}"_*) ;;
     *) echo "В снимке неожиданный путь $p — восстановление остановлено" >&2; exit 1 ;;
   esac
 done
@@ -110,6 +112,12 @@ for p in "${PATHS[@]}"; do
   fi
   echo "  $p"
   mkdir -p "$p"
+  # Домашнюю папку <проект>-run меняют участники проекта: том там не должен оказаться ссылкой —
+  # rsync --delete пошёл бы по ней (окно между проверкой и rsync остаётся: проба, README)
+  if [[ $p == /home/* ]] && [ "$(realpath -e "$p")" != "$p" ]; then
+    echo "  $p — ссылка или путь через ссылку: пропуск" >&2
+    continue
+  fi
   # -A -X: ACL и xattr (web/ открыт группе проекта и контейнерам через ACL);
   # --numeric-ids: uid/gid как в снимке (userns-remap — 100000+, у них нет имён).
   rsync -aHAX --numeric-ids --delete "$STAGE$p/" "$p/"

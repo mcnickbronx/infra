@@ -3,6 +3,9 @@
 # Все люди с доступом к этому серверу (участники его проектов)
 host_people: "{{ projects.values() | map(attribute='devs', default=[]) | flatten | unique }}"
 
+# Проекты без root (rootless: true): свой пользователь <проект>-run и свой Docker без root
+rootless_projects: "{{ projects | dict2items | selectattr('value.rootless', 'defined') | selectattr('value.rootless') | map(attribute='key') | list }}"
+
 # Проекты с автовыкладкой из реестра образов (autodeploy: true)
 autodeploy_projects: "{{ projects | dict2items | selectattr('value.autodeploy', 'defined') | selectattr('value.autodeploy') | map(attribute='key') | list }}"
 

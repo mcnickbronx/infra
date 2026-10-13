@@ -92,7 +92,7 @@
     src: "{{ item }}"
     dest: "/usr/local/bin/{{ item }}"
     mode: "0755"
-  loop: [project-compose, project-db-env]
+  loop: [project-compose, project-db-env, project-docker-host]
 
 # Автовыкладка (autodeploy: true у проекта): каждые 15 секунд таймер проверяет реестр образов,
 # новый образ выкладывает project-deploy. Договорённость с проектом — TEAM.md, «Автовыкладка»
@@ -192,12 +192,13 @@
 
 # Лимиты на весь проект: контейнеры попадают сюда через cgroup_parent в base.yml.
 # Изменения применяются к работающему проекту после daemon-reload (handler), без перезапуска.
+# У проекта без root лимиты — на всего его пользователя (роль rootless)
 - name: Лимиты проектов (systemd slice proj-<проект>.slice)
   ansible.builtin.template:
     src: project.slice.j2
     dest: "/etc/systemd/system/proj-{{ item.key }}.slice"
     mode: "0644"
-  loop: "{{ projects | dict2items }}"
+  loop: "{{ projects | dict2items | rejectattr('key', 'in', rootless_projects) }}"
   loop_control:
     label: "{{ item.key }}: {{ item.value.memory | default(project_default_memory) }}, {{ item.value.cpus | default(project_default_cpus) }} CPU"
   notify: Reload systemd

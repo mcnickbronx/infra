@@ -45,6 +45,10 @@ short() { sed -E 's/(sha256:[0-9a-f]{12})[0-9a-f]*/\1/' <<<"${1:-—}"; }
 
 # ---------- Шаги выкладки ----------
 compose() { project-compose "$NAME" "$@"; }
+# Проект без root (rootless): образы и контейнеры — в его Docker. Скачивает образ root (вход в ghcr —
+# у root), а compose.yml из образа запускает пользователь проекта (project-compose)
+DOCKER_HOST=$(project-docker-host "$NAME")
+[ -n "$DOCKER_HOST" ] && export DOCKER_HOST || unset DOCKER_HOST
 
 # Версия образа: первый дайджест реестра (repo@sha256:...); у образа без реестра — пусто
 version_of() { docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null | head -1; }

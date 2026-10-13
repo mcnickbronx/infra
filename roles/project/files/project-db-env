@@ -17,7 +17,9 @@ die() { echo "project-db-env: $*" >&2; exit 1; }
 [[ $PREFIX =~ ^[A-Z0-9_]*$ ]] || die "приставка — заглавные латинские буквы, цифры и _ (например DEV_)"
 PASSWORD=$(sed -nE "s/^db_password_$NAME:[[:space:]]*\"?([^\"]*)\"?[[:space:]]*$/\1/p" /etc/infra/secrets.yml)
 [ -n "$PASSWORD" ] || die "у проекта $NAME нет базы: нет db_password_$NAME в /etc/infra/secrets.yml"
-HOST=$(docker network inspect "proj-$NAME" -f '{{(index .IPAM.Config 0).Gateway}}')
+# Проект без root (rootless) видит Postgres по адресу на infra0, остальные — по шлюзу своей сети
+HOST=$(project-docker-host "$NAME" db_host)
+[ -n "$HOST" ] || HOST=$(docker network inspect "proj-$NAME" -f '{{(index .IPAM.Config 0).Gateway}}')
 [ -L "$ENV_FILE" ] && die "$ENV_FILE — ссылка, а не файл: root не пишет пароль по ссылке"
 [ -f "$ENV_FILE" ] || die "нет $ENV_FILE — сначала .env проекта"
 

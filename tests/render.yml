@@ -29,6 +29,7 @@
       - backup/projects.json
       - monitoring/health-check.sh
       - monitoring/health-check-summary.timer
+      - rootless/infra0.service
     # Вычисляемые значения (derived.yml): от них зависят все правила доступа
     derived:
       host_people: "{{ host_people }}"
@@ -41,6 +42,7 @@
       postgres_memory_share: "{{ postgres_memory_share }}"
       project_default_cpus: "{{ project_default_cpus }}"
       people_groups: "{{ people_groups }}"
+      rootless_projects: "{{ rootless_projects }}"
   tasks:
     - name: Проверки инвентаря проходят
       ansible.builtin.import_role:
@@ -71,7 +73,18 @@
         src: ../roles/project/templates/project.slice.j2
         dest: "{{ out }}/project/proj-{{ item.key }}.slice"
         mode: "0644"
-      loop: "{{ projects | dict2items }}"
+      loop: "{{ projects | dict2items | rejectattr('key', 'in', rootless_projects) }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # Пользователь — как на сервере (<проект>-run), uid в имени файла — нет: его даёт роль rootless
+    - name: Лимиты проектов без root (user-<uid>.slice.d/50-infra.conf)
+      ansible.builtin.template:
+        src: ../roles/rootless/templates/slice-limits.conf.j2
+        dest: "{{ out }}/rootless/{{ item.key }}-50-infra.conf"
+        mode: "0644"
+      loop: "{{ rootless_projects | map('regex_replace', '^(.+)$', '{\"key\": \"\\1\", \"value\": {\"user\": \"\\1-run\"}}')
+                | map('from_json') | list }}"
       loop_control:
         label: "{{ item.key }}"
 

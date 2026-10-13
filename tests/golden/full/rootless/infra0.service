@@ -1,0 +1,15 @@
+# Управляется Ansible (роль rootless). Адрес Postgres для контейнеров проектов без root:
+# свою сеть хоста они не видят, localhost хоста им закрыт — а этот адрес на виртуальном интерфейсе
+# доступен. Postgres слушает все адреса, в pg_hba.conf — строки проектов без root с этого адреса.
+[Unit]
+Description=Интерфейс infra0 (10.199.0.1) — Postgres для проектов без root
+Before=postgresql.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip link show infra0 >/dev/null 2>&1 || ip link add infra0 type dummy; ip addr replace 10.199.0.1/32 dev infra0; ip link set infra0 up'
+ExecStop=/sbin/ip link del infra0
+
+[Install]
+WantedBy=multi-user.target

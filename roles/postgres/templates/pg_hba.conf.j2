@@ -14,9 +14,17 @@ host    replication     all             127.0.0.1/32            scram-sha-256
 host    replication     all             ::1/128                 scram-sha-256
 
 # --- Проекты: пользователь = база = имя проекта, из сети своего проекта
-{% for p in db_projects %}
+{% for p in db_projects if p.key not in rootless_projects %}
 host    {{ p.key }}    {{ p.key }}    172.20.{{ p.value.net }}.0/24    scram-sha-256
 {% endfor %}
+{% if db_projects | selectattr('key', 'in', rootless_projects) | list %}
+
+# --- Проекты без root: их контейнеры приходят с адреса {{ rootless_db_ip }} (infra0) — у всех
+# таких проектов он один, поэтому их разделяет только пароль
+{% for p in db_projects if p.key in rootless_projects %}
+host    {{ p.key }}    {{ p.key }}    {{ rootless_db_ip }}/32    scram-sha-256
+{% endfor %}
+{% endif %}
 
 # --- Свои строки администратора сервера (Postgres 16+): срабатывает первая подходящая строка,
 # поэтому отсюда можно только добавить доступ, но не закрыть открытый выше

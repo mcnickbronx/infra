@@ -32,3 +32,9 @@ projects:
   static:
     net: 20
     devs: [olga, kira]
+  lab:
+    net: 30
+    db: postgres
+    rootless: true                # без root: свой пользователь и Docker
+    autodeploy: true              # участникам проекта без root docker_users не нужен
+    devs: [kira]

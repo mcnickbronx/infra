@@ -22,5 +22,11 @@
         "every": null,
         "hourly": null,
         "name": "static"
+    },
+    {
+        "db": "postgres",
+        "every": null,
+        "hourly": null,
+        "name": "lab"
     }
 ]

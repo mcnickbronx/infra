@@ -145,6 +145,59 @@ ufw allow from 9.9.9.9 to any port 22 proto tcp comment 'infra-access manual'
         self.assertEqual((d / ("b" * 16)).read_text(), "готово\n")
 
 
+pt = load("project_traefik", "roles/rootless/files/project-traefik")
+
+
+class RootlessTraefik(unittest.TestCase):
+    """roles/rootless/files/project-traefik: labels контейнеров без root → файл маршрутов Traefik."""
+
+    def container(self, labels, ports=None, health=None, running=True):
+        state = {"Running": running}
+        if health:
+            state["Health"] = {"Status": health}
+        return {"Name": "/lab-app-1", "Config": {"Labels": labels}, "State": state,
+                "NetworkSettings": {"Ports": ports if ports is not None else
+                                     {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "40600"}]}}}
+
+    LABELS = {
+        "traefik.enable": "true",
+        "traefik.http.services.lab-app.loadbalancer.server.port": "8000",
+        "traefik.http.routers.lab-app.rule": "Host(`lab.example.org`)",
+        "traefik.http.routers.lab-app.entrypoints": "websecure",
+        "traefik.http.routers.lab-app.service": "lab-app",
+        "traefik.http.routers.lab-www.rule": "Host(`www.lab.example.org`)",
+        "traefik.http.routers.lab-www.middlewares": "lab-www,login-ratelimit@file",
+        "traefik.http.routers.lab-www.priority": "100",
+        "traefik.http.middlewares.lab-www.redirectregex.regex": "^https://www\\.(.+)",
+        "traefik.http.middlewares.lab-www.redirectregex.permanent": "true",
+        "com.docker.compose.project": "lab",
+    }
+
+    def test_labels_to_routes(self):
+        http = pt.build([self.container(self.LABELS)])["http"]
+        self.assertEqual(http["services"]["lab-app"], {"loadbalancer": {"servers": [{"url": "http://127.0.0.1:40600"}]}})
+        self.assertEqual(http["routers"]["lab-app"], {"rule": "Host(`lab.example.org`)", "entrypoints": ["websecure"],
+                                                      "service": "lab-app"})
+        # маршрут без service — к единственному сервису контейнера; списки, числа, true/false
+        self.assertEqual(http["routers"]["lab-www"]["service"], "lab-app")
+        self.assertEqual(http["routers"]["lab-www"]["middlewares"], ["lab-www", "login-ratelimit@file"])
+        self.assertEqual(http["routers"]["lab-www"]["priority"], 100)
+        self.assertEqual(http["middlewares"]["lab-www"]["redirectregex"],
+                         {"regex": "^https://www\\.(.+)", "permanent": True})
+
+    def test_only_ready_containers(self):
+        # Traefik с labels тоже не ведёт к нездоровому и запускающемуся контейнеру
+        for c in (self.container(self.LABELS, health="starting"), self.container(self.LABELS, health="unhealthy"),
+                  self.container(self.LABELS, running=False), self.container({**self.LABELS, "traefik.enable": "false"})):
+            self.assertIsNone(pt.build([c]))
+        self.assertIsNotNone(pt.build([self.container(self.LABELS, health="healthy")]))
+
+    def test_port_not_on_localhost(self):
+        # порт не открыт на 127.0.0.1 (контейнер запущен не через project-compose) — маршрута нет
+        for ports in ({}, {"8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8000"}]}):
+            self.assertIsNone(pt.build([self.container(self.LABELS, ports=ports)]))
+
+
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class SignedUpgrade(unittest.TestCase):
     """infra tag-signed: infra upgrade ставит только тег, подписанный ключом из SIGNERS текущей версии."""
