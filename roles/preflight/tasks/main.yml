@@ -15,7 +15,8 @@
     fail_msg: >-
       {{ inventory_hostname }}: {{ ansible_distribution }} {{ ansible_distribution_version }},
       а серверы должны быть на Ubuntu {{ ubuntu_version }}. Переустановите сервер
-      на Ubuntu {{ ubuntu_version }} в панели хостера
+      на Ubuntu {{ ubuntu_version }} в панели хостера. На 24.04 движок тоже работает, но это
+      не желательно (README, «Ограничения»): тогда ubuntu_version: "24.04" в server.yml
     quiet: true
 
 # Без них движку не из чего строить сервер; значений по умолчанию у них нет
