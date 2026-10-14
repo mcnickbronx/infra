@@ -27,6 +27,8 @@ and YAML instead of buttons.
   key from an IP allowlist; an access link opens SSH for your current IP for 24 hours.
 - **Security:** only 80/443 open, container ports bound to 127.0.0.1 by default, userns-remap,
   CrowdSec bans in the firewall (never your IPs or your members'), nightly Ubuntu security updates.
+  Experimental: `rootless: true` per project — its own Linux user and rootless Docker, so a project's
+  `compose.yml` can't give anyone root on the server (~100 MB of RAM per project).
 - **Backups (restic):** nightly per-project snapshots (files, volumes, DB dump) plus `/etc`; frequent
   snapshots every 1–60 minutes straight to S3; three levels — server, your computer, S3 with Object Lock.
 - **Deploys:** push → CI builds an image in ghcr.io → the server picks it up within 15 seconds, runs
@@ -45,7 +47,7 @@ A fresh VDS with Ubuntu 26.04 (24.04 works too, see Limitations), root login by 
 ```bash
 ssh root@<IP>
 git clone -q https://github.com/mcnickbronx/infra.git /opt/infra
-git -C /opt/infra checkout -q v1.7.2          # latest version — CHANGELOG.md
+git -C /opt/infra checkout -q v1.8.0          # latest version — CHANGELOG.md
 /opt/infra/install.sh
 infra init     # server name, Let's Encrypt email, your SSH keys and IPs — then the server is set up
 ```

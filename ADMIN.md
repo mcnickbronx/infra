@@ -136,7 +136,7 @@ Postgres — короткий разрыв подключений; `daemon.json`
    ```bash
    ssh root@<IP>
    git clone -q https://github.com/mcnickbronx/infra.git /opt/infra   # нет git — apt-get install -y git
-   git -C /opt/infra checkout -q v1.7.2                                # последняя версия — CHANGELOG.md
+   git -C /opt/infra checkout -q v1.8.0                                # последняя версия — CHANGELOG.md
    /opt/infra/install.sh
    ```
    Своя ветка или форк движка (ваши правки в коде) — клонировать его вместо этого адреса.
@@ -353,7 +353,7 @@ Docker и Postgres перезапускаются (контейнеры рабо
 подключений на секунды); если нужна перезагрузка — через минуту после конца прогона,
 минута-две простоя.
 
-**Новая версия движка** — `sudo infra upgrade v1.7.2`: код нужной версии из git, затем `apply`
+**Новая версия движка** — `sudo infra upgrade v1.8.0`: код нужной версии из git, затем `apply`
 с предпросмотром. Что поменялось — CHANGELOG движка. Правили код прямо в `/opt/infra` —
 `upgrade` откажется, чтобы правки не пропали молча: им место в ветке движка.
 

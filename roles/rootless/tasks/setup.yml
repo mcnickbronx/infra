@@ -1,4 +1,4 @@
-# Проекты без root (rootless: true у проекта в server.yml; проба — ветка rootless, DECISIONS.md).
+# Проекты без root (rootless: true у проекта в server.yml; экспериментально — README, DECISIONS.md).
 # У проекта свой пользователь <проект>-run и свой Docker без root: контейнеры проекта — процессы
 # этого пользователя и его subuid, и compose.yml проекта, кто бы его ни написал, root на сервере
 # не даёт. Участники проекта управляют контейнерами сами — project-compose от имени <проект>-run.
@@ -185,30 +185,54 @@
     label: "{{ item.0.key }}: {{ 'пользователь' if item.1[0] == 'u' else 'gid ' ~ item.1[0] }}{{ ' (по умолчанию)' if item.1[1] else '' }}"
   when: not ansible_check_mode
 
-# Проект переводят на rootless с уже залитыми файлами (media, static…): их создавали контейнеры общего
-# Docker (uid 100000+), и контейнеры без root их бы не перезаписали (collectstatic, загрузки) — владельцы
-# меняются на номера контейнеров без root (project-rootless-files). Один раз — те же права, что выше, на
-# всё содержимое web/. -P: по ссылкам не идти (их могут подложить участники); -n: маску не пересчитывать —
-# файл, закрытый для группы на запись (644 из SFTP), так и останется только для чтения. Отметка — в /var/lib
+# Перевод проекта на rootless — один раз, по отметке в /var/lib/infra-rootless, одним apply:
+#   1. проект останавливается в общем Docker (тома общего Docker сами не переезжают — тогда перевод
+#      останавливается до их переноса вручную, README, «Проекты без root»);
+#   2. файлы, которые создали его контейнеры (media, static…), переходят номерам контейнеров без root
+#      (project-rootless-files), и на всё в web/ — те же права, что выше. -P: по ссылкам не идти (их могут
+#      подложить участники); -n: маску не пересчитывать — файл, закрытый для группы на запись (644 из SFTP),
+#      так и останется только для чтения;
+#   3. адрес базы в .env — infra0 (project-db-env);
+#   4. запуск в его Docker: автовыкладка выкладывает заново (её отметка версии сброшена), без неё —
+#      project-compose up -d. Новый проект (ещё без файлов и контейнеров) проходит те же шаги впустую.
 - name: Папка отметок роли rootless
   ansible.builtin.file:
     path: /var/lib/infra-rootless
     state: directory
     mode: "0700"
 
-- name: Файлы, которые уже есть в web/, — контейнерам без root (один раз)
+- name: Перевод проектов на Docker без root (один раз)
   ansible.builtin.shell: |
     set -euo pipefail
-    # владельцы: номера контейнеров общего Docker → номера Docker без root
-    project-rootless-files {{ item.key | quote }} to-rootless
+    p={{ item.key | quote }} w=/srv/projects/{{ item.key }}/web
+    vols=$(env -u DOCKER_HOST docker volume ls -q --filter "label=com.docker.compose.project=$p" | xargs)
+    if [ -n "$vols" ]; then
+      echo "$p: тома в общем Docker ($vols) сами не переезжают — перенесите вручную (README, «Проекты без root»)" >&2
+      exit 1
+    fi
+    # образ — заранее в Docker проекта (вход в ghcr — у root): простой — только на перезапуск
+    image=$(sed -n 's/^DEPLOY_IMAGE=//p' "$w/.env" 2>/dev/null | tail -1 | tr -d "\"'")
+    [ -z "$image" ] || DOCKER_HOST={{ item.value.sock | quote }} docker pull -q "$image" >/dev/null
+    env -u DOCKER_HOST docker compose -p "$p" down 2>&1 | tail -n 3
+    project-rootless-files "$p" to-rootless
     spec="u:{{ item.value.user }}:rwX"
     for g in {{ docker_remap_web_gids | join(' ') }}; do
       if [ "$g" = 0 ]; then id={{ item.value.gid }}; else id=$(( {{ item.value.subgid }} + g - 1 )); fi
       spec="$spec,g:$id:rwX"
     done
-    setfacl -n -P -R -m "$spec" /srv/projects/{{ item.key }}/web
-    find /srv/projects/{{ item.key }}/web -mindepth 1 -type d -exec setfacl -n -P -m "$(sed 's/\(^\|,\)/\1d:/g' <<<"$spec")" {} +
-    touch /var/lib/infra-rootless/{{ item.key }}.acl
+    setfacl -n -P -R -m "$spec" "$w"
+    find "$w" -mindepth 1 -type d -exec setfacl -n -P -m "$(sed 's/\(^\|,\)/\1d:/g' <<<"$spec")" {} +
+    {% if projects[item.key].db is defined %}
+    [ ! -f "$w/.env" ] || project-db-env "$p"
+    {% endif %}
+    rm -f /var/lib/project-deploy/"$p".{current,previous,failed,failed-ref}
+    {% if item.key in autodeploy_projects %}
+    systemctl start --no-block "project-deploy@$p.service"
+    echo "$p: выложит автовыкладка — уже в Docker без root"
+    {% else %}
+    project-compose "$p" up -d
+    {% endif %}
+    touch /var/lib/infra-rootless/"$p".acl
   args:
     executable: /bin/bash
     creates: "/var/lib/infra-rootless/{{ item.key }}.acl"

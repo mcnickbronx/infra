@@ -38,7 +38,7 @@
 #      до замены; база заменена целиком (таблица только dev исчезла), владелец — роль dev; расширение
 #      прода (pg_trgm) и индекс на нём — в dev; --files с группой dev; откат снимком — точно как было
 #      (project-restore очищает базу); project-db-dump.
-#  10. Проект без root (если в server.yml есть rootless: true): участник запускает его сам, без
+#  10. Проект без root lab (rootless: true, участник tester — в server.yml тестового): участник запускает его сам, без
 #      docker_users; маршрут Traefik из labels, база с адреса infra0, лимит на пользователя; privileged
 #      с корнем диска и env_file: /etc/shadow root не дают; том в бэкапе; health-check видит упавший Docker;
 #      автовыкладка (реестр на infra0): выкладка, отказ подготовки, маршрут Traefik переезжает, откат.
@@ -957,7 +957,7 @@
     # с чужим файлом. Маршрут Traefik — из labels, база — с адреса infra0, том — в бэкапе.
     - name: "10. Проект без root: участник запускает сам, маршрут, база, лимиты, root не получить, бэкап тома"
       vars:
-        p: "{{ rootless_projects | first }}"
+        p: lab
       ansible.builtin.shell: |
         set -uo pipefail
         p={{ p }} w=/srv/projects/{{ p }}/web host=rl-verify.invalid
@@ -1060,7 +1060,7 @@
         executable: /bin/bash
       register: rootless
       changed_when: true
-      when: rootless_projects | length > 0
+      when: "'lab' in rootless_projects"
 
     - name: "10. Проект без root работает, а root через него не получить"
       vars:
@@ -1072,7 +1072,7 @@
           - r.proc_uid == 'subuid'            # процесс контейнера — subuid пользователя проекта
           - r.file == 'app:app'               # приложение пишет в папку, участник её читает
           - r.route == '200'                  # маршрут Traefik из labels
-          - r.db == (rootless_projects | first)   # база — с адреса infra0, паролем проекта
+          - r.db == 'lab'                     # база — с адреса infra0, паролем проекта
           - r.limit == '536870912'            # memory: 512m — на всего пользователя
           - "'noshadow' in r.evil and 'noroothome' in r.evil and 'SHADOW' not in r.evil"
           - r.etc == 'clean'
@@ -1084,7 +1084,7 @@
           - r.route_gone == 'gone'
         fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
         quiet: true
-      when: rootless_projects | length > 0
+      when: "'lab' in rootless_projects"
 
     # Автовыкладка в проект без root. Реестр — на адресе infra0 (из Docker без root хост виден только
     # по нему), на время сценария без TLS (insecure-registries в настройках Docker без root). Образы
@@ -1092,7 +1092,7 @@
     # Traefik: маршрут переезжает на новую версию сам. Процессы выложенной версии — <проект>-run
     - name: "10. Автовыкладка в проект без root: выкладка, отказ, маршрут Traefik, откат"
       vars:
-        p: "{{ rootless_projects | first }}"
+        p: lab
       ansible.builtin.shell: |
         set -uo pipefail
         p={{ p }} w=/srv/projects/{{ p }}/web reg={{ rootless_db_ip }}:5001 host=rl-deploy.invalid
@@ -1153,7 +1153,7 @@
         executable: /bin/bash
       register: rootless_deploy
       changed_when: true
-      when: rootless_projects | length > 0
+      when: "'lab' in rootless_projects"
 
     - name: "10. Автовыкладка без root: выложено, отказ вернул прежнюю, маршрут переехал, откат"
       vars:
@@ -1163,8 +1163,8 @@
           - r.v1 == '0:v1:v1'
           - "r.v2 == '1:v1:подготовка (сервис deploy): работает прежняя версия'"
           - r.v3 == '0:v3:v3'
-          - r.deploy_user == (rootless_projects | first) ~ '-run'   # root в контейнере — пользователь проекта
+          - r.deploy_user == 'lab-run'        # root в контейнере — пользователь проекта
           - r.rollback == '0:v1'
         fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
         quiet: true
-      when: rootless_projects | length > 0
+      when: "'lab' in rootless_projects"
