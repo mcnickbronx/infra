@@ -124,7 +124,9 @@
     - name: "2. Файлы, том и база до снимка"
       ansible.builtin.shell: |
         set -euo pipefail
-        mkdir -p {{ web }}/verify/sub
+        # права — явно и с ведущим 0: mkdir из uutils 0.8 (Ubuntu 26.04) в папке с setgid создаёт 7775,
+        # а chmod 2770 (и в GNU) setuid у папки не снимает
+        mkdir -p {{ web }}/verify/sub && chmod 02770 {{ web }}/verify/sub
         echo {{ marker }} > {{ web }}/verify/marker.txt
         ln -sfn marker.txt {{ web }}/verify/link
         G=$(getent group shop-dev | cut -d: -f3)
@@ -262,7 +264,7 @@
     # Как автовыкладка (make_dirs): mkdir и запись для группы — через ACL папки проекта
     # её получает и пользователь приложения в контейнере
     - name: "3. Папка для записи приложения — от участника"
-      ansible.builtin.command: runuser -u tester -- bash -c 'cd {{ web }} && mkdir files && chmod 2770 files'
+      ansible.builtin.command: runuser -u tester -- bash -c 'cd {{ web }} && mkdir files && chmod 02770 files'
       changed_when: true
 
     - name: "3. Проект запущен (project-compose)"
@@ -730,6 +732,8 @@
           "$s3" "$RESTIC_PASSWORD" "$RESTIC_REPOSITORY" "$RESTIC_PASSWORD") > /etc/restic/s3-env
         # таймер на время проверки стоит: его запуск взял бы блокировку, и проверка «пропустила» бы снимки
         systemctl stop backup-hourly.timer; while systemctl is-active -q backup-hourly.service; do sleep 1; done
+        # полный снимок crm старше частых — на новом сервере ночного бэкапа ещё не было
+        project-backup crm >/dev/null 2>&1
         shop0=$(count project:shop); crm0=$(count project:crm,db-only)
         psql_crm "DROP TABLE IF EXISTS verify_h; CREATE TABLE verify_h(v text); INSERT INTO verify_h VALUES ('h1')"
         rm -f /var/lib/backup-hourly/failed /var/lib/backup-hourly/last-ok

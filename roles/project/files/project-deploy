@@ -78,13 +78,15 @@ restore() {
 }
 
 # Папки проекта, которые монтирует compose: нет — создать с записью для группы, как web/
-# (иначе их создаст Docker от root, и приложение не сможет туда писать). Сервисы — и запущенные,
+# (иначе их создаст Docker от root, и приложение не сможет туда писать). install -d, а не mkdir:
+# mkdir из uutils 0.8 (Ubuntu 26.04) в папке с setgid создаёт 7775 — setuid и sticky,
+# и chmod 2770 setuid у папки не снимает Сервисы — и запущенные,
 # и deploy: --profile в команде заменяет профили из .env, поэтому два прохода
 make_dirs() {
   { compose config --format json; compose --profile deploy config --format json; } |
     jq -r '.services[].volumes[]? | select(.type == "bind") | .source' |
     sort -u | while read -r d; do
-      case $d in "$WEB"/*) [ -e "$d" ] || { mkdir -p "$d" && chmod 2770 "$d"; } || exit 1 ;; esac
+      case $d in "$WEB"/*) [ -e "$d" ] || install -d -m 2770 "$d" || exit 1 ;; esac
     done
 }
 
