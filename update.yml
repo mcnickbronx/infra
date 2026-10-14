@@ -55,6 +55,25 @@
       ansible.builtin.debug:
         msg: "{{ apt_upgrade.stdout_lines | default([]) | select('match', '^(Inst|Setting up) ') | list }}"
 
+    # Проекты без root (rootless: true): их Docker — те же пакеты, но работающий демон пользователя сам
+    # не перезапускается, и новый Docker заработал бы только после перезагрузки. Обновился Docker —
+    # перезапуск (контейнеры с restart: unless-stopped поднимаются сами, как у общего Docker)
+    - name: Docker без root у проектов — перезапуск после обновления Docker
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for u in $(jq -r '.[].user' /usr/local/etc/infra-rootless.json); do
+          systemctl --user -M "$u@" restart infra-docker
+          echo "$u"
+        done
+      args:
+        executable: /bin/bash
+      register: rootless_restarted
+      changed_when: rootless_restarted.stdout | length > 0
+      when:
+        - rootless_projects | length > 0
+        - not ansible_check_mode
+        - apt_upgrade.stdout_lines | default([]) | select('match', '^Setting up (docker-ce|docker-ce-rootless-extras|containerd[.]io) ') | list | length > 0
+
     # Контейнер пересоздаётся, только если образ новее — сайты недоступны пару секунд
     - name: Traefik — свежий образ в пределах минорной версии
       community.docker.docker_compose_v2:
