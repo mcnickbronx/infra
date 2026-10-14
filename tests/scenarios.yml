@@ -965,7 +965,7 @@
         restic_p() { (set -a; . /etc/restic/env; set +a; restic "$@"); }
         rm -rf $w/compose.yml $w/compose.override.yml $w/files $w/.env
         # .env и compose.yml — от участника, доступ к базе в .env — от администратора (project-db-env)
-        as_tester "touch .env && chmod 660 .env && mkdir files && chmod 2770 files"
+        as_tester "touch .env && chmod 660 .env && mkdir files && chmod 02770 files"
         project-db-env $p >/dev/null
         cat > /tmp/verify-rl.yml <<'Y'
         name: {{ p }}
@@ -1034,7 +1034,9 @@
         install -o tester -g $p-dev -m 664 /tmp/verify-rl-shadow.yml $w/compose.override.yml
         echo "shadow=$(project-compose $p config 2>&1 | grep -c 'permission denied')"
         rm -f $w/compose.override.yml
-        echo "tester_root=$(runuser -u tester -- sudo -n true 2>&1 | grep -c 'password is required\|not allowed\|may not run')"
+        # root участнику не дать, пользователя проекта — да (код возврата: у sudo-rs в 26.04 свои сообщения)
+        can() { runuser -u tester -- sudo -n "$@" true >/dev/null 2>&1 && echo yes || echo no; }
+        echo "tester_sudo=$(can):$(can -u $p-run)"
         # том проекта — в бэкапе, восстанавливается
         project-compose $p exec -T -u 0 app sh -c 'echo v1 > /vol/m'   # том — root контейнера (на сервере <проект>-run)
         project-backup $p >/dev/null 2>&1; echo "backup=$?"
@@ -1075,7 +1077,7 @@
           - "'noshadow' in r.evil and 'noroothome' in r.evil and 'SHADOW' not in r.evil"
           - r.etc == 'clean'
           - r.shadow == '1'                   # env_file: /etc/shadow — отказ
-          - r.tester_root == '1'
+          - r.tester_sudo == 'no:yes'         # root — нет, пользователь проекта — да
           - r.backup == '0' and r.restore == '0' and r.vol == 'v1'
           - r.hc_down == '1'
           - r.infra_status == '1'
