@@ -1,0 +1,271 @@
+# Проекты без root (rootless: true у проекта в server.yml; проба — ветка rootless, DECISIONS.md).
+# У проекта свой пользователь <проект>-run и свой Docker без root: контейнеры проекта — процессы
+# этого пользователя и его subuid, и compose.yml проекта, кто бы его ни написал, root на сервере
+# не даёт. Участники проекта управляют контейнерами сами — project-compose от имени <проект>-run.
+# В домашнюю папку <проект>-run root не пишет: её может менять каждый участник проекта, и ссылка
+# там направила бы запись root куда угодно. Поэтому служба и настройки Docker — общие, в /etc.
+# Убрать у проекта rootless — вручную (README, «Проекты без root»).
+
+- name: Пакеты Docker без root
+  ansible.builtin.apt:
+    name: [uidmap, slirp4netns, dbus-user-session, docker-ce-rootless-extras]
+
+# ---------- Адрес Postgres для контейнеров ----------
+- name: Служба интерфейса infra0 (адрес Postgres для контейнеров без root)
+  ansible.builtin.template:
+    src: infra0.service.j2
+    dest: /etc/systemd/system/infra-rootless-net.service
+    mode: "0644"
+  register: infra0_unit
+
+- name: infra0 поднят
+  ansible.builtin.systemd:
+    name: infra-rootless-net
+    state: "{{ 'restarted' if infra0_unit is changed else 'started' }}"
+    enabled: true
+    daemon_reload: true
+  when: not ansible_check_mode or infra0_unit is not changed
+
+# ---------- Docker без root: общие служба и настройки ----------
+- name: Папки настроек и службы Docker без root
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: [/etc/infra-rootless, /etc/systemd/user/default.target.wants]
+
+- name: Настройки Docker без root (общие для проектов)
+  ansible.builtin.copy:
+    src: daemon.json
+    dest: /etc/infra-rootless/daemon.json
+    mode: "0644"
+  register: rootless_daemon_json
+
+# Служба пользователя — у всех пользователей группы rootless (ConditionGroup), включена для всех сразу
+- name: Служба Docker без root (у пользователей группы rootless)
+  ansible.builtin.copy:
+    src: infra-docker.service
+    dest: /etc/systemd/user/infra-docker.service
+    mode: "0644"
+  register: rootless_unit
+
+- name: Служба Docker без root включена
+  ansible.builtin.file:
+    src: /etc/systemd/user/infra-docker.service
+    dest: /etc/systemd/user/default.target.wants/infra-docker.service
+    state: link
+    force: true
+
+# ---------- Пользователи проектов ----------
+# <проект>-dev — читать и писать web/ (compose.yml, .env); rootless — видеть процессы (base, hidepid)
+- name: Пользователи проектов без root (<проект>-run)
+  ansible.builtin.user:
+    name: "{{ item }}-run"
+    comment: "Контейнеры проекта {{ item }} без root (infra)"   # двоеточие в комментарии useradd не примет
+    shell: /usr/sbin/nologin
+    groups: ["{{ item }}-dev", rootless]
+    append: false
+  loop: "{{ rootless_projects }}"
+
+- name: Номера пользователей
+  ansible.builtin.getent:
+    database: passwd
+  check_mode: false
+
+- name: Диапазоны subuid и subgid
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: [/etc/subuid, /etc/subgid]
+  register: rootless_subids
+
+# info[проект] = user, uid, gid, subgid (первый gid диапазона), sock, ports, db_host.
+# В --check у нового проекта пользователя ещё нет — его пропускаем
+- name: Проекты без root — пользователи, диапазоны, сокеты
+  ansible.builtin.set_fact:
+    rootless_info: >-
+      {%- set subgid = {} -%}
+      {%- for line in rootless_subids.results[1].content | b64decode | split('\n') if line.count(':') == 2 -%}
+      {%-   set f = line.split(':') -%}
+      {%-   set _ = subgid.update({f[0]: f[1] | int}) -%}
+      {%- endfor -%}
+      {%- set info = {} -%}
+      {%- for p in rootless_projects if (p ~ '-run') in getent_passwd -%}
+      {%-   set u = p ~ '-run' -%}
+      {%-   set uid = getent_passwd[u][1] | int -%}
+      {%-   set _ = info.update({p: {'user': u, 'uid': uid, 'gid': getent_passwd[u][2] | int,
+                                     'subgid': subgid[u] | default(0),
+                                     'sock': 'unix:///run/user/' ~ uid ~ '/docker.sock',
+                                     'ports': rootless_port_base + (projects[p].net | int) * 20,
+                                     'db_host': rootless_db_ip}}) -%}
+      {%- endfor -%}
+      {{ info }}
+
+- name: У пользователей проектов без root есть subuid и subgid
+  ansible.builtin.assert:
+    that: rootless_info.values() | selectattr('subgid', 'eq', 0) | list | length == 0
+    fail_msg: "Нет диапазона в /etc/subgid у {{ rootless_info.values() | selectattr('subgid', 'eq', 0) | map(attribute='user') | list }}"
+    quiet: true
+
+- name: Docker пользователя работает без его входа (linger)
+  ansible.builtin.command: loginctl enable-linger {{ item }}-run
+  args:
+    creates: "/var/lib/systemd/linger/{{ item }}-run"
+  loop: "{{ rootless_projects }}"
+
+- name: systemd пользователя запущен
+  ansible.builtin.wait_for:
+    path: "/run/user/{{ item.value.uid }}/systemd/private"
+    timeout: 60
+  loop: "{{ rootless_info | dict2items }}"
+  loop_control:
+    label: "{{ item.value.user }}"
+  when: not ansible_check_mode
+
+# Новая служба или настройки — перечитать и перезапустить; иначе — только запустить
+- name: Docker без root запущен
+  ansible.builtin.shell: |
+    set -euo pipefail
+    u={{ item.value.user | quote }}
+    sc() { systemctl --user -M "$u@" "$@"; }
+    if [ {{ (rootless_unit is changed or rootless_daemon_json is changed) | string | quote }} = True ]; then
+      sc daemon-reload; sc restart infra-docker; echo changed
+    elif ! sc is-active -q infra-docker; then
+      sc daemon-reload; sc start infra-docker; echo changed
+    fi
+  args:
+    executable: /bin/bash
+  loop: "{{ rootless_info | dict2items }}"
+  loop_control:
+    label: "{{ item.value.user }}"
+  register: rootless_started
+  changed_when: "'changed' in rootless_started.stdout"
+  when: not ansible_check_mode
+
+- name: Сокет Docker без root готов
+  ansible.builtin.wait_for:
+    path: "/run/user/{{ item.value.uid }}/docker.sock"
+    timeout: 60
+  loop: "{{ rootless_info | dict2items }}"
+  loop_control:
+    label: "{{ item.value.user }}"
+  when: not ansible_check_mode
+
+# Список для скриптов (project-docker-host, project-compose, project-traefik, бэкап, health-check)
+- name: Список проектов без root (/usr/local/etc/infra-rootless.json)
+  ansible.builtin.copy:
+    content: "{{ rootless_info | to_nice_json }}\n"
+    dest: /usr/local/etc/infra-rootless.json
+    mode: "0644"
+
+# ---------- Проект ----------
+# Сеть proj-<проект> — в его Docker (compose проекта ждёт её как external); подсеть — любая:
+# у каждого Docker без root свои сети, с сетями сервера они не пересекаются
+- name: Сети проектов в их Docker без root
+  community.docker.docker_network:
+    name: "proj-{{ item.key }}"
+    docker_host: "{{ item.value.sock }}"
+  loop: "{{ rootless_info | dict2items }}"
+  loop_control:
+    label: "proj-{{ item.key }}"
+  when: not ansible_check_mode
+
+# Контейнеры без root на хосте — это <проект>-run (root в контейнере) и его subgid: gid N в контейнере
+# = subgid + N - 1. web/ открыт им, как общему Docker — его docker_remap_web_gids (0, 33, 1000)
+- name: Доступ контейнеров без root к web/
+  ansible.posix.acl:
+    path: "/srv/projects/{{ item.0.key }}/web"
+    etype: "{{ 'user' if item.1[0] == 'u' else 'group' }}"
+    entity: "{{ item.0.value.user if item.1[0] == 'u' else
+                (item.0.value.gid if item.1[0] == 0 else item.0.value.subgid + item.1[0] - 1) | string }}"
+    permissions: rwX
+    default: "{{ item.1[1] }}"
+    state: present
+  loop: "{{ rootless_info | dict2items | product((['u'] + docker_remap_web_gids) | product([false, true])) | list }}"
+  loop_control:
+    label: "{{ item.0.key }}: {{ 'пользователь' if item.1[0] == 'u' else 'gid ' ~ item.1[0] }}{{ ' (по умолчанию)' if item.1[1] else '' }}"
+  when: not ansible_check_mode
+
+# Проект переводят на rootless с уже залитыми файлами (media, static…): их создавали контейнеры общего
+# Docker (uid 100000+), и контейнеры без root их бы не перезаписали (collectstatic, загрузки) — владельцы
+# меняются на номера контейнеров без root (project-rootless-files). Один раз — те же права, что выше, на
+# всё содержимое web/. -P: по ссылкам не идти (их могут подложить участники); -n: маску не пересчитывать —
+# файл, закрытый для группы на запись (644 из SFTP), так и останется только для чтения. Отметка — в /var/lib
+- name: Папка отметок роли rootless
+  ansible.builtin.file:
+    path: /var/lib/infra-rootless
+    state: directory
+    mode: "0700"
+
+- name: Файлы, которые уже есть в web/, — контейнерам без root (один раз)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    # владельцы: номера контейнеров общего Docker → номера Docker без root
+    project-rootless-files {{ item.key | quote }} to-rootless
+    spec="u:{{ item.value.user }}:rwX"
+    for g in {{ docker_remap_web_gids | join(' ') }}; do
+      if [ "$g" = 0 ]; then id={{ item.value.gid }}; else id=$(( {{ item.value.subgid }} + g - 1 )); fi
+      spec="$spec,g:$id:rwX"
+    done
+    setfacl -n -P -R -m "$spec" /srv/projects/{{ item.key }}/web
+    find /srv/projects/{{ item.key }}/web -mindepth 1 -type d -exec setfacl -n -P -m "$(sed 's/\(^\|,\)/\1d:/g' <<<"$spec")" {} +
+    touch /var/lib/infra-rootless/{{ item.key }}.acl
+  args:
+    executable: /bin/bash
+    creates: "/var/lib/infra-rootless/{{ item.key }}.acl"
+  loop: "{{ rootless_info | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: not ansible_check_mode
+
+- name: Папки лимитов user-<uid>.slice.d
+  ansible.builtin.file:
+    path: "/etc/systemd/system/user-{{ item.value.uid }}.slice.d"
+    state: directory
+    mode: "0755"
+  loop: "{{ rootless_info | dict2items }}"
+  loop_control:
+    label: "{{ item.value.user }}"
+
+- name: Лимиты проектов без root — на всего пользователя (user-<uid>.slice)
+  ansible.builtin.template:
+    src: slice-limits.conf.j2
+    dest: "/etc/systemd/system/user-{{ item.value.uid }}.slice.d/50-infra.conf"
+    mode: "0644"
+  loop: "{{ rootless_info | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}: {{ projects[item.key].memory | default(project_default_memory) }}"
+  notify: Reload systemd
+
+# Участник проекта — от имени <проект>-run: тот не root, и Docker у него без root
+- name: Участники проектов без root управляют их контейнерами (sudo -u <проект>-run)
+  ansible.builtin.copy:
+    content: |
+      # Управляется Ansible (роль rootless): участники проекта без root — от имени его пользователя
+      {% for p in rootless_projects %}
+      %{{ p }}-dev ALL=({{ p }}-run) NOPASSWD: ALL
+      {% endfor %}
+    dest: /etc/sudoers.d/infra-rootless
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+# ---------- Маршруты Traefik ----------
+- name: project-traefik — labels контейнеров без root → маршруты Traefik
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: project-traefik, dest: /usr/local/sbin/project-traefik, mode: "0755" }
+    - { src: project-traefik@.service, dest: /etc/systemd/system/project-traefik@.service, mode: "0644" }
+  loop_control:
+    label: "{{ item.dest }}"
+  register: traefik_sync_files
+
+- name: Маршруты Traefik следят за контейнерами проектов без root
+  ansible.builtin.systemd:
+    name: "project-traefik@{{ item }}"
+    enabled: true
+    state: "{{ 'restarted' if traefik_sync_files is changed else 'started' }}"
+    daemon_reload: true
+  loop: "{{ rootless_info.keys() | list }}"
+  when: not ansible_check_mode

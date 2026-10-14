@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+# Управляется Ansible (роль rootless). Владельцы файлов проекта при переводе между общим Docker
+# и Docker без root. Файлы, которые создали контейнеры, принадлежат на хосте «номеру контейнера»:
+#   общий Docker (userns-remap): uid N в контейнере = 100000 + N на хосте;
+#   Docker без root:             uid 0 = <проект>-run, uid N = начало его subuid + N - 1.
+# Без перевода приложение после смены Docker прочитало бы свои старые файлы, но не перезаписало
+# (collectstatic, загрузки). Файлы людей (uid ниже 100000) не трогаются, по ссылкам — не идём.
+#   project-rootless-files <проект> to-rootless|to-rootful
+import os
+import pwd
+import sys
+
+BASE = 100000          # docker_remap_base: userns-remap общего Docker
+SPAN = 65536
+
+
+def subrange(path, user):
+    with open(path) as f:
+        for line in f:
+            name, start, count = (line.strip().split(":") + ["", "", ""])[:3]
+            if name == user:
+                return int(start), int(count)
+    raise SystemExit(f"нет диапазона {user} в {path}")
+
+
+def mapper(direction, own, sub):
+    """Функция: номер на хосте → новый номер (или тот же, если это не номер контейнера)."""
+    def to_rootless(i):
+        if BASE <= i < BASE + SPAN:
+            n = i - BASE
+            return own if n == 0 else sub + n - 1
+        return i
+
+    def to_rootful(i):
+        if i == own:
+            return BASE
+        if sub <= i < sub + SPAN:
+            return BASE + (i - sub) + 1
+        return i
+    return to_rootless if direction == "to-rootless" else to_rootful
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in ("to-rootless", "to-rootful"):
+        print("Использование: project-rootless-files <проект> to-rootless|to-rootful", file=sys.stderr)
+        return 2
+    project, direction = argv
+    user = f"{project}-run"
+    pw = pwd.getpwnam(user)
+    uid = mapper(direction, pw.pw_uid, subrange("/etc/subuid", user)[0])
+    gid = mapper(direction, pw.pw_gid, subrange("/etc/subgid", user)[0])
+    top = f"/srv/projects/{project}/web"
+    changed = 0
+    # fwalk — по открытым папкам (dir_fd): подменить папку ссылкой посреди обхода не выйдет
+    for _root, dirs, files, fd in os.fwalk(top, follow_symlinks=False):
+        for name in dirs + files:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            new = (uid(st.st_uid), gid(st.st_gid))
+            if new != (st.st_uid, st.st_gid):
+                # и сама ссылка — не то, на что она указывает; setgid у папок chown не снимает
+                os.chown(name, *new, dir_fd=fd, follow_symlinks=False)
+                changed += 1
+    print(f"project-rootless-files: {project} {direction}: владельцев сменили {changed} файлов и папок")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

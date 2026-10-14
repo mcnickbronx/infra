@@ -198,6 +198,24 @@ class RootlessTraefik(unittest.TestCase):
             self.assertIsNone(pt.build([self.container(self.LABELS, ports=ports)]))
 
 
+prf = load("project_rootless_files", "roles/rootless/files/project-rootless-files")
+
+
+class RootlessFiles(unittest.TestCase):
+    """roles/rootless/files/project-rootless-files: владельцы файлов при смене Docker проекта."""
+
+    def test_both_ways(self):
+        own, sub = 1004, 231072                  # <проект>-run и начало его subuid
+        to_rl, to_rf = prf.mapper("to-rootless", own, sub), prf.mapper("to-rootful", own, sub)
+        self.assertEqual(to_rl(100000), own)     # root контейнера
+        self.assertEqual(to_rl(101000), sub + 999)   # uid 1000 контейнера
+        for person in (0, 1000, 99999, 165536, 300000):   # люди, root сервера, чужие диапазоны
+            self.assertEqual(to_rl(person), person)
+            self.assertEqual(to_rf(person), person)
+        for n in (0, 33, 1000, 65535):           # туда и обратно — как было
+            self.assertEqual(to_rf(to_rl(100000 + n)), 100000 + n)
+
+
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class SignedUpgrade(unittest.TestCase):
     """infra tag-signed: infra upgrade ставит только тег, подписанный ключом из SIGNERS текущей версии."""

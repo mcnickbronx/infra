@@ -1,0 +1,59 @@
+# Проект, у которого убрали rootless (или его убрали из server.yml): его Docker без root и маршруты
+# останавливаются — контейнеры проекта теперь в общем Docker. Пользователь <проект>-run и его данные
+# (образы, тома в /home/<проект>-run) остаются — удалить вручную (README, «Проекты без root»).
+- name: Пользователи проектов без root на сервере (группа rootless)
+  ansible.builtin.getent:
+    database: group
+    key: rootless
+    fail_key: false
+  check_mode: false
+
+- name: Проекты, которым убрали rootless
+  ansible.builtin.set_fact:
+    rootless_gone: >-
+      {{ ((getent_group | default({})).rootless | default(['', '', ''], true))[2] | split(',') | reject('eq', '')
+         | map('regex_replace', '-run$', '') | list | difference(rootless_projects) }}
+
+- name: Маршруты Traefik к их контейнерам без root — выключены
+  ansible.builtin.systemd:
+    name: "project-traefik@{{ item }}"
+    state: stopped
+    enabled: false
+  loop: "{{ rootless_gone }}"
+
+# Файлы, которые создали контейнеры без root, — обратно номерам контейнеров общего Docker. Один раз:
+# ниже пользователь выходит из группы rootless, и в следующий apply проект уже не «убранный»
+- name: Их файлы — обратно контейнерам общего Docker
+  ansible.builtin.command: project-rootless-files {{ item }} to-rootful
+  loop: "{{ rootless_gone }}"
+  changed_when: true
+
+- name: Файлы их маршрутов и отметки прав убраны
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ rootless_gone | map('regex_replace', '^(.+)$', '/srv/infra/traefik/dynamic/rootless-\\1.yml') | list
+            + rootless_gone | map('regex_replace', '^(.+)$', '/var/lib/infra-rootless/\\1.acl') | list }}"
+
+# Без linger systemd пользователя останавливается, а с ним — его Docker и контейнеры
+- name: Их Docker без root остановлен (linger выключен)
+  ansible.builtin.command: loginctl disable-linger {{ item }}-run
+  args:
+    removes: "/var/lib/systemd/linger/{{ item }}-run"
+  loop: "{{ rootless_gone }}"
+
+- name: Пользователи остановленных проектов — без группы rootless
+  ansible.builtin.user:
+    name: "{{ item }}-run"
+    groups: ["{{ item }}-dev"]
+    append: false
+  loop: "{{ rootless_gone }}"
+
+# Проектов без root не осталось: список для скриптов пустой — project-compose и остальные ведут
+# все проекты в общий Docker; правило sudo для участников — убрано
+- name: Проектов без root не осталось — их список и правило sudo убраны
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: [/usr/local/etc/infra-rootless.json, /etc/sudoers.d/infra-rootless]
+  when: rootless_projects | length == 0
