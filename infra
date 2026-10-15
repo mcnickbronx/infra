@@ -636,7 +636,7 @@ cmd_status() {
   else
     # Проект|состояние|разовый (compose run)|все метки — по ним сайты (Host в правилах Traefik).
     # Из общего Docker и из Docker каждого проекта без root (rootless: true)
-    containers=$(for host in "" $(jq -r '.[].sock' /usr/local/etc/infra-rootless.json 2>/dev/null); do
+    containers=$(for host in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootless.json 2>/dev/null); do
       env ${host:+DOCKER_HOST="$host"} docker ps -aq 2>/dev/null | xargs -r env ${host:+DOCKER_HOST="$host"} docker inspect --format \
         '{{index .Config.Labels "com.docker.compose.project"}}|{{.State.Status}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{range .Config.Labels}}{{.}} {{end}}' 2>/dev/null || true
     done)

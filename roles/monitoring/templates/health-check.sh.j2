@@ -403,7 +403,7 @@ check_failed_units
 check_ssh_open
 check_rootless
 # Контейнеры — в общем Docker и в Docker каждого проекта без root (rootless: true)
-for DOCKER_HOST in "" $(jq -r '.[].sock' /usr/local/etc/infra-rootless.json 2>/dev/null); do
+for DOCKER_HOST in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootless.json 2>/dev/null); do
   if [ -n "$DOCKER_HOST" ]; then export DOCKER_HOST; else unset DOCKER_HOST; fi
   check_restarting
   check_crashed

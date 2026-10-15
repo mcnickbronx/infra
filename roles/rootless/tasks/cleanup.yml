@@ -1,21 +1,31 @@
-# Проект, у которого убрали rootless, — обратно в общий Docker одним apply: остановка в его Docker
-# без root, файлы — номерам контейнеров общего Docker, адрес базы — шлюз его сети, запуск (автовыкладка
-# выкладывает заново, без неё — project-compose up -d). Затем его Docker без root и маршруты
-# останавливаются. Пользователь <проект>-run и его данные (образы в /home/<проект>-run) остаются —
-# удалить вручную (README, «Проекты без root»). Проект, убранный из server.yml совсем, только
-# останавливается.
-- name: Пользователи проектов без root на сервере (группа rootless)
-  ansible.builtin.getent:
-    database: group
-    key: rootless
-    fail_key: false
+# Уборка за проектами без root, одним apply:
+#   - проект, у которого убрали rootless (или убрали его из server.yml), — обратно в общий Docker:
+#     остановка в Docker его группы, файлы — номерам контейнеров общего Docker, адрес базы — шлюз его
+#     сети, запуск (автовыкладка выкладывает заново, без неё — project-compose up -d). Убранный из
+#     server.yml совсем — только останавливается;
+#   - группа, в которой не осталось проектов, — её Docker останавливается. Пользователь <группа>-run
+#     и его данные (образы в /home/<группа>-run) остаются — удалить вручную (README, «Проекты без root»).
+# Какой группой проект уже переведён — отметка setup.yml (/var/lib/infra-rootless/<проект>.acl:
+# «docker <пользователь группы>», у v1.8.0 — пустая или «docker», пользователь — <проект>-run)
+- name: Переведённые проекты и пользователи их групп (по отметкам)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    for f in /var/lib/infra-rootless/*.acl; do
+      [ -f "$f" ] || continue
+      p=$(basename "$f" .acl); u=""
+      read -r _rt u < "$f" || true
+      echo "$p ${u:-$p-run}"
+    done
+  args:
+    executable: /bin/bash
+  register: rootless_marks
+  changed_when: false
   check_mode: false
 
 - name: Проекты, которым убрали rootless
   ansible.builtin.set_fact:
-    rootless_gone: >-
-      {{ ((getent_group | default({})).rootless | default(['', '', ''], true))[2] | split(',') | reject('eq', '')
-         | map('regex_replace', '-run$', '') | list | difference(rootless_projects) }}
+    rootless_marked: "{{ dict(rootless_marks.stdout_lines | map('split', ' ')) }}"
+    rootless_gone: "{{ rootless_marks.stdout_lines | map('split', ' ') | map('first') | difference(rootless_projects) }}"
 
 # Раньше перевода: project-compose и project-db-env спрашивают этот список (setup.yml его уже
 # переписал, если проекты без root ещё остались)
@@ -36,22 +46,22 @@
 - name: Проекты, которым убрали rootless, — обратно в общий Docker
   ansible.builtin.shell: |
     set -euo pipefail
-    p={{ item | quote }} w=/srv/projects/{{ item }}/web
-    uid=$(id -u "$p-run")
-    if [ -S "/run/user/$uid/docker.sock" ]; then
-      export DOCKER_HOST=unix:///run/user/$uid/docker.sock
+    p={{ item | quote }} w=/srv/projects/{{ item }}/web user={{ rootless_marked[item] | quote }}
+    sock=/run/user/$(id -u "$user")/docker.sock
+    if [ -S "$sock" ]; then
+      export DOCKER_HOST=unix://$sock
       vols=$(docker volume ls -q --filter "label=com.docker.compose.project=$p" | xargs)
       if [ -n "$vols" ]; then
         echo "$p: тома в Docker без root ($vols) сами не переезжают — перенесите вручную (README, «Проекты без root»)" >&2
         exit 1
       fi
       # образ — заранее в общий Docker: простой — только на перезапуск
-      image=$(sed -n 's/^DEPLOY_IMAGE=//p' "$w/.env" 2>/dev/null | tail -1 | tr -d "\"'")
+      image=""; [ ! -f "$w/.env" ] || image=$(sed -n 's/^DEPLOY_IMAGE=//p' "$w/.env" | tail -1 | tr -d "\"'")
       [ -z "$image" ] || env -u DOCKER_HOST docker pull -q "$image" >/dev/null || true
       docker compose -p "$p" down 2>&1 | tail -n 3
       unset DOCKER_HOST
     fi
-    project-rootless-files "$p" to-rootful
+    project-rootless-files "$p" to-rootful "$user"
     {% if item in projects %}
     {% if projects[item].db is defined %}
     [ ! -f "$w/.env" ] || project-db-env "$p"
@@ -70,24 +80,39 @@
   changed_when: true
   when: not ansible_check_mode
 
-- name: Файлы их маршрутов и отметки перевода убраны
+- name: Файлы их маршрутов, лимитов и отметки перевода убраны
   ansible.builtin.file:
     path: "{{ item }}"
     state: absent
   loop: "{{ rootless_gone | map('regex_replace', '^', '/srv/infra/traefik/dynamic/rootless-') | map('regex_replace', '$', '.yml') | list
+            + rootless_gone | map('regex_replace', '^', '/etc/systemd/user/proj-') | map('regex_replace', '$', '.slice') | list
             + rootless_gone | map('regex_replace', '^', '/var/lib/infra-rootless/') | map('regex_replace', '$', '.acl') | list }}"
+
+# ---------- Группы, в которых не осталось проектов ----------
+- name: Пользователи групп проектов без root на сервере (группа rootless)
+  ansible.builtin.getent:
+    database: group
+    key: rootless
+    fail_key: false
+  check_mode: false
+
+- name: Пользователи групп, которые больше не нужны
+  ansible.builtin.set_fact:
+    rootless_unused: >-
+      {{ ((getent_group | default({})).rootless | default(['', '', ''], true))[2] | split(',') | reject('eq', '')
+         | list | difference(rootless_groups | map('regex_replace', '$', '-run') | list) }}
 
 # Без linger systemd пользователя останавливается, а с ним — его Docker
 - name: Их Docker без root остановлен (linger выключен)
-  ansible.builtin.command: loginctl disable-linger {{ item }}-run
+  ansible.builtin.command: loginctl disable-linger {{ item }}
   args:
-    removes: "/var/lib/systemd/linger/{{ item }}-run"
-  loop: "{{ rootless_gone }}"
+    removes: "/var/lib/systemd/linger/{{ item }}"
+  loop: "{{ rootless_unused }}"
 
-# Вне группы rootless проект больше не «убранный»: следующий apply его не трогает
-- name: Пользователи этих проектов — без группы rootless
+# Вне группы rootless пользователь больше не «ненужный»: следующий apply его не трогает
+- name: Эти пользователи — без группы rootless и групп проектов
   ansible.builtin.user:
-    name: "{{ item }}-run"
-    groups: ["{{ item }}-dev"]
+    name: "{{ item }}"
+    groups: []
     append: false
-  loop: "{{ rootless_gone }}"
+  loop: "{{ rootless_unused }}"

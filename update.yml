@@ -61,7 +61,7 @@
     - name: Docker без root у проектов — перезапуск после обновления Docker
       ansible.builtin.shell: |
         set -euo pipefail
-        for u in $(jq -r '.[].user' /usr/local/etc/infra-rootless.json); do
+        for u in $(jq -r '[.[].user] | unique[]' /usr/local/etc/infra-rootless.json); do
           systemctl --user -M "$u@" restart infra-docker
           echo "$u"
         done

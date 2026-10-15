@@ -56,16 +56,18 @@
     state: link
     force: true
 
-# ---------- Пользователи проектов ----------
-# <проект>-dev — читать и писать web/ (compose.yml, .env); rootless — видеть процессы (base, hidepid)
-- name: Пользователи проектов без root (<проект>-run)
+# ---------- Пользователи групп ----------
+# Группа (rootless: <имя> у проектов; true — группа из одного проекта) — пользователь <группа>-run.
+# <проект>-dev всех проектов группы — читать и писать их web/; rootless — видеть процессы (base, hidepid)
+- name: Пользователи групп проектов без root (<группа>-run)
   ansible.builtin.user:
     name: "{{ item }}-run"
-    comment: "Контейнеры проекта {{ item }} без root (infra)"   # двоеточие в комментарии useradd не примет
+    comment: "Контейнеры группы {{ item }} без root (infra)"   # двоеточие в комментарии useradd не примет
     shell: /usr/sbin/nologin
-    groups: ["{{ item }}-dev", rootless]
+    groups: "{{ rootless_group_of | dict2items | selectattr('value', 'eq', item) | map(attribute='key')
+                | map('regex_replace', '$', '-dev') | list + ['rootless'] }}"
     append: false
-  loop: "{{ rootless_projects }}"
+  loop: "{{ rootless_groups }}"
 
 - name: Номера пользователей
   ansible.builtin.getent:
@@ -78,8 +80,8 @@
   loop: [/etc/subuid, /etc/subgid]
   register: rootless_subids
 
-# info[проект] = user, uid, gid, subgid (первый gid диапазона), sock, ports, db_host.
-# В --check у нового проекта пользователя ещё нет — его пропускаем
+# info[проект] = group, user (<группа>-run), uid, gid, subgid (первый gid диапазона), sock, ports, db_host.
+# В --check у новой группы пользователя ещё нет — её проекты пропускаем
 - name: Проекты без root — пользователи, диапазоны, сокеты
   ansible.builtin.set_fact:
     rootless_info: >-
@@ -89,10 +91,10 @@
       {%-   set _ = subgid.update({f[0]: f[1] | int}) -%}
       {%- endfor -%}
       {%- set info = {} -%}
-      {%- for p in rootless_projects if (p ~ '-run') in getent_passwd -%}
-      {%-   set u = p ~ '-run' -%}
+      {%- for p in rootless_projects if (rootless_group_of[p] ~ '-run') in getent_passwd -%}
+      {%-   set u = rootless_group_of[p] ~ '-run' -%}
       {%-   set uid = getent_passwd[u][1] | int -%}
-      {%-   set _ = info.update({p: {'user': u, 'uid': uid, 'gid': getent_passwd[u][2] | int,
+      {%-   set _ = info.update({p: {'group': rootless_group_of[p], 'user': u, 'uid': uid, 'gid': getent_passwd[u][2] | int,
                                      'subgid': subgid[u] | default(0),
                                      'sock': 'unix:///run/user/' ~ uid ~ '/docker.sock',
                                      'ports': rootless_port_base + (projects[p].net | int) * 20,
@@ -100,32 +102,33 @@
       {%- endfor -%}
       {{ info }}
 
-- name: У пользователей проектов без root есть subuid и subgid
+- name: У пользователей групп есть subuid и subgid
   ansible.builtin.assert:
     that: rootless_info.values() | selectattr('subgid', 'eq', 0) | list | length == 0
     fail_msg: "Нет диапазона в /etc/subgid у {{ rootless_info.values() | selectattr('subgid', 'eq', 0) | map(attribute='user') | list }}"
     quiet: true
 
-- name: Docker пользователя работает без его входа (linger)
+- name: Docker группы работает без входа её пользователя (linger)
   ansible.builtin.command: loginctl enable-linger {{ item }}-run
   args:
     creates: "/var/lib/systemd/linger/{{ item }}-run"
-  loop: "{{ rootless_projects }}"
+  loop: "{{ rootless_groups }}"
 
-- name: systemd пользователя запущен
+# Дальше — по пользователю группы: один Docker на всю группу
+- name: systemd пользователя группы запущен
   ansible.builtin.wait_for:
-    path: "/run/user/{{ item.value.uid }}/systemd/private"
+    path: "/run/user/{{ item.uid }}/systemd/private"
     timeout: 60
-  loop: "{{ rootless_info | dict2items }}"
+  loop: "{{ rootless_info.values() | unique(attribute='user') | list }}"
   loop_control:
-    label: "{{ item.value.user }}"
+    label: "{{ item.user }}"
   when: not ansible_check_mode
 
 # Новая служба или настройки — перечитать и перезапустить; иначе — только запустить
-- name: Docker без root запущен
+- name: Docker группы без root запущен
   ansible.builtin.shell: |
     set -euo pipefail
-    u={{ item.value.user | quote }}
+    u={{ item.user | quote }}
     sc() { systemctl --user -M "$u@" "$@"; }
     if [ {{ (rootless_unit is changed or rootless_daemon_json is changed) | string | quote }} = True ]; then
       sc daemon-reload; sc restart infra-docker; echo changed
@@ -134,20 +137,20 @@
     fi
   args:
     executable: /bin/bash
-  loop: "{{ rootless_info | dict2items }}"
+  loop: "{{ rootless_info.values() | unique(attribute='user') | list }}"
   loop_control:
-    label: "{{ item.value.user }}"
+    label: "{{ item.user }}"
   register: rootless_started
   changed_when: "'changed' in rootless_started.stdout"
   when: not ansible_check_mode
 
-- name: Сокет Docker без root готов
+- name: Сокет Docker группы готов
   ansible.builtin.wait_for:
-    path: "/run/user/{{ item.value.uid }}/docker.sock"
+    path: "/run/user/{{ item.uid }}/docker.sock"
     timeout: 60
-  loop: "{{ rootless_info | dict2items }}"
+  loop: "{{ rootless_info.values() | unique(attribute='user') | list }}"
   loop_control:
-    label: "{{ item.value.user }}"
+    label: "{{ item.user }}"
   when: not ansible_check_mode
 
 # Список для скриптов (project-docker-host, project-compose, project-traefik, бэкап, health-check)
@@ -201,21 +204,35 @@
     state: directory
     mode: "0700"
 
-- name: Перевод проектов на Docker без root (один раз)
+# Отметка /var/lib/infra-rootless/<проект>.acl — «docker <пользователь группы>», чьим Docker проект уже
+# работает (у v1.8.0 — пустая или «docker»: пользователь <проект>-run). Нет отметки — переезд из общего
+# Docker; другой пользователь — проект перешёл в другую группу: остановка в Docker прежней группы,
+# владельцы файлов — от её номеров к номерам новой (через номера общего Docker)
+- name: Перевод проектов в Docker их группы (один раз)
   ansible.builtin.shell: |
     set -euo pipefail
-    p={{ item.key | quote }} w=/srv/projects/{{ item.key }}/web
-    vols=$(env -u DOCKER_HOST docker volume ls -q --filter "label=com.docker.compose.project=$p" | xargs)
+    p={{ item.key | quote }} w=/srv/projects/{{ item.key }}/web m=/var/lib/infra-rootless/{{ item.key }}.acl
+    user={{ item.value.user | quote }}
+    was=""
+    if [ -f "$m" ]; then read -r _rt was < "$m" || true; was=${was:-$p-run}; fi
+    [ "$was" != "$user" ] || exit 0
+    if [ -z "$was" ]; then old=""; else old=unix:///run/user/$(id -u "$was")/docker.sock; fi
+    vols=$(env ${old:+DOCKER_HOST=$old} docker volume ls -q --filter "label=com.docker.compose.project=$p" 2>/dev/null | xargs || true)
     if [ -n "$vols" ]; then
-      echo "$p: тома в общем Docker ($vols) сами не переезжают — перенесите вручную (README, «Проекты без root»)" >&2
+      echo "$p: тома ($vols) сами не переезжают — перенесите вручную (README, «Проекты без root»)" >&2
       exit 1
     fi
-    # образ — заранее в Docker проекта (вход в ghcr — у root): простой — только на перезапуск
-    image=$(sed -n 's/^DEPLOY_IMAGE=//p' "$w/.env" 2>/dev/null | tail -1 | tr -d "\"'")
+    # образ — заранее в Docker группы (вход в ghcr — у root): простой — только на перезапуск
+    image=""; [ ! -f "$w/.env" ] || image=$(sed -n 's/^DEPLOY_IMAGE=//p' "$w/.env" | tail -1 | tr -d "\"'")
     [ -z "$image" ] || DOCKER_HOST={{ item.value.sock | quote }} docker pull -q "$image" >/dev/null
-    env -u DOCKER_HOST docker compose -p "$p" down 2>&1 | tail -n 3
-    project-rootless-files "$p" to-rootless
-    spec="u:{{ item.value.user }}:rwX"
+    if [ -z "$was" ]; then
+      env -u DOCKER_HOST docker compose -p "$p" down 2>&1 | tail -n 3
+    else
+      DOCKER_HOST=$old docker compose -p "$p" down 2>&1 | tail -n 3 || true
+      project-rootless-files "$p" to-rootful "$was"
+    fi
+    project-rootless-files "$p" to-rootless "$user"
+    spec="u:$user:rwX"
     for g in {{ docker_remap_web_gids | join(' ') }}; do
       if [ "$g" = 0 ]; then id={{ item.value.gid }}; else id=$(( {{ item.value.subgid }} + g - 1 )); fi
       spec="$spec,g:$id:rwX"
@@ -223,50 +240,73 @@
     setfacl -n -P -R -m "$spec" "$w"
     find "$w" -mindepth 1 -type d -exec setfacl -n -P -m "$(sed 's/\(^\|,\)/\1d:/g' <<<"$spec")" {} +
     {% if projects[item.key].db is defined %}
-    [ ! -f "$w/.env" ] || project-db-env "$p"
+    [ -n "$was" ] || [ ! -f "$w/.env" ] || project-db-env "$p"
     {% endif %}
     rm -f /var/lib/project-deploy/"$p".{current,previous,failed,failed-ref}
     {% if item.key in autodeploy_projects %}
     systemctl start --no-block "project-deploy@$p.service"
-    echo "$p: выложит автовыкладка — уже в Docker без root"
+    echo "$p: переведён в Docker группы {{ item.value.group }}, выложит автовыкладка"
     {% else %}
     project-compose "$p" up -d
+    echo "$p: переведён в Docker группы {{ item.value.group }}"
     {% endif %}
-    touch /var/lib/infra-rootless/"$p".acl
+    echo "docker $user" > "$m"
   args:
     executable: /bin/bash
-    creates: "/var/lib/infra-rootless/{{ item.key }}.acl"
+  register: rootless_moved
+  changed_when: "'переведён' in rootless_moved.stdout"
   loop: "{{ rootless_info | dict2items }}"
   loop_control:
-    label: "{{ item.key }}"
+    label: "{{ item.key }} → {{ item.value.group }}"
   when: not ansible_check_mode
 
-- name: Папки лимитов user-<uid>.slice.d
+# ---------- Лимиты ----------
+# Общий лимит группы — на всего её пользователя (Docker и контейнеры): сумма лимитов её проектов.
+# Свой лимит у каждого проекта — его slice proj-<проект>.slice в systemd пользователя группы
+# (контейнеры попадают туда через cgroup_parent в base.yml, как у общего Docker)
+- name: Папки лимитов групп (user-<uid>.slice.d)
   ansible.builtin.file:
-    path: "/etc/systemd/system/user-{{ item.value.uid }}.slice.d"
+    path: "/etc/systemd/system/user-{{ item.uid }}.slice.d"
     state: directory
     mode: "0755"
-  loop: "{{ rootless_info | dict2items }}"
+  loop: "{{ rootless_info.values() | unique(attribute='user') | list }}"
   loop_control:
-    label: "{{ item.value.user }}"
+    label: "{{ item.user }}"
 
-- name: Лимиты проектов без root — на всего пользователя (user-<uid>.slice)
+- name: Лимиты групп — на всего пользователя группы (user-<uid>.slice)
   ansible.builtin.template:
     src: slice-limits.conf.j2
-    dest: "/etc/systemd/system/user-{{ item.value.uid }}.slice.d/50-infra.conf"
+    dest: "/etc/systemd/system/user-{{ item.uid }}.slice.d/50-infra.conf"
     mode: "0644"
-  loop: "{{ rootless_info | dict2items }}"
+  loop: "{{ rootless_info.values() | unique(attribute='user') | list }}"
   loop_control:
-    label: "{{ item.key }}: {{ projects[item.key].memory | default(project_default_memory) }}"
+    label: "{{ item.group }}"
   notify: Reload systemd
 
-# Участник проекта — от имени <проект>-run: тот не root, и Docker у него без root
-- name: Участники проектов без root управляют их контейнерами (sudo -u <проект>-run)
+- name: Лимиты проектов в Docker групп (proj-<проект>.slice у systemd пользователя)
+  ansible.builtin.template:
+    src: project-slice.j2
+    dest: "/etc/systemd/user/proj-{{ item }}.slice"
+    mode: "0644"
+  loop: "{{ rootless_projects }}"
+  register: rootless_project_slices
+
+# Модуль systemd не умеет «systemd другого пользователя от root» (-M <пользователь>@) — поэтому команда
+- name: systemd пользователей групп перечитал лимиты проектов
+  ansible.builtin.command: systemctl --user -M {{ item }}-run@ daemon-reload  # noqa: command-instead-of-module
+  loop: "{{ rootless_project_slices.results | selectattr('changed') | map(attribute='item')
+            | map('extract', rootless_group_of) | unique | list }}"
+  changed_when: true
+  when: not ansible_check_mode
+
+# Участник проекта — от имени пользователя его группы: тот не root, и Docker у него без root.
+# Граница — группа: участник одного её проекта управляет контейнерами всех
+- name: Участники проектов без root управляют контейнерами группы (sudo -u <группа>-run)
   ansible.builtin.copy:
     content: |
-      # Управляется Ansible (роль rootless): участники проекта без root — от имени его пользователя
+      # Управляется Ansible (роль rootless): участники проекта без root — от имени пользователя его группы
       {% for p in rootless_projects %}
-      %{{ p }}-dev ALL=({{ p }}-run) NOPASSWD: ALL
+      %{{ p }}-dev ALL=({{ rootless_group_of[p] }}-run) NOPASSWD: ALL
       {% endfor %}
     dest: /etc/sudoers.d/infra-rootless
     mode: "0440"

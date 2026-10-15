@@ -1,0 +1,4 @@
+expect_error: "так называется другой проект"
+projects:
+  shop: {net: 5, devs: [ivan]}
+  blog: {net: 6, rootless: shop, devs: [ivan]}

@@ -152,7 +152,7 @@ projects() {
     return
   fi
   while :; do
-    CONTAINERS=$(for h in "" $(jq -r '.[].sock' /usr/local/etc/infra-rootless.json 2>/dev/null); do
+    CONTAINERS=$(for h in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootless.json 2>/dev/null); do
       env ${h:+DOCKER_HOST="$h"} docker ps -a --format \
         '{{.Label "com.docker.compose.project"}}|{{.State}}|{{.Label "com.docker.compose.oneoff"}}' 2>/dev/null
     done)

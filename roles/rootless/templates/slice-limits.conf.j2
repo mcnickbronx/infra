@@ -1,6 +1,10 @@
-# Управляется Ansible (роль rootless). Лимиты проекта {{ item.key }} (без root) — на всего его
-# пользователя {{ item.value.user }}: Docker и контейнеры. Сам Docker без root занимает ~200 МБ из них.
+# Управляется Ansible (роль rootless). Лимиты группы {{ item.group }} проектов без root — на всего её
+# пользователя {{ item.user }}: Docker и контейнеры всех её проектов. Сумма лимитов проектов группы
+# (у каждого проекта ещё свой — proj-<проект>.slice); сам Docker без root занимает ~120 МБ из них.
+{% set members = rootless_group_of | dict2items | selectattr('value', 'eq', item.group) | map(attribute='key') | list %}
 [Slice]
-MemoryMax={{ (projects[item.key].memory | default(project_default_memory)) | upper }}
-CPUQuota={{ ((projects[item.key].cpus | default(project_default_cpus)) | float * 100) | round | int }}%
-TasksMax=4096
+MemoryMax={{ members | map('extract', projects) | map(attribute='memory', default=project_default_memory)
+              | map('upper') | map('human_to_bytes') | sum }}
+CPUQuota={{ (members | map('extract', projects) | map(attribute='cpus', default=project_default_cpus)
+             | map('float') | sum * 100) | round | int }}%
+TasksMax=8192

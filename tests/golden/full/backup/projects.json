@@ -28,5 +28,17 @@
         "every": null,
         "hourly": null,
         "name": "lab"
+    },
+    {
+        "db": "postgres",
+        "every": null,
+        "hourly": null,
+        "name": "api_one"
+    },
+    {
+        "db": null,
+        "every": null,
+        "hourly": null,
+        "name": "api_two"
     }
 ]

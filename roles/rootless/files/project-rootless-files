@@ -2,10 +2,11 @@
 # Управляется Ansible (роль rootless). Владельцы файлов проекта при переводе между общим Docker
 # и Docker без root. Файлы, которые создали контейнеры, принадлежат на хосте «номеру контейнера»:
 #   общий Docker (userns-remap): uid N в контейнере = 100000 + N на хосте;
-#   Docker без root:             uid 0 = <проект>-run, uid N = начало его subuid + N - 1.
+#   Docker без root:             uid 0 = пользователь группы (<группа>-run), uid N = начало его subuid + N - 1.
 # Без перевода приложение после смены Docker прочитало бы свои старые файлы, но не перезаписало
 # (collectstatic, загрузки). Файлы людей (uid ниже 100000) не трогаются, по ссылкам — не идём.
-#   project-rootless-files <проект> to-rootless|to-rootful
+#   project-rootless-files <проект> to-rootless|to-rootful [пользователь группы, по умолчанию <проект>-run]
+# Из одной группы в другую — двумя шагами: to-rootful прежней, затем to-rootless новой
 import os
 import pwd
 import sys
@@ -41,11 +42,11 @@ def mapper(direction, own, sub):
 
 
 def main(argv):
-    if len(argv) != 2 or argv[1] not in ("to-rootless", "to-rootful"):
-        print("Использование: project-rootless-files <проект> to-rootless|to-rootful", file=sys.stderr)
+    if len(argv) not in (2, 3) or argv[1] not in ("to-rootless", "to-rootful"):
+        print("Использование: project-rootless-files <проект> to-rootless|to-rootful [пользователь]", file=sys.stderr)
         return 2
-    project, direction = argv
-    user = f"{project}-run"
+    project, direction = argv[:2]
+    user = argv[2] if len(argv) == 3 else f"{project}-run"
     pw = pwd.getpwnam(user)
     uid = mapper(direction, pw.pw_uid, subrange("/etc/subuid", user)[0])
     gid = mapper(direction, pw.pw_gid, subrange("/etc/subgid", user)[0])

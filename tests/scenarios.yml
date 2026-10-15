@@ -38,7 +38,7 @@
 #      до замены; база заменена целиком (таблица только dev исчезла), владелец — роль dev; расширение
 #      прода (pg_trgm) и индекс на нём — в dev; --files с группой dev; откат снимком — точно как было
 #      (project-restore очищает базу); project-db-dump.
-#  10. Проект без root lab (rootless: true, участник tester — в server.yml тестового): участник запускает его сам, без
+#  10. Проект без root lab в группе labs с lab2 (server.yml тестового; участник lab — tester): участник запускает его сам, без
 #      docker_users; маршрут Traefik из labels, база с адреса infra0, лимит на пользователя; privileged
 #      с корнем диска и env_file: /etc/shadow root не дают; том в бэкапе; health-check видит упавший Docker;
 #      автовыкладка (реестр на infra0): выкладка, отказ подготовки, маршрут Traefik переезжает, откат.
@@ -961,6 +961,9 @@
       ansible.builtin.shell: |
         set -uo pipefail
         p={{ p }} w=/srv/projects/{{ p }}/web host=rl-verify.invalid
+        u=$(project-docker-host $p user)                  # пользователь группы проекта (labs-run)
+        same=$( [ "$(project-docker-host $p sock)" = "$(project-docker-host lab2 sock)" ] && echo один-docker || echo разные)
+        echo "group=$u:$(project-docker-host lab2 user):$same"
         as_tester() { runuser -u tester -- bash -c "cd $w && $1"; }
         restic_p() { (set -a; . /etc/restic/env; set +a; restic "$@"); }
         rm -rf $w/compose.yml $w/compose.override.yml $w/files $w/.env
@@ -1014,7 +1017,7 @@
         as_tester "project-compose $p up -d --wait --quiet-pull" >/dev/null 2>&1; echo "up=$?"
         echo "tester_docker=$(runuser -u tester -- docker ps 2>&1 | grep -c 'permission denied')"
         pid=$(DOCKER_HOST=$(project-docker-host $p) docker inspect -f '{{ '{{' }}.State.Pid{{ '}}' }}' "$(project-compose $p ps -q app)")
-        sub=$(awk -F: -v u=$p-run '$1 == u {print $2}' /etc/subuid)
+        sub=$(awk -F: -v u=$u '$1 == u {print $2}' /etc/subuid)
         echo "proc_uid=$([ "$(ps -o uid= -p "$pid" | tr -d ' ')" = "$((sub + 999))" ] && echo subuid || ps -o uid= -p "$pid")"
         echo "file=$(cat $w/files/w.txt 2>&1):$(runuser -u tester -- cat $w/files/w.txt 2>&1)"
         # маршрут Traefik — из labels (служба project-traefik@<проект>)
@@ -1025,7 +1028,8 @@
         done
         echo "route=$code"
         echo "db=$(project-compose $p --profile test run --rm -T psql 2>/dev/null | tail -1)"
-        echo "limit=$(systemctl show "user-$(id -u $p-run).slice" -p MemoryMax --value)"
+        echo "limit=$(systemctl show "user-$(id -u $u).slice" -p MemoryMax --value)"
+        echo "proj_limit=$(cat /sys/fs/cgroup/user.slice/user-$(id -u $u).slice/user@$(id -u $u).service/proj.slice/proj-$p.slice/memory.max 2>&1)"
         # privileged и корень диска — запуск администратором: root в контейнере — это <проект>-run
         echo "evil=$(project-compose $p --profile evil run --rm -T evil 2>&1 | grep -E 'shadow|roothome' | tr '\n' ' ')"
         echo "etc=$([ -e /etc/verify-rootless ] && echo WRITTEN || echo clean)"
@@ -1036,7 +1040,7 @@
         rm -f $w/compose.override.yml
         # root участнику не дать, пользователя проекта — да (код возврата: у sudo-rs в 26.04 свои сообщения)
         can() { runuser -u tester -- sudo -n "$@" true >/dev/null 2>&1 && echo yes || echo no; }
-        echo "tester_sudo=$(can):$(can -u $p-run)"
+        echo "tester_sudo=$(can):$(can -u $u)"
         # том проекта — в бэкапе, восстанавливается
         project-compose $p exec -T -u 0 app sh -c 'echo v1 > /vol/m'   # том — root контейнера (на сервере <проект>-run)
         project-backup $p >/dev/null 2>&1; echo "backup=$?"
@@ -1047,9 +1051,9 @@
         project-compose $p up -d --wait >/dev/null 2>&1
         echo "vol=$(project-compose $p exec -T app cat /vol/m)"
         # Docker проекта остановлен — health-check сообщает
-        systemctl --user -M $p-run@ stop infra-docker
+        systemctl --user -M $u@ stop infra-docker
         echo "hc_down=$(/usr/local/bin/health-check.sh | grep -c "Проекты без root не работают: $p (Docker)")"
-        systemctl --user -M $p-run@ start infra-docker
+        systemctl --user -M $u@ start infra-docker
         echo "infra_status=$(infra status | grep -c "^  $p — контейнеры")"
         # уборка: маршрут уходит вместе с контейнерами
         project-compose $p down -v >/dev/null 2>&1
@@ -1073,7 +1077,9 @@
           - r.file == 'app:app'               # приложение пишет в папку, участник её читает
           - r.route == '200'                  # маршрут Traefik из labels
           - r.db == 'lab'                     # база — с адреса infra0, паролем проекта
-          - r.limit == '536870912'            # memory: 512m — на всего пользователя
+          - r.group == 'labs-run:labs-run:один-docker'   # lab и lab2 — в одной группе labs
+          - r.limit == '805306368'            # группа: 512m (lab) + 256m (lab2)
+          - r.proj_limit == '536870912'       # и у самого lab — свои 512m
           - "'noshadow' in r.evil and 'noroothome' in r.evil and 'SHADOW' not in r.evil"
           - r.etc == 'clean'
           - r.shadow == '1'                   # env_file: /etc/shadow — отказ
@@ -1096,11 +1102,12 @@
       ansible.builtin.shell: |
         set -uo pipefail
         p={{ p }} w=/srv/projects/{{ p }}/web reg={{ rootless_db_ip }}:5001 host=rl-deploy.invalid
+        u=$(project-docker-host $p user)
         cfg=/etc/infra-rootless/daemon.json
         DOCKER_HOST=$(project-docker-host $p); export DOCKER_HOST
         cp -p $cfg /tmp/verify-rl-daemon.json
         jq --arg r "$reg" '. + {"insecure-registries": [$r]}' /tmp/verify-rl-daemon.json > $cfg
-        systemctl --user -M $p-run@ restart infra-docker
+        systemctl --user -M $u@ restart infra-docker
         for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
         env -u DOCKER_HOST docker run -d --name verify-rl-registry -p $reg:5000 registry:2 >/dev/null
         b=$(mktemp -d)
@@ -1147,7 +1154,7 @@
         env -u DOCKER_HOST docker rm -f verify-rl-registry >/dev/null 2>&1
         docker images -q "$reg/verify-rl" | sort -u | xargs -r docker rmi -f >/dev/null 2>&1
         cp -p /tmp/verify-rl-daemon.json $cfg && rm -f /tmp/verify-rl-daemon.json
-        systemctl --user -M $p-run@ restart infra-docker
+        systemctl --user -M $u@ restart infra-docker
         rm -rf $w/data $w/compose.yml $w/compose.yml.prev $w/.env /var/lib/project-deploy/$p.*
       args:
         executable: /bin/bash
@@ -1163,7 +1170,7 @@
           - r.v1 == '0:v1:v1'
           - "r.v2 == '1:v1:подготовка (сервис deploy): работает прежняя версия'"
           - r.v3 == '0:v3:v3'
-          - r.deploy_user == 'lab-run'        # root в контейнере — пользователь проекта
+          - r.deploy_user == 'labs-run'       # root в контейнере — пользователь группы
           - r.rollback == '0:v1'
         fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
         quiet: true

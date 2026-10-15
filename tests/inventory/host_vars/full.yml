@@ -35,6 +35,19 @@ projects:
   lab:
     net: 30
     db: postgres
-    rootless: true                # без root: свой пользователь и Docker
+    rootless: true                # без root: своя группа — свой пользователь и Docker
     autodeploy: true              # участникам проекта без root docker_users не нужен
     devs: [kira]
+  api_one:                        # группа back: один Docker без root на два проекта
+    net: 31
+    db: postgres
+    rootless: back
+    memory: 1g
+    cpus: 1
+    devs: [ivan]
+  api_two:
+    net: 32
+    rootless: back
+    memory: 512m
+    cpus: 0.5
+    devs: [olga]

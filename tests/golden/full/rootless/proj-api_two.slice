@@ -1,0 +1,8 @@
+# Управляется Ansible (роль rootless). Лимиты проекта api_two в Docker группы back:
+# все его контейнеры (через cgroup_parent в base.yml) работают в этом slice systemd пользователя группы.
+[Unit]
+Description=Project api_two
+
+[Slice]
+MemoryMax=512M
+CPUQuota=50%

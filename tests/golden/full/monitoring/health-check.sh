@@ -21,7 +21,7 @@ DISK_CRITICAL=90    # с этого заполнения ночной бэкап
 MEM_LIMIT=10
 BACKUP_REPO=/var/backups/restic
 ACME=/srv/infra/traefik/acme/acme.json
-PROJECTS=" blog crm lab shop static "     # проекты сервера; пробелы по краям — для поиска " имя "
+PROJECTS=" api_one api_two blog crm lab shop static "     # проекты сервера; пробелы по краям — для поиска " имя "
 UPDATE_CMD="sudo infra update"
 EVENTS=/var/log/infra.log                      # журнал событий: итог ночного бэкапа
 HOURLY="shop crm"   # проекты с частыми снимками (backup_hourly)
@@ -403,7 +403,7 @@ check_failed_units
 check_ssh_open
 check_rootless
 # Контейнеры — в общем Docker и в Docker каждого проекта без root (rootless: true)
-for DOCKER_HOST in "" $(jq -r '.[].sock' /usr/local/etc/infra-rootless.json 2>/dev/null); do
+for DOCKER_HOST in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootless.json 2>/dev/null); do
   if [ -n "$DOCKER_HOST" ]; then export DOCKER_HOST; else unset DOCKER_HOST; fi
   check_restarting
   check_crashed

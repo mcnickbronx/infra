@@ -67,6 +67,7 @@ case " ${PATHS[*]} " in
 esac
 
 # Пути из снимка должны относиться к этому проекту: папка проекта, его дампы, его volumes.
+RUNUSER=$(project-docker-host "$NAME" user)   # проект без root — пользователь его группы
 # Защита от ошибки в снимке: rsync --delete по чужому пути был бы катастрофой.
 # (тома проекта называются <проект>_<ключ>, если у тома нет своего name: — правило из TEAM.md;
 #  том с другим именем остановит восстановление здесь, а не сотрёт чужое)
@@ -75,8 +76,8 @@ for p in "${PATHS[@]}"; do
     ""|*/../*|*/..) echo "В снимке некорректный путь '$p' — восстановление остановлено" >&2; exit 1 ;;
     "/srv/projects/$NAME"|"/var/backups/db/$NAME") ;;
     /var/lib/docker/volumes/"${NAME}"_*|/var/lib/docker/*/volumes/"${NAME}"_*) ;;
-    # проект без root (rootless): тома в Docker его пользователя
-    /home/"${NAME}"-run/.local/share/docker/volumes/"${NAME}"_*) ;;
+    # проект без root (rootless): тома в Docker пользователя его группы
+    /home/"${RUNUSER:-${NAME}-run}"/.local/share/docker/volumes/"${NAME}"_*) ;;
     *) echo "В снимке неожиданный путь $p — восстановление остановлено" >&2; exit 1 ;;
   esac
 done

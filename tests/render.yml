@@ -43,6 +43,7 @@
       project_default_cpus: "{{ project_default_cpus }}"
       people_groups: "{{ people_groups }}"
       rootless_projects: "{{ rootless_projects }}"
+      rootless_group_of: "{{ rootless_group_of }}"
   tasks:
     - name: Проверки инвентаря проходят
       ansible.builtin.import_role:
@@ -77,16 +78,23 @@
       loop_control:
         label: "{{ item.key }}"
 
-    # Пользователь — как на сервере (<проект>-run), uid в имени файла — нет: его даёт роль rootless
-    - name: Лимиты проектов без root (user-<uid>.slice.d/50-infra.conf)
+    # Пользователь группы — как на сервере (<группа>-run), uid в имени файла — нет: его даёт роль rootless
+    - name: Лимиты групп проектов без root (user-<uid>.slice.d/50-infra.conf)
       ansible.builtin.template:
         src: ../roles/rootless/templates/slice-limits.conf.j2
-        dest: "{{ out }}/rootless/{{ item.key }}-50-infra.conf"
+        dest: "{{ out }}/rootless/group-{{ item.group }}-50-infra.conf"
         mode: "0644"
-      loop: "{{ rootless_projects | map('regex_replace', '^(.+)$', '{\"key\": \"\\1\", \"value\": {\"user\": \"\\1-run\"}}')
+      loop: "{{ rootless_groups | map('regex_replace', '^(.+)$', '{\"group\": \"\\1\", \"user\": \"\\1-run\"}')
                 | map('from_json') | list }}"
       loop_control:
-        label: "{{ item.key }}"
+        label: "{{ item.group }}"
+
+    - name: Лимиты проектов в Docker групп (proj-<проект>.slice у systemd пользователя)
+      ansible.builtin.template:
+        src: ../roles/rootless/templates/project-slice.j2
+        dest: "{{ out }}/rootless/proj-{{ item }}.slice"
+        mode: "0644"
+      loop: "{{ rootless_projects }}"
 
     - name: Вычисляемые значения
       ansible.builtin.copy:

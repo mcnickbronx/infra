@@ -179,11 +179,28 @@
   ansible.builtin.assert:
     that:
       - projects.values() | selectattr('autodeploy', 'defined') | rejectattr('autodeploy', 'boolean') | list | length == 0
-      - projects.values() | selectattr('rootless', 'defined') | rejectattr('rootless', 'boolean') | list | length == 0
+      - projects.values() | selectattr('rootless', 'defined') | rejectattr('rootless', 'boolean')
+        | map(attribute='rootless') | map('string') | reject('match', '^[a-z][a-z0-9_]{0,27}$') | list | length == 0
       - autodeploy_projects | length == 0 or (ghcr_user != '' and ghcr_token != '')
     fail_msg: >-
-      autodeploy и rootless — true или false, без кавычек; при autodeploy: true в {{ infra_dir }}/secrets.yml нужны
+      autodeploy — true или false, без кавычек; rootless — true, false или имя группы (строчные латинские
+      буквы, цифры и _, до 28 символов); при autodeploy: true в {{ infra_dir }}/secrets.yml нужны
       ghcr_user и ghcr_token (токен GitHub classic с правом read:packages)
+    quiet: true
+
+# Группа проектов без root, названная как чужой проект, — это один пользователь <имя>-run и один Docker
+# на двоих: проект оказался бы в группе, где его не ждут
+- name: Группа проектов без root не называется как другой проект
+  vars:
+    clash: >-
+      {%- set c = [] -%}
+      {%- for g in rootless_groups if g in projects and rootless_group_of.get(g) != g -%}
+      {%-   set _ = c.append(g) -%}
+      {%- endfor -%}
+      {{ c }}
+  ansible.builtin.assert:
+    that: clash | length == 0
+    fail_msg: "rootless: {{ clash }} — так называется другой проект; у группы проектов без root — своё имя (back, front…)"
     quiet: true
 
 # Автовыкладка без проверки запускает от root compose.yml из образа, а образ выбирает .env проекта:

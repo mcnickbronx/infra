@@ -3,8 +3,17 @@
 # Все люди с доступом к этому серверу (участники его проектов)
 host_people: "{{ projects.values() | map(attribute='devs', default=[]) | flatten | unique }}"
 
-# Проекты без root (rootless: true): свой пользователь <проект>-run и свой Docker без root
+# Проекты без root (rootless: true или имя группы). У группы — свой пользователь <группа>-run и свой
+# Docker без root; true — группа из одного проекта, по его имени
 rootless_projects: "{{ projects | dict2items | selectattr('value.rootless', 'defined') | selectattr('value.rootless') | map(attribute='key') | list }}"
+# {проект: группа}, например {shop_back: back, shop_front: front, blog: blog}
+rootless_group_of: >-
+  {%- set groups = {} -%}
+  {%- for p in rootless_projects -%}
+  {%-   set _ = groups.update({p: p if projects[p].rootless is sameas true else projects[p].rootless | string}) -%}
+  {%- endfor -%}
+  {{ groups }}
+rootless_groups: "{{ rootless_group_of.values() | unique | list }}"
 
 # Проекты с автовыкладкой из реестра образов (autodeploy: true)
 autodeploy_projects: "{{ projects | dict2items | selectattr('value.autodeploy', 'defined') | selectattr('value.autodeploy') | map(attribute='key') | list }}"
