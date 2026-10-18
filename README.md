@@ -83,7 +83,7 @@ Ubuntu: удалили движок — сервер работает дальш
 ```bash
 ssh root@<IP>
 git clone -q https://github.com/mcnickbronx/infra.git /opt/infra
-git -C /opt/infra checkout -q v1.8.0          # последняя версия — CHANGELOG.md
+git -C /opt/infra checkout -q v1.9.1          # последняя версия — CHANGELOG.md
 /opt/infra/install.sh
 infra init     # имя сервера, email для Let's Encrypt, ваши SSH-ключи и IP — и сервер настроится
 ```

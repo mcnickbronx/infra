@@ -48,7 +48,7 @@ A fresh VDS with Ubuntu 26.04 (24.04 works too, see Limitations), root login by 
 ```bash
 ssh root@<IP>
 git clone -q https://github.com/mcnickbronx/infra.git /opt/infra
-git -C /opt/infra checkout -q v1.8.0          # latest version — CHANGELOG.md
+git -C /opt/infra checkout -q v1.9.1          # latest version — CHANGELOG.md
 /opt/infra/install.sh
 infra init     # server name, Let's Encrypt email, your SSH keys and IPs — then the server is set up
 ```
