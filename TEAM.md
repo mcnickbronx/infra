@@ -386,7 +386,38 @@ middlewares — `<проект>` или `<проект>-что-угодно`: о
 - Свежие данные прода в dev-проекте (проверить миграцию на настоящих данных) — попросите
   администратора: он заменит базу `<проект>_dev` копией прода одной командой (ADMIN.md).
 - Поднимать свою базу в контейнере **нельзя**: её не будет в нормальных бэкапах.
-  Нужна база, другой пользователь или расширение — к администратору.
+  Нужна ещё база или другой пользователь — к администратору.
+
+**Расширения Postgres** ставит миграция проекта — тогда они одинаковые на проде, в dev, в CI
+и у вас, а не только там, где их поставили руками.
+- **Доверенные** — `pg_trgm`, `unaccent`, `citext`, `hstore`, `pgcrypto`, `uuid-ossp`, `ltree`,
+  `btree_gin`, `btree_gist`, `fuzzystrmatch` и ещё несколько (весь список:
+  `SELECT DISTINCT name FROM pg_available_extension_versions WHERE trusted ORDER BY 1`). Их ставит сам пользователь
+  проекта: он владелец своей базы, администратор не нужен. Пример — поиск с опечатками на `pg_trgm`
+  в Django: пустая миграция `python manage.py makemigrations <модуль> --empty -n pg_trgm`, в неё —
+  ```python
+  from django.contrib.postgres.operations import TrigramExtension
+  from django.db import migrations
+
+  class Migration(migrations.Migration):
+      dependencies = [("<модуль>", "<предыдущая миграция>")]
+      operations = [TrigramExtension()]   # другое расширение — CreateExtension("unaccent")
+  ```
+  После `migrate` запрос `SELECT word_similarity('новасти', 'Новости компании')` даёт 0,45: опечатка
+  похожа на слово «Новости». В Django — по ней отбор и сортировка (`django.contrib.postgres`
+  в `INSTALLED_APPS`):
+  ```python
+  from django.contrib.postgres.search import TrigramWordSimilarity
+
+  Page.objects.annotate(match=TrigramWordSimilarity("новасти", "title")).filter(match__gt=0.3).order_by("-match")
+  ```
+  Готовые `title__trigram_similar` и `__trigram_word_similar` для опечаток строже: их пороги — 0,3
+  от всей строки и 0,6 от слова, и «Новости компании» по «новасти» они не найдут. Ложное совпадение
+  может оказаться выше нужного: «Новая услуга» — 0,5 против 0,45. Без Django — `CREATE EXTENSION IF NOT EXISTS
+  pg_trgm` в миграции вашего инструмента.
+- **Остальные** (PostGIS, pgvector) ставит только суперпользователь: попросите администратора
+  (ADMIN.md, «Остальное»). После этого миграция с тем же расширением проходит: Django
+  (`CreateExtension("postgis")`, для pgvector — `CreateExtension("vector")`) уже поставленное пропускает, без Django — `IF NOT EXISTS`.
 
 **Тесты Django** создают базу `test_<проект>` — на сервере это не работает (создавать базы
 пользователю проекта нельзя). Тесты гоняют в CI или локально.
@@ -396,8 +427,8 @@ middlewares — `<проект>` или `<проект>-что-угодно`: о
 не нужны. Чтобы «в CI зелёное» значило «на сервере заработает»:
 - Тестовая база в CI — **не суперпользователь**, а владелец своей базы, как на сервере
   (создать отдельного пользователя с `CREATEDB` для тестовой базы). Иначе миграция
-  с `CREATE EXTENSION` пройдёт в CI и упадёт при выкладке: на сервере расширения ставит
-  администратор.
+  с недоверенным расширением (PostGIS, pgvector) пройдёт в CI и упадёт при выкладке;
+  доверенные (`pg_trgm` и др.) владелец базы ставит сам — и в CI, и на сервере.
 - **Версия Postgres — как на сервере** (сейчас 17). Сменится на
   серверах — поменять и в workflow.
 - Тесты идут на **пустой базе**. Миграции, которые меняют данные, проверяйте на dev-проекте

@@ -290,6 +290,7 @@ Telegram недоступен — следующая попытка через �
 | Обновить сервер (Docker, Postgres, Traefik, ядро) — раз в неделю | `sudo infra update`, сначала на тестовом («Обновления») |
 | Проекту мало памяти / CPU | `memory: 4g` / `cpus: 2` в блоке проекта → `sudo infra apply --tags project` |
 | Своя строка в `pg_hba`, своя настройка Postgres, свой роутер Traefik | «Что можно менять руками» выше |
+| Проекту нужно PostGIS или pgvector | `sudo apt-get install -y postgresql-17-postgis-3` (pgvector — `postgresql-17-pgvector`, расширение `vector`), затем `sudo -u postgres psql -d <проект> -c 'CREATE EXTENSION postgis'` — и в `<проект>_dev`, если он есть. Пакет запишите комментарием в `server.yml`: на новом сервере и при смене версии Postgres его ставят заново, иначе восстановление базы проекта остановится на расширении. Доверенные расширения (`pg_trgm`, `unaccent`…) проект ставит сам миграцией (TEAM.md, «Расширения Postgres») |
 | Сайт переводят на CDN | сначала доработать лимиты Traefik (комментарий в `roles/traefik/templates/middlewares.yml.j2`) и проверить на тестовой VDS: иначе все посетители сайта придут с адресов CDN и упрутся в лимит одного IP |
 | Сменился ваш IP | `admin_ips` в `server.yml` → `sudo infra apply` (со старого IP, пока пускает; иначе — консоль хостера, ниже). Полный: IP администратора — ещё в белом списке CrowdSec и в `admin-only` Traefik |
 
