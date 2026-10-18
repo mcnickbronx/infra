@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Установка движка на сервер — как установка панели. На новом сервере с Ubuntu 26.04, от root:
-#   git clone -q https://github.com/mcnickbronx/infra.git /opt/infra && git -C /opt/infra checkout -q <версия>
-#   /opt/infra/install.sh                                                 (ADMIN.md, «Новый сервер»)
+# клон в /opt/infra, последняя подписанная версия и этот файл — команды в ADMIN.md, «Новый сервер».
 # Ставит Ansible в /opt/infra/.venv (версии — requirements-server.txt и requirements.yml), команду
 # infra и папку /etc/infra с secrets.yml из образца — с пустыми строками под ключи, которые
 # вписываете вы (пароли допишет первый sudo infra apply); server.yml создаёт sudo infra init.

@@ -93,9 +93,10 @@ SSH открыт только с ваших IP — остальной интер
 У себя: `ssh root@<IP>`. Затем на сервере:
 
 ```bash
-git clone -q https://github.com/mcnickbronx/infra.git /opt/infra
-git -C /opt/infra checkout -q v1.9.1          # последняя версия — CHANGELOG.md
-/opt/infra/install.sh
+git clone -q https://github.com/mcnickbronx/infra.git /opt/infra && cd /opt/infra
+# Самая новая версия с подписью автора (ключ — в SIGNERS); такой нет — команда остановится
+v=$(for t in $(git tag -l 'v*' --sort=-v:refname); do ./infra tag-signed "$t" && echo "$t" && break; done)
+echo "Версия: ${v:?нет версии с подписью автора}" && git checkout -q "refs/tags/$v" && ./install.sh
 infra init
 ```
 

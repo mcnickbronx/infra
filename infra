@@ -673,7 +673,9 @@ case $command in
   menu) check_setup "$command"; INFRA_WHO=$WHO exec "$ENGINE/infra-menu" ;;
   edit|status|apply|update|upgrade|run) check_setup "$command"; "cmd_$command" "$@" ;;
   run-unit) check_setup "$command"; run_unit "$@" ;;      # служебная: её запускает служба infra-apply
-  tag-signed) tag_signed "${1:?}" ;;                      # служебная: меню показывает только подписанные версии
+  # tag-signed — служебная: на ней меню показывает только подписанные версии, а установка по докам
+  # (ADMIN.md, «Новый сервер») выбирает самую новую подписанную
+  tag-signed) tag_signed "${1:?}" ;;
   -h|--help|help) usage 0 ;;
   *) echo "infra: неизвестная команда «$command»" >&2; usage 1 ;;
 esac
