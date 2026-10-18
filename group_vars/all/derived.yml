@@ -57,3 +57,7 @@ people_groups: >-
 # IP, которым открыт SSH/SFTP: администратор и участники проектов сервера.
 people_ips: "{{ host_people | map('extract', people) | map(attribute='ips', default=[]) | flatten }}"
 ssh_allowed_ips: "{{ (admin_ips + people_ips) | unique }}"
+
+# Свой адрес сервера — IPv4 основного интерфейса (факты Ansible). CrowdSec его не банит: проект
+# без root ходит к своим доменам с публичного IPv4 сервера (DECISIONS.md, «CrowdSec»)
+server_ips: "{{ [ansible_facts['default_ipv4']['address'] | default('')] | select | list }}"

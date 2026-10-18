@@ -26,7 +26,8 @@ and YAML instead of buttons.
 - **People and access:** Linux accounts per person, SSH/SFTP only into their projects' folders; SSH by
   key from an IP allowlist; an access link opens SSH for your current IP for 24 hours.
 - **Security:** only 80/443 open, container ports bound to 127.0.0.1 by default, userns-remap,
-  CrowdSec bans in the firewall (never your IPs or your members'), nightly Ubuntu security updates.
+  CrowdSec bans in the firewall (never your IPs, your members' or the server's own address), nightly
+  Ubuntu security updates.
   Experimental: `rootless: true` per project — its own Linux user and rootless Docker, so a project's
   `compose.yml` can't give anyone root on the server (~100 MB of RAM per project).
 - **Backups (restic):** nightly per-project snapshots (files, volumes, DB dump) plus `/etc`; frequent

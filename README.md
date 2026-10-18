@@ -44,7 +44,8 @@ Ubuntu: удалили движок — сервер работает дальш
 **Защита**
 - снаружи открыты только 80 и 443, порты контейнеров по умолчанию — на 127.0.0.1;
 - root в контейнере — не root на хосте (userns-remap), `no-new-privileges` для всех контейнеров;
-- CrowdSec банит атакующих в файрволе по логам SSH и Traefik; ваши IP и IP участников — никогда;
+- CrowdSec банит атакующих в файрволе по логам SSH и Traefik; ваши IP, IP участников и адрес
+  самого сервера — никогда;
 - обновления безопасности Ubuntu ставятся каждую ночь сами.
 
 **Бэкапы (restic)**
@@ -225,7 +226,7 @@ Ansible работает на самом сервере (`-c local`): коман
 | `docker` | Docker с userns-remap и `no-new-privileges`, сеть на проект, общий `base.yml` для compose, очистка образов | `/etc/docker/daemon.json`, `/srv/infra/compose/base.yml`, `docker-cleanup.timer` |
 | `postgres` | Postgres из PGDG, база и пользователь на проект, лимиты подключений и времени запроса, журнал медленных запросов | `/etc/postgresql/<версия>/main/`: `conf.d/90-ansible.conf`, `pg_hba.conf` (+ свои строки админа в `pg_hba.d/`) |
 | `traefik` | SSL сам, заголовки безопасности, лимиты запросов с одного IP | `/srv/infra/traefik/` |
-| `crowdsec` | бан атакующих по логам SSH и Traefik прямо в файрволе, на всех портах; ваши IP и IP участников не банятся | `/etc/crowdsec/acquis.d/traefik.yaml`, `/etc/crowdsec/parsers/s02-enrich/ansible-admin-whitelist.yaml` |
+| `crowdsec` | бан атакующих по логам SSH и Traefik прямо в файрволе, на всех портах; ваши IP, IP участников и самого сервера не банятся | `/etc/crowdsec/acquis.d/traefik.yaml`, `/etc/crowdsec/parsers/s02-enrich/ansible-admin-whitelist.yaml` |
 | `users` | аккаунты участников, SSH-ключи, группы, команда `go` | `/home/<человек>`, блок `Match Group devs` в `/etc/ssh/sshd_config` |
 | `project` | папки проектов и права, лимиты (systemd slice), `project-compose`, `project-db-env`, автовыкладка | `/srv/projects/<проект>/`, `proj-<проект>.slice`, `project-deploy@<проект>.timer` |
 | `access` | ссылка доступа: SSH текущему IP открывшего на сутки; страница без прав, правило ufw — root, по сроку убирает таймер | `/etc/infra-access/config.json`, `infra-access`, `infra-access-web.service`, `infra-access.path`, `infra-access-expire.timer`, `dynamic/infra-access.yml` Traefik |

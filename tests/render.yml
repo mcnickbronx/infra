@@ -34,6 +34,7 @@
     derived:
       host_people: "{{ host_people }}"
       ssh_allowed_ips: "{{ ssh_allowed_ips }}"
+      server_ips: "{{ server_ips }}"
       db_projects: "{{ db_projects | map(attribute='key') | list }}"
       autodeploy_projects: "{{ autodeploy_projects }}"
       hourly_backup_projects: "{{ hourly_backup_projects }}"
@@ -45,6 +46,12 @@
       rootless_projects: "{{ rootless_projects }}"
       rootless_group_of: "{{ rootless_group_of }}"
   tasks:
+    # Факты из ansible_facts в инвентаре не задать (его заполняет сам Ansible) — только так
+    - name: Факты сервера — свой адрес
+      ansible.builtin.set_fact:
+        ansible_default_ipv4: {address: 192.0.2.1}
+        cacheable: true
+
     - name: Проверки инвентаря проходят
       ansible.builtin.import_role:
         name: preflight

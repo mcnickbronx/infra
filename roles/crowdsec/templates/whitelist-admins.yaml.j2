@@ -1,12 +1,13 @@
 # Управляется Ansible. IP администратора (admin_ips) и участников проектов этого сервера
 # (ips в people) — те же, что в белом списке SSH, — не банятся: ни за ошибки с ключом, ни за
-# запросы, которые CrowdSec счёл бы сканированием сайта
+# запросы, которые CrowdSec счёл бы сканированием сайта. IPv4 самого сервера — тоже: проект без root
+# ходит к своим доменам с публичного IP сервера, и бан этого IP отрезал бы сервер от своих же сайтов
 name: ansible/admin-whitelist
-description: "Admin and people IPs from Ansible"
+description: "Admin, people and server IPs from Ansible"
 whitelist:
-  reason: "admin_ips and people ips"
+  reason: "admin_ips, people ips and server ips"
   ip:
-{% for ip in ssh_allowed_ips | reject('search', '/') %}
+{% for ip in (ssh_allowed_ips + server_ips) | unique | reject('search', '/') %}
     - "{{ ip }}"
 {% else %}
     - "127.0.0.1"

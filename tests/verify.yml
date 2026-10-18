@@ -129,6 +129,18 @@
         fail_msg: "нет в белом списке CrowdSec: {{ ssh_allowed_ips | difference(listed.ip | default([], true) + listed.cidr | default([], true)) }}"
         quiet: true
 
+    # Проект без root ходит к своим доменам с публичного IP сервера: без этого IP в белом списке
+    # CrowdSec банит сам сервер за сканирование, которое фронт пересылает в API, — и фронты отдают 502
+    - name: В белом списке CrowdSec — IPv4 самого сервера
+      vars:
+        listed: "{{ (cs_whitelist.content | b64decode | from_yaml).whitelist.ip | default([], true) }}"
+      ansible.builtin.assert:
+        that:
+          - server_ips | length > 0
+          - server_ips | difference(listed) | length == 0
+        fail_msg: "IPv4 сервера: {{ server_ips }}, в белом списке CrowdSec: {{ listed }}"
+        quiet: true
+
     # Только GET: страница показывает форму и ничего не открывает
     - name: Страница ссылки доступа
       ansible.builtin.shell: |
