@@ -25,8 +25,9 @@
         file: "{{ infra_dir }}/server.yml"
         name: server_settings
       tags: [always]
-  # У каждой роли своя метка: можно применить часть, например только файрвол
-  # и доступы: sudo infra apply --tags base,users
+  # У каждой роли своя метка: можно применить часть, например обновить уже заведённые
+  # проекты: sudo infra apply --tags project. Сменились IP — только полный apply
+  # (ADMIN.md, «Каждый раз, когда что-то меняете»).
   # Порядок важен: secrets — после проверок (пишет файл), traefik — после docker
   # (Traefik — контейнер), crowdsec — после traefik (читает его лог), project — после
   # users (папки проектов принадлежат группам <проект>-dev, их создаёт users).
@@ -56,5 +57,5 @@
       tags: [rootless, project]
     - role: backup        # ночные бэкапы restic
       tags: [backup]
-    - role: monitoring    # health-check каждый час: диск, память, упавшие службы и контейнеры...
+    - role: monitoring    # health-check каждые 10 минут: диск, память, упавшие службы и контейнеры...
       tags: [monitoring]

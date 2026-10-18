@@ -162,7 +162,7 @@
   when: not ansible_check_mode or deploy_unit.stat.exists
 
 # Отметка сбоя остаётся до следующей удачной выкладки: у проекта, которому выключили
-# автовыкладку (или убрали из server.yml), health-check повторял бы её каждый час
+# автовыкладку (или убрали из server.yml), health-check повторял бы её каждые 10 минут
 - name: Отметки сбоя автовыкладки на сервере
   ansible.builtin.find:
     paths: /var/lib/project-deploy

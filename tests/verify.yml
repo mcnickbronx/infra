@@ -391,7 +391,7 @@
     - name: health-check выполняется без ошибок
       ansible.builtin.command: /usr/local/bin/health-check.sh
       environment:
-        HC_URL: ""            # без уведомления: это проверка, а не ежечасный запуск
+        HC_URL: ""            # без уведомления: это проверка, а не запуск раз в 10 минут
       register: health
       changed_when: false
 

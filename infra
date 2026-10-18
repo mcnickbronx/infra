@@ -10,7 +10,7 @@
 #   sudo infra update [--check] [-y]        обновления: Docker, Postgres, Traefik, пакеты, перезагрузка
 #   sudo infra upgrade <версия> [...]       движок другой версии (git-тег с подписью из SIGNERS), затем apply
 #   sudo infra run <плейбук> [...]          плейбук движка как есть — для проверок (tests/verify.yml)
-# Остальные параметры уходят ansible-playbook: --tags base,users, -e skip_lockout_check=true.
+# Остальные параметры уходят ansible-playbook: --tags project, -e skip_lockout_check=true (если уверены).
 # Движок — папка этого скрипта (/opt/infra), его Ansible — .venv в ней; настройки и пароли —
 # /etc/infra. Прогон с изменениями идёт службой infra-apply: обрыв SSH его не прерывает.
 # Что и кем применено — в журнале событий /var/log/infra.log (diff настроек, имена новых паролей).
