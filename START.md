@@ -242,7 +242,7 @@ people:
 | Что | Где и как |
 |---|---|
 | Ваши ключи и IP | `admin_keys`, `admin_ips` |
-| Люди | `people:` — `key`, `ips` |
+| Люди | `people:` — `key`, `ips`, и только они |
 | Кто запускает контейнеры | `docker_users` |
 | Проект | в `projects:` — `net` (обязательно), `db: postgres`, `devs`, `domains` (для справки) |
 | Лимиты проекта | `memory: 4g`, `cpus: 2` (по умолчанию 2g и половина CPU сервера) |

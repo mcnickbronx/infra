@@ -1,0 +1,3 @@
+expect_error: "people.ivan: не словарь — нужно key: и ips:"
+people:
+  ivan: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureIvanKey0000000000000000000000 ivan@laptop"

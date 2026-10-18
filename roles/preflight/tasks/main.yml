@@ -265,6 +265,62 @@
       (так называются пользователь и группа проекта)
     quiet: true
 
+# Опечатка в ключе человека молча значила бы «нет»: ip: вместо ips: — человеку закрыт SSH,
+# keys: вместо key: — сообщение про испорченный ключ, хотя ключ в порядке. Все люди, не только
+# участники проектов этого сервера: опечатку видно раньше, чем человека впишут в devs.
+# Человек без полей (pavel: ~) — то же, что pavel: {}: проходит, как раньше (в devs его ловит
+# проверка ключа). Стоп — только на значении не словарём, например ключ строкой (ivan: "ssh-ed25519 …")
+- name: У людей только key и ips
+  vars:
+    extra: "{{ (people[item] if people[item] is mapping else {}) | list | difference(['key', 'ips']) }}"
+  ansible.builtin.assert:
+    that: people[item] is none or (people[item] is mapping and extra | length == 0)
+    fail_msg: >-
+      people.{{ item }}: {{ ('неизвестные ключи ' ~ extra | string ~ ' — опечатка? У человека только key (SSH-ключ)
+      и ips (адреса)') if people[item] is mapping else 'не словарь — нужно key: и ips: с отступом под именем' }}
+    quiet: true
+  loop: "{{ people.keys() | list }}"
+  loop_control:
+    label: "{{ item }}"
+
+# Адрес с опечаткой (198.51.100.300, /33) иначе остановил бы прогон позже ошибкой Python в роли base,
+# а если base его не проверит (запуск из консоли хостера) — ушёл бы в файрвол и CrowdSec.
+# Правило то же, что у base и infra init (bad_ips): ip_network(a, strict=False) — IPv4 и IPv6,
+# подсети, в том числе с битами хоста (192.0.2.5/24). ips строкой — один адрес, как у people_ips
+- name: Адреса в admin_ips и ips людей
+  vars:
+    addrs: >-
+      {%- set d = {'admin_ips': admin_ips} -%}
+      {%- for name, p in people.items() if p is mapping -%}
+      {%-   set _ = d.update({'people.' ~ name: [p.ips | default([])] | flatten}) -%}
+      {%- endfor -%}
+      {{ d }}
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -I
+      - -c
+      - |
+        import ipaddress, json, sys
+        for who, addrs in json.loads(sys.argv[1]).items():
+            for a in addrs:
+                try:
+                    ipaddress.ip_network(a, strict=False)
+                except ValueError:
+                    print(f"'{a}' ({who})")
+      - "{{ addrs | to_json }}"
+  register: bad_addrs
+  changed_when: false
+  check_mode: false     # только читает; иначе в --check stdout пустой и проверка ниже не работает
+
+- name: admin_ips и ips людей — IP или подсети
+  ansible.builtin.assert:
+    that: bad_addrs.stdout == ''
+    fail_msg: >-
+      Не IP и не подсеть: {{ bad_addrs.stdout_lines | join(', ') }} в server.yml. Нужно вида 203.0.113.10,
+      203.0.113.0/24 или 2001:db8::1 — по одному адресу на элемент списка
+    quiet: true
+
 # В Postgres локальный вход (peer) пускает пользователя Linux в роль с тем же именем:
 # человек по имени shop вошёл бы в базу проекта shop без пароля.
 - name: Имена людей и администратора не совпадают с именами проектов

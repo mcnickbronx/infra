@@ -1,0 +1,3 @@
+expect_error: "Не IP и не подсеть: '192.0.2.5, 198.51.100.7' (people.ivan)"
+people:
+  ivan: {key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureIvanKey0000000000000000000000 ivan@laptop", ips: "192.0.2.5, 198.51.100.7"}

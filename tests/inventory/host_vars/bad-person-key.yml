@@ -1,0 +1,3 @@
+expect_error: "people.ivan: неизвестные ключи ['ip']"
+people:
+  ivan: {key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureIvanKey0000000000000000000000 ivan@laptop", ip: [192.0.2.5]}
