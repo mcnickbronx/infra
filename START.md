@@ -244,7 +244,7 @@ people:
 | Ваши ключи и IP | `admin_keys`, `admin_ips` |
 | Люди | `people:` — `key`, `ips`, и только они |
 | Кто запускает контейнеры | `docker_users` |
-| Проект | в `projects:` — `net` (обязательно), `db: postgres`, `devs`, `domains` (для справки) |
+| Проект | в `projects:` — `net` (обязательно), `db: postgres`, `devs` |
 | Лимиты проекта | `memory: 4g`, `cpus: 2` (по умолчанию 2g и половина CPU сервера) |
 | База проекта | `db_conn_limit` (50), `db_statement_timeout` (60s) |
 | Автовыкладка | `autodeploy: true` у проекта, `ghcr_user` и `ghcr_token` в `secrets.yml` (ADMIN.md) |

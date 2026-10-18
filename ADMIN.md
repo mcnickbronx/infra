@@ -183,7 +183,6 @@ Postgres — короткий разрыв подключений; `daemon.json`
    ```yaml
    projects:
      blog:
-       domains: [blog.example.com]   # для справки
        net: 14          # следующий свободный номер на этом сервере, потом не менять
        db: postgres     # или убрать строку — без базы
        devs: [anna]

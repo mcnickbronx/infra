@@ -45,8 +45,7 @@ projects:
   shop:
     net: 11                       # номер сети 1..254, уникален на сервере, потом НЕ менять
                                   #   (сеть proj-shop, 172.20.11.0/24; адрес базы — 172.20.11.1)
-    domains: [shop.example.com, www.shop.example.com]   # для справки; на сайт домен ведут
-                                  #   labels Traefik в compose проекта (TEAM.md)
+    # домены сайта — labels Traefik в compose проекта (TEAM.md), не здесь
     db: postgres                  # база и пользователь «shop»; без строки — без базы
     db_conn_limit: 100            # подключений к базе
     db_statement_timeout: 120s    # предел времени запроса ("0" — без предела)
