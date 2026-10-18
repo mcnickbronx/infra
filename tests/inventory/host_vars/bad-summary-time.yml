@@ -1,0 +1,2 @@
+expect_error: "notify_summary_time в /etc/infra/server.yml — время ЧЧ:ММ"
+notify_summary_time: "9:00"

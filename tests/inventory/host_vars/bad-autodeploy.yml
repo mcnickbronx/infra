@@ -1,3 +1,3 @@
-expect_error: "autodeploy — true или false"
+expect_error: "Проект 'site': autodeploy — true или false"
 projects:
   site: {net: 5, autodeploy: "yes", devs: [ivan]}

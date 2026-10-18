@@ -1,0 +1,2 @@
+expect_error: "telegram_proxy в /etc/infra/secrets.yml — адрес вида"
+secrets_file: {telegram_proxy: "192.0.2.50:1080"}     # без схемы (socks5h://, http://)

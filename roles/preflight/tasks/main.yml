@@ -140,8 +140,6 @@
   loop_control:
     label: "{{ item.key }}"
 
-# autodeploy: "yes" (строка) выглядело бы включённым. Образы приватные — без токена таймер
-# падал бы каждые 15 секунд
 # Ссылка доступа: true/false; срок — целые часы, не больше трёх суток (порт открыт и соседям IP
 # по оператору); свой адрес — имя хоста, без https:// и пути
 - name: "access_link — true или false, access_link_hours — 1..72, access_link_host — имя хоста"
@@ -175,16 +173,35 @@
   loop_control:
     label: "{{ item.key }}"
 
-- name: "autodeploy и rootless у проекта — true или false; при автовыкладке — токен реестра в secrets.yml"
+# autodeploy: "yes" (строка) выглядело бы включённым
+- name: У проекта autodeploy — true или false
+  ansible.builtin.assert:
+    that: item.value.autodeploy is not defined or item.value.autodeploy is boolean
+    fail_msg: "Проект '{{ item.key }}': autodeploy — true или false, без кавычек"
+    quiet: true
+  loop: "{{ projects | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: У проекта rootless — true, false или имя группы
   ansible.builtin.assert:
     that:
-      - projects.values() | selectattr('autodeploy', 'defined') | rejectattr('autodeploy', 'boolean') | list | length == 0
-      - projects.values() | selectattr('rootless', 'defined') | rejectattr('rootless', 'boolean')
-        | map(attribute='rootless') | map('string') | reject('match', '^[a-z][a-z0-9_]{0,27}$') | list | length == 0
-      - autodeploy_projects | length == 0 or (ghcr_user != '' and ghcr_token != '')
+      - item.value.rootless is not defined or item.value.rootless is boolean
+        or (item.value.rootless | string) is match('^[a-z][a-z0-9_]{0,27}$')
     fail_msg: >-
-      autodeploy — true или false, без кавычек; rootless — true, false или имя группы (строчные латинские
-      буквы, цифры и _, до 28 символов); при autodeploy: true в {{ infra_dir }}/secrets.yml нужны
+      Проект '{{ item.key }}': rootless — true, false или имя группы (строчные латинские буквы,
+      цифры и _, до 28 символов)
+    quiet: true
+  loop: "{{ projects | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# Образы приватные — без токена таймер автовыкладки падал бы каждые 15 секунд
+- name: При автовыкладке — вход в ghcr.io в secrets.yml
+  ansible.builtin.assert:
+    that: autodeploy_projects | length == 0 or (ghcr_user != '' and ghcr_token != '')
+    fail_msg: >-
+      autodeploy: true у {{ autodeploy_projects | join(', ') }} — в {{ infra_dir }}/secrets.yml нужны
       ghcr_user и ghcr_token (токен GitHub classic с правом read:packages)
     quiet: true
 
@@ -220,18 +237,32 @@
     quiet: true
 
 # ---------- Люди ----------
-- name: Все участники проектов описаны в people, администратора там нет
+- name: Все участники проектов описаны в people
   ansible.builtin.assert:
-    that:
-      - host_people | difference(people.keys()) | length == 0
-      - admin_user not in people
-      - people.keys() | reject('match', '^[a-z][a-z0-9_-]{0,31}$') | list | length == 0
-      - people.keys() | select('match', '.*-(run|dev)$') | list | length == 0
+    that: host_people | difference(people.keys()) | length == 0
     fail_msg: >-
-      Нет в people: {{ host_people | difference(people.keys()) }};
-      {{ admin_user }} не должен быть в people (иначе его можно случайно удалить);
-      имена — строчные латинские буквы, цифры, _ и -, не на -run и -dev (так называются
-      пользователь и группа проекта)
+      Нет в people: {{ host_people | difference(people.keys()) }} — участники проектов (devs) описываются
+      в people: key (SSH-ключ) и ips (адреса)
+    quiet: true
+
+- name: Администратора нет в people
+  ansible.builtin.assert:
+    that: admin_user not in people
+    fail_msg: >-
+      {{ admin_user }} — администратор, его не должно быть в people (иначе его можно случайно удалить):
+      его ключи и IP — admin_keys и admin_ips
+    quiet: true
+
+- name: Имена людей — для пользователей Linux, не на -run и -dev
+  vars:
+    bad_names: >-
+      {{ (people.keys() | reject('match', '^[a-z][a-z0-9_-]{0,31}$') | list)
+         + (people.keys() | select('match', '.*-(run|dev)$') | list) }}
+  ansible.builtin.assert:
+    that: bad_names | length == 0
+    fail_msg: >-
+      Имена в people: {{ bad_names | unique }} — строчные латинские буквы, цифры, _ и -, не на -run и -dev
+      (так называются пользователь и группа проекта)
     quiet: true
 
 # В Postgres локальный вход (peer) пускает пользователя Linux в роль с тем же именем:
@@ -292,18 +323,25 @@
 
 # Уведомления в Telegram: чат без бота молча не получал бы ничего. Бот без чата — шаг настройки
 # (id чата подсказывает infra-notify --find-chat по токену): не ошибка, а напоминание
-- name: Telegram — чат только с ботом, прокси — адрес, сводка — время ЧЧ:ММ
+- name: Telegram — чат только вместе с ботом
+  ansible.builtin.assert:
+    that: secrets.telegram_chat_id | default('', true) | string == '' or secrets.telegram_bot_token | default('', true) != ''
+    fail_msg: "В {{ infra_dir }}/secrets.yml telegram_chat_id задан без telegram_bot_token — уведомления не уходят"
+    quiet: true
+
+# Значение прокси в сообщение не выводится: в нём бывают логин и пароль
+- name: Telegram — прокси — адрес
   vars:
     tg_proxy: "{{ secrets.telegram_proxy | default('', true) }}"
   ansible.builtin.assert:
-    that:
-      - secrets.telegram_chat_id | default('', true) | string == '' or secrets.telegram_bot_token | default('', true) != ''
-      - tg_proxy == '' or tg_proxy is match('^(https?|socks5h?)://')
-      - notify_summary_time | string is match('^([01][0-9]|2[0-3]):[0-5][0-9]$')
-    fail_msg: >-
-      В {{ infra_dir }}/secrets.yml telegram_chat_id задан без telegram_bot_token;
-      telegram_proxy — адрес вида socks5h://логин:пароль@хост:порт или http://хост:порт;
-      notify_summary_time — время ЧЧ:ММ в кавычках, например "09:00"
+    that: tg_proxy == '' or tg_proxy is match('^(https?|socks5h?)://')
+    fail_msg: "telegram_proxy в {{ infra_dir }}/secrets.yml — адрес вида socks5h://логин:пароль@хост:порт или http://хост:порт"
+    quiet: true
+
+- name: Утренняя сводка — время ЧЧ:ММ
+  ansible.builtin.assert:
+    that: notify_summary_time | string is match('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+    fail_msg: 'notify_summary_time в {{ infra_dir }}/server.yml — время ЧЧ:ММ в кавычках, например "09:00"'
     quiet: true
 
 - name: Telegram — бот задан, чат ещё нет

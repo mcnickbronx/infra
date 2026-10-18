@@ -1,0 +1,4 @@
+expect_error: "admin — администратор, его не должно быть в people"
+people:
+  admin: {key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureIvanKey0000000000000000000000 x@y", ips: [192.0.2.5]}
+  ivan: {key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureIvanKey0000000000000000000000 ivan@laptop", ips: [192.0.2.6]}

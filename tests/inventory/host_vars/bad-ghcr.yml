@@ -1,4 +1,4 @@
-expect_error: "нужны ghcr_user и ghcr_token"
+expect_error: "autodeploy: true у site — в /etc/infra/secrets.yml нужны ghcr_user и ghcr_token"
 projects:
   site: {net: 5, autodeploy: true, devs: [ivan]}
 docker_users: [ivan]

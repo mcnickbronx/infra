@@ -1,4 +1,4 @@
-expect_error: "не на -run и -dev"
+expect_error: "Имена в people: ['shop-run']"
 people:
   shop-run: {key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureIvanKey0000000000000000000000 x@y", ips: [192.0.2.5]}
 projects:
