@@ -585,7 +585,7 @@ event_text() {
 # Сервер одним экраном: версия, применены ли настройки, бэкап, уведомления, проекты (контейнеры,
 # сайты, автовыкладка) и что сейчас видит health-check. Только читает
 cmd_status() {
-  local line mem p up total hosts deploy containers problems hourly d=/var/lib/project-deploy
+  local line mem p up total sick hosts deploy containers problems hourly d=/var/lib/project-deploy
   mem=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%.1f из %.1f ГБ", a / 1048576, t / 1048576 }' /proc/meminfo)
   echo "== $SERVER · движок $(git -C "$ENGINE" describe --tags --always 2>/dev/null || echo 'копия, не git')" \
        "· $(. /etc/os-release && echo "$PRETTY_NAME") · включён с $(uptime -s | cut -c1-16)"
@@ -634,15 +634,17 @@ cmd_status() {
   elif [ "$(jq length /etc/restic/projects.json)" = 0 ]; then
     echo "Проектов нет — добавить: sudo infra edit"
   else
-    # Проект|состояние|разовый (compose run)|все метки — по ним сайты (Host в правилах Traefik).
+    # Проект|состояние (у нездорового — «running unhealthy»)|разовый (compose run)|все метки — по ним
+    # сайты (Host в правилах Traefik).
     # Из общего Docker и из Docker каждого проекта без root (rootless: true)
     containers=$(for host in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootless.json 2>/dev/null); do
       env ${host:+DOCKER_HOST="$host"} docker ps -aq 2>/dev/null | xargs -r env ${host:+DOCKER_HOST="$host"} docker inspect --format \
-        '{{index .Config.Labels "com.docker.compose.project"}}|{{.State.Status}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{range .Config.Labels}}{{.}} {{end}}' 2>/dev/null || true
+        '{{index .Config.Labels "com.docker.compose.project"}}|{{.State.Status}}{{with .State.Health}}{{if eq .Status "unhealthy"}} unhealthy{{end}}{{end}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{range .Config.Labels}}{{.}} {{end}}' 2>/dev/null || true
     done)
     echo "Проекты:"
     for p in $(jq -r '.[].name' /etc/restic/projects.json); do
-      read -r up total < <(awk -F'|' -v p="$p" '$1 == p && $3 != "True" { n++; if ($2 == "running") u++ } END { print u + 0, n + 0 }' <<<"$containers")
+      read -r up total sick < <(awk -F'|' -v p="$p" '$1 == p && $3 != "True" { n++; if ($2 == "running") u++; if ($2 == "running unhealthy") s++ }
+                                     END { print u + 0, n + 0, s + 0 }' <<<"$containers")
       hosts=$(awk -F'|' -v p="$p" '$1 == p' <<<"$containers" | grep -o 'Host(`[^`]*`)' | sed 's/^Host(`//; s/`)$//' | sort -u | paste -sd' ' - || true)
       deploy=""
       if systemctl is-enabled -q "project-deploy@$p.timer" 2>/dev/null; then
@@ -652,6 +654,7 @@ cmd_status() {
         fi
       fi
       if [ "$total" = 0 ]; then line="не запущен"; else line="контейнеры $up из $total"; fi
+      [ "$sick" = 0 ] || line+=", нездоровых $sick"
       echo "  $p — $line${hosts:+ · $hosts}${deploy:+ · $deploy}"
     done
   fi

@@ -142,6 +142,19 @@ check_restarting() {
   fi
 }
 
+# Работают, но не проходят свою проверку здоровья (healthcheck в compose): Traefik к таким не ведёт,
+# сайт на них не открывается, а Docker сам их не перезапускает. «Запускается» (starting) — не
+# тревога: так идут выкладка и первые секунды после запуска. Только running: упавшему Docker тоже
+# ставит unhealthy, а перезапускающиеся — в check_restarting
+check_unhealthy() {
+  local names
+  names=$(docker ps --filter health=unhealthy --filter status=running --format '{{.Names}}' 2>/dev/null | xargs)
+  if [ -n "$names" ]; then
+    problem "Контейнеры нездоровы (не проходят свой healthcheck): $names" \
+      "Traefik к ним не ведёт — сайт на них не открывается. Почему: sudo project-compose <проект> logs --tail 50 <сервис>; перезапустить — sudo project-compose <проект> restart <сервис>"
+  fi
+}
+
 # Упали и лежат (restart: no, исчерпан on-failure, убиты за нехватку памяти). Не считаются:
 # остановленные вручную (docker stop, compose stop — коды 0, 130, 137, 143) и разовые
 # (docker compose run). Уведомление повторяется, пока контейнер не поднят или не удалён.
@@ -406,6 +419,7 @@ check_rootless
 for DOCKER_HOST in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootless.json 2>/dev/null); do
   if [ -n "$DOCKER_HOST" ]; then export DOCKER_HOST; else unset DOCKER_HOST; fi
   check_restarting
+  check_unhealthy
   check_crashed
   check_open_ports
   check_compose_projects

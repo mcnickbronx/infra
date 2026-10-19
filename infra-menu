@@ -133,12 +133,13 @@ main() {
 autodeploy() { systemctl is-enabled -q "project-deploy@$1.timer" 2>/dev/null; }
 has_db() { jq -e --arg n "$1" 'any(.[]; .name == $n and .db == "postgres")' "$PROJECTS" >/dev/null; }
 
-# Строка проекта в списке: контейнеры (кроме разовых — compose run), автовыкладка
+# Строка проекта в списке: контейнеры (кроме разовых — compose run; нездоровые — не работают), автовыкладка
 project_line() {
-  local up total line
-  read -r up total < <(awk -F'|' -v p="$1" '$1 == p && $3 != "True" { n++; if ($2 == "running") u++ }
-                                           END { print u + 0, n + 0 }' <<<"$CONTAINERS")
+  local up total sick line
+  read -r up total sick < <(awk -F'|' -v p="$1" '$1 == p && $3 != "True" { n++; if ($4 ~ /\(unhealthy\)$/) s++; else if ($2 == "running") u++ }
+                                           END { print u + 0, n + 0, s + 0 }' <<<"$CONTAINERS")
   if [ "$total" = 0 ]; then line="не запущен"; else line="контейнеры $up из $total"; fi
+  [ "$sick" = 0 ] || line+=", нездоровых $sick"
   if [ -f "$DEPLOY/$1.failed" ]; then line+=" · автовыкладка не удалась"
   elif autodeploy "$1"; then line+=" · автовыкладка"
   fi
@@ -154,7 +155,7 @@ projects() {
   while :; do
     CONTAINERS=$(for h in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootless.json 2>/dev/null); do
       env ${h:+DOCKER_HOST="$h"} docker ps -a --format \
-        '{{.Label "com.docker.compose.project"}}|{{.State}}|{{.Label "com.docker.compose.oneoff"}}' 2>/dev/null
+        '{{.Label "com.docker.compose.project"}}|{{.State}}|{{.Label "com.docker.compose.oneoff"}}|{{.Status}}' 2>/dev/null
     done)
     items=()
     for p in $(jq -r '.[].name' "$PROJECTS"); do items+=("$p" "$(project_line "$p")"); done

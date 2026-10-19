@@ -216,6 +216,62 @@ class RootlessFiles(unittest.TestCase):
             self.assertEqual(to_rf(to_rl(100000 + n)), 100000 + n)
 
 
+class HealthCheckContainers(unittest.TestCase):
+    """roles/monitoring: health-check.sh (эталон tests/golden) — проверки контейнеров по заглушке docker
+    и уведомления: о новом — один раз, о прошедшем — один раз."""
+
+    SCRIPT = ROOT / "tests/golden/full/monitoring/health-check.sh"
+    # Заглушка отвечает только на запрос нездоровых; остальные проверки видят пустой Docker
+    DOCKER = """#!/bin/bash
+if [ "$*" = "ps --filter health=unhealthy --filter status=running --format {{.Names}}" ]; then
+  [ -z "$STUB_UNHEALTHY" ] || printf '%s\\n' $STUB_UNHEALTHY
+fi
+"""
+    NOTIFY = '#!/bin/bash\nprintf "%s\\n---\\n" "$1" >> "$STUB_SENT"\n'
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        for name, text in (("docker", self.DOCKER), ("infra-notify", self.NOTIFY)):
+            (self.dir / name).write_text(text)
+            (self.dir / name).chmod(0o755)
+        # из эталона — функции (до «Все проверки») и цикл проверок контейнеров, как на сервере;
+        # остальные проверки читают /proc, ufw, systemd
+        head, sep, tail = self.SCRIPT.read_text().partition("# ---------- Все проверки ----------")
+        start, end = tail.find("\nfor DOCKER_HOST in "), tail.find("\ndone\n")
+        self.assertTrue(sep and 0 <= start < end, "в health-check.sh нет «Все проверки» и цикла по Docker")
+        self.checks = head + tail[start:end + len("\ndone\n")]
+        self.sent = self.dir / "sent"
+
+    def run_checks(self, unhealthy, *calls, resolve=30):
+        env = {**os.environ, "PATH": f"{self.dir}:{os.environ['PATH']}", "STUB_UNHEALTHY": unhealthy,
+               "STUB_SENT": str(self.sent), "HEALTH_STATE_DIR": str(self.dir / "state"),
+               "HEALTH_RESOLVE_MINUTES": str(resolve)}
+        script = self.checks + "\n".join(calls) + "\n"
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=True).stdout
+
+    def messages(self):
+        return self.sent.read_text().split("---\n")[:-1] if self.sent.exists() else []
+
+    def test_unhealthy_is_a_problem(self):
+        out = self.run_checks("shop-back-1 lab-app-1", 'render "$PROBLEMS"')
+        self.assertIn("Контейнеры нездоровы (не проходят свой healthcheck): shop-back-1 lab-app-1", out)
+        self.assertIn("project-compose <проект> logs", out)
+        self.assertEqual(self.run_checks("", 'render "$PROBLEMS"'), "")
+
+    def test_notified_once_then_resolved_once(self):
+        self.run_checks("shop-back-1", "notify_changes")
+        self.run_checks("shop-back-1", "notify_changes")           # через 10 минут — то же: молчит
+        self.run_checks("", "notify_changes")                      # поправили — «прошло» не сразу
+        self.assertEqual(len(self.messages()), 1)
+        self.assertIn("— новое:", self.messages()[0])
+        self.assertIn("shop-back-1", self.messages()[0])
+        self.run_checks("", "notify_changes", resolve=0)            # нет дольше HEALTH_RESOLVE_MINUTES
+        self.assertEqual(len(self.messages()), 2)
+        self.assertIn("— прошло:", self.messages()[1])
+        self.assertIn("shop-back-1", self.messages()[1])
+
+
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class SignedUpgrade(unittest.TestCase):
     """infra tag-signed: infra upgrade ставит только тег, подписанный ключом из SIGNERS текущей версии."""

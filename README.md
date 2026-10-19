@@ -61,7 +61,7 @@ Ubuntu: удалили движок — сервер работает дальш
 - или руками: `git pull` или SFTP и `docker compose up -d`.
 
 **Наблюдение**
-- health-check каждые 10 минут: диск, CPU, память, упавшие службы и контейнеры, порты мимо
+- health-check каждые 10 минут: диск, CPU, память, упавшие службы, упавшие и нездоровые контейнеры, порты мимо
   файрвола, тома вне бэкапа, сертификаты, выкладки, бэкапы;
 - Telegram: только новые и прошедшие проблемы, утром — сводка (нет сводки — сервер лежит);
 - журнал событий `/var/log/infra.log` — кто, когда и что: настройки, выкладки, бэкапы, восстановления.
@@ -232,7 +232,7 @@ Ansible работает на самом сервере (`-c local`): коман
 | `project` | папки проектов и права, лимиты (systemd slice), `project-compose`, `project-db-env`, автовыкладка | `/srv/projects/<проект>/`, `proj-<проект>.slice`, `project-deploy@<проект>.timer` |
 | `access` | ссылка доступа: SSH текущему IP открывшего на сутки; страница без прав, правило ufw — root, по сроку убирает таймер | `/etc/infra-access/config.json`, `infra-access`, `infra-access-web.service`, `infra-access.path`, `infra-access-expire.timer`, `dynamic/infra-access.yml` Traefik |
 | `backup` | каждую ночь — снимок каждого проекта (файлы, тома, дамп базы) и копия в S3; проектам с `backup_hourly` — ещё и каждые `backup_every` минут (сразу в S3); копия прод-базы в `*_dev`, дамп базы к себе | `/etc/restic/`, `/var/backups/restic`, `backup.timer`, `backup-hourly.timer`, `project-backup`, `project-restore`, `project-db-copy`, `project-db-dump`, `backup-s3-copy` |
-| `monitoring` | каждые 10 минут health-check: диск, CPU, память, упавшие службы и контейнеры, порты мимо файрвола, тома вне бэкапа, сертификаты, неудачная автовыкладка, ночной бэкап и частые снимки, давно не запускали `update.yml`; о новом и прошедшем — в Telegram, утром — сводка | `/usr/local/bin/health-check.sh`, `/usr/local/sbin/infra-notify`, `health-check.timer`, `health-check-summary.timer` |
+| `monitoring` | каждые 10 минут health-check: диск, CPU, память, упавшие службы, упавшие и нездоровые контейнеры, порты мимо файрвола, тома вне бэкапа, сертификаты, неудачная автовыкладка, ночной бэкап и частые снимки, давно не запускали `update.yml`; о новом и прошедшем — в Telegram, утром — сводка | `/usr/local/bin/health-check.sh`, `/usr/local/sbin/infra-notify`, `health-check.timer`, `health-check-summary.timer` |
 
 Скрипты на сервере (`/usr/local/bin`, `/usr/local/sbin`) — из `roles/<роль>/files/` или
 `templates/` с тем же именем (у шаблона — плюс `.j2`).
