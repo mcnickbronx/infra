@@ -77,7 +77,7 @@ docker_remap_web_gids: [0, 33, 1000]
 # proj-<проект>.slice: память и CPU ограничены на весь проект, как его сервисы их ни делят.
 # Утечка памяти или майнер во взломанном контейнере не займут весь сервер.
 project_default_memory: 2g
-project_default_cpus: "{{ [1, (ansible_processor_vcpus | default(2) | int) / 2] | max }}"   # половина CPU сервера
+project_default_cpus: "{{ [1, (ansible_facts['processor_vcpus'] | default(2) | int) / 2] | max }}"   # половина CPU сервера
 project_default_db_conn_limit: 50              # подключений к базе у пользователя проекта
 project_default_db_statement_timeout: 60s      # предел времени запроса; "0" — без предела
 

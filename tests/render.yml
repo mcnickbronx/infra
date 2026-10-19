@@ -47,6 +47,9 @@
       rootless_group_of: "{{ rootless_group_of }}"
   tasks:
     # Факты из ansible_facts в инвентаре не задать (его заполняет сам Ansible) — только так
+    - name: Факты сервера
+      ansible.builtin.import_tasks: facts.yml
+
     - name: Факты сервера — свой адрес
       ansible.builtin.set_fact:
         ansible_default_ipv4: {address: 192.0.2.1}

@@ -1,9 +1,9 @@
-# Управляется Ansible. Рассчитано на {{ ansible_memtotal_mb }} МБ RAM,
+# Управляется Ansible. Рассчитано на {{ ansible_facts['memtotal_mb'] }} МБ RAM,
 # под Postgres отведено {{ ((postgres_memory_share | float) * 100) | int }}%.
 listen_addresses = '*'          # доступ ограничивают pg_hba.conf и файрвол
 max_connections = 200
-shared_buffers = {{ (ansible_memtotal_mb * (postgres_memory_share | float) * 0.25) | int }}MB
-effective_cache_size = {{ (ansible_memtotal_mb * (postgres_memory_share | float) * 0.75) | int }}MB
+shared_buffers = {{ (ansible_facts['memtotal_mb'] * (postgres_memory_share | float) * 0.25) | int }}MB
+effective_cache_size = {{ (ansible_facts['memtotal_mb'] * (postgres_memory_share | float) * 0.75) | int }}MB
 maintenance_work_mem = 256MB
 work_mem = 16MB
 wal_compression = on

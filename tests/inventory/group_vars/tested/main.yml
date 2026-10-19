@@ -6,11 +6,5 @@ admin_keys: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureAdminKey000000000000000
 admin_ips: [192.0.2.10, 198.51.100.0/29, "2001:db8::10"]
 acme_email: admin@fixture.test
 
-# Факты сервера (gather_facts не нужен: серверов нет). Его адрес (ansible_default_ipv4) — не здесь,
-# а в tests/render.yml (set_fact)
-ansible_distribution: Ubuntu
-ansible_distribution_version: "26.04"
-ansible_distribution_release: resolute
-ansible_architecture: x86_64
-ansible_memtotal_mb: 4096
-ansible_processor_vcpus: 4
+# Факты сервера — не здесь: Ubuntu, память и CPU — в tests/facts.yml, адрес — в tests/render.yml.
+# Роли читают их через ansible_facts[...], а его в инвентаре не задать

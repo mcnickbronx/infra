@@ -1,0 +1,12 @@
+# Факты тестового сервера — для tests/render.yml и tests/invalid.yml (gather_facts там нет:
+# серверов нет). Роли читают факты через ansible_facts[...], а его из инвентаря не задать —
+# только set_fact с cacheable
+- name: Факты сервера — Ubuntu, процессор, память
+  ansible.builtin.set_fact:
+    ansible_distribution: Ubuntu
+    ansible_distribution_version: "26.04"
+    ansible_distribution_release: resolute
+    ansible_architecture: x86_64
+    ansible_memtotal_mb: 4096
+    ansible_processor_vcpus: 4
+    cacheable: true

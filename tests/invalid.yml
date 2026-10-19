@@ -6,6 +6,9 @@
   hosts: invalid
   gather_facts: false
   tasks:
+    - name: Факты сервера
+      ansible.builtin.import_tasks: facts.yml
+
     - name: Описание с ошибкой
       block:
         - name: Проверки инвентаря

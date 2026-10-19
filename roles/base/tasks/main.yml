@@ -75,7 +75,7 @@
     name: fwupd-refresh.timer
     enabled: false
     state: stopped
-  when: ansible_virtualization_role | default('') == 'guest'
+  when: ansible_facts['virtualization_role'] | default('') == 'guest'
   failed_when: false        # fwupd не установлен — выключать нечего
 
 - name: Часовой пояс

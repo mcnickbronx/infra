@@ -17,6 +17,9 @@
   в том числе с битами хоста (`192.0.2.5/24`), `ips` строкой — как один адрес. Человек без `ips` — как раньше.
 - Доки: ключ проекта `domains` убран из server.yml.example, START и ADMIN — его никто не читал, домены задают
   labels Traefik. В старых `server.yml` он допустим, как прежде.
+- Роли читают факты сервера через `ansible_facts[...]`: `infra apply` и `infra update` больше не печатают
+  `[DEPRECATION WARNING]: INJECT_FACTS_AS_VARS…` (ansible-core 2.21), движок готов к ansible-core 2.24, где
+  прежние имена уберут. Результат тот же: эталоны `tests/golden` не изменились.
 
 На сервере, перед `sudo infra upgrade`: `sudo infra edit` — у каждого человека в `people`, в том числе у тех,
 кого нет в `devs`, только `key` и `ips`; адреса в `ips` и `admin_ips` — вида `192.0.2.5`, `192.0.2.0/24`
