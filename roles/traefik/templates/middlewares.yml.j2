@@ -10,6 +10,24 @@ http:
         contentTypeNosniff: true
         referrerPolicy: strict-origin-when-cross-origin
 
+    # На всех сайтах: сжатие текста — br или gzip, что умеет браузер. Только текстовые типы:
+    # картинки, видео, архивы уже сжаты и не трогаются. Ответ, который проект сжал сам
+    # (Content-Encoding), не пережимается. Порог — умолчание Traefik: меньше 1024 байт не жмёт.
+    compress:
+      compress:
+        encodings: [br, gzip]
+        includedContentTypes:
+          - text/html
+          - text/css
+          - text/javascript
+          - application/javascript
+          - application/json
+          - application/xml
+          - text/xml
+          - image/svg+xml
+          - application/manifest+json
+          - application/rss+xml
+
     # На всех сайтах: ограничения на один IP против HTTP-флуда (значения — в main.yml).
     # IP берётся из соединения: Traefik в сети хоста.
     # sourceCriterion.ipStrategy обязателен у inFlightReq: без него запросы группируются

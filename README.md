@@ -28,8 +28,8 @@ Ubuntu: удалили движок — сервер работает дальш
   в контейнерах; проекты друг друга не видят;
 - база и пользователь в общем Postgres (PGDG): вход только из сети проекта и через SSH-туннель,
   доступ в `.env` проекта кладёт `project-db-env`, пароль создаёт движок;
-- SSL от Let's Encrypt сам: домен — labels в `compose.yml`; заголовки безопасности и лимит запросов
-  с одного IP — в Traefik;
+- SSL от Let's Encrypt сам: домен — labels в `compose.yml`; заголовки безопасности, лимит запросов
+  с одного IP и сжатие текста (br, gzip) — в Traefik;
 - лимиты памяти и CPU на проект (systemd slice), на контейнер — 512 процессов и 65 536 файлов;
 - dev и prod рядом: копия прод-базы в `*_dev` одной командой, дамп базы к себе.
 
@@ -226,7 +226,7 @@ Ansible работает на самом сервере (`-c local`): коман
 | `base` | пакеты, обновления безопасности Ubuntu, SSH только по ключу, файрвол с белым списком IP, журнал событий сервера | `/etc/ssh/sshd_config.d/10-hardening.conf`, `/usr/local/sbin/ufw-sync-whitelist`, `/etc/ufw/ansible-whitelist.json`, `/usr/local/sbin/infra-log`, `/var/log/infra.log` |
 | `docker` | Docker с userns-remap и `no-new-privileges`, сеть на проект, общий `base.yml` для compose, очистка образов | `/etc/docker/daemon.json`, `/srv/infra/compose/base.yml`, `docker-cleanup.timer` |
 | `postgres` | Postgres из PGDG, база и пользователь на проект, лимиты подключений и времени запроса, журнал медленных запросов | `/etc/postgresql/<версия>/main/`: `conf.d/90-ansible.conf`, `pg_hba.conf` (+ свои строки админа в `pg_hba.d/`) |
-| `traefik` | SSL сам, заголовки безопасности, лимиты запросов с одного IP | `/srv/infra/traefik/` |
+| `traefik` | SSL сам, заголовки безопасности, лимиты запросов с одного IP, сжатие текста (br, gzip) | `/srv/infra/traefik/` |
 | `crowdsec` | бан атакующих по логам SSH и Traefik прямо в файрволе, на всех портах; ваши IP, IP участников и самого сервера не банятся | `/etc/crowdsec/acquis.d/traefik.yaml`, `/etc/crowdsec/parsers/s02-enrich/ansible-admin-whitelist.yaml` |
 | `users` | аккаунты участников, SSH-ключи, группы, команда `go` | `/home/<человек>`, блок `Match Group devs` в `/etc/ssh/sshd_config` |
 | `project` | папки проектов и права, лимиты (systemd slice), `project-compose`, `project-db-env`, автовыкладка | `/srv/projects/<проект>/`, `proj-<проект>.slice`, `project-deploy@<проект>.timer` |
