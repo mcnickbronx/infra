@@ -340,5 +340,139 @@ class SignedUpgrade(unittest.TestCase):
         self.assertFalse(self.signed("v2.0.0"))
 
 
+@unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
+class UpgradePreview(unittest.TestCase):
+    """infra upgrade: сервер не менялся (--check, «нет», предпросмотр не прошёл, Ctrl+C) — движок прежней версии;
+    «изменений нет» и «да» — новой. Стенд: «origin» с подписанными v1.0.0 и v1.1.0, движок — его клон на v1.0.0,
+    /etc/infra и /var/lib/infra — во временной папке; Ansible, install.sh, infra-log, id, systemd — заглушки,
+    пишут строку в журнал стенда."""
+
+    PLAYBOOK = """#!/bin/sh
+echo "ansible-playbook $*" >> "$STUB_LOG"
+[ -z "$STUB_INT" ] || kill -INT 0          # Ctrl+C в терминале — сигнал всей группе процессов
+echo "PLAY RECAP"
+echo "srv : ok=40 changed=$STUB_CHANGED failed=0"
+exit "$STUB_RC"
+"""
+    STUBS = {
+        "id": '#!/bin/sh\n[ "$1" = -u ] && echo 0 || exec /usr/bin/id "$@"\n',
+        "systemctl": "#!/bin/sh\nexit 3\n",                                  # infra-apply не идёт
+        "systemd-run": '#!/bin/sh\necho "systemd-run $*" >> "$STUB_LOG"\nexit "$STUB_APPLY_RC"\n',  # прогон «да»
+        "stat": '#!/bin/sh\n[ "$1" = -c ] && [ "$2" = %s ] && wc -c < "$3" | tr -d " "\n',  # stat -c на Mac нет
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = pathlib.Path(tempfile.mkdtemp())
+        cls.addClassCleanup(shutil.rmtree, cls.dir)
+        cls.bin, cls.etc, origin = cls.dir / "bin", cls.dir / "etc", cls.dir / "origin"
+        for d in (cls.bin, cls.etc, origin / "roles/base/files"):
+            d.mkdir(parents=True)
+        for name, text in cls.STUBS.items():
+            (cls.bin / name).write_text(text)
+            (cls.bin / name).chmod(0o755)
+        (cls.etc / "server.yml").write_text("server_name: srv\n")
+        (cls.etc / "secrets.yml").write_text("")
+        key = cls.dir / "author"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "author", "-f", key], check=True)
+        public = pathlib.Path(f"{key}.pub").read_text().split()
+        (origin / "SIGNERS").write_text(f'author namespaces="git" {public[0]} {public[1]}\n')
+        # infra из репозитория, только пути и массивы: bash 3.2 на Mac под set -u не знает пустой "${A[@]}",
+        # ${A[@]+"${A[@]}"} — то же на любом bash
+        infra = (ROOT / "infra").read_text()
+        for old, new in (("\nCONF=/etc/infra\n", f'\nCONF="{cls.etc}"\n'),
+                         ("\nSTATE=/var/lib/infra ", f'\nSTATE="{cls.dir / "state"}" '),
+                         ('"${ARGS[@]}"', '${ARGS[@]+"${ARGS[@]}"}'),
+                         ('"${CLEANUP[@]}"', '${CLEANUP[@]+"${CLEANUP[@]}"}')):
+            if old not in infra:
+                raise AssertionError(f"в infra нет «{old.strip()}» — стенду нечего подменить")
+            infra = infra.replace(old, new)
+        for path, text in (("infra", infra),
+                           ("install.sh", '#!/bin/sh\necho "install $(cat "$(dirname "$0")/VERSION")" >> "$STUB_LOG"\n'),
+                           ("roles/base/files/infra-log", '#!/bin/sh\necho "infra-log $*" >> "$STUB_LOG"\n'),
+                           (".gitignore", ".venv/\n")):
+            (origin / path).write_text(text)
+            (origin / path).chmod(0o755 if text.startswith("#!") else 0o644)
+
+        def git(*args):
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "gpg.format=ssh",
+                            "-c", f"user.signingkey={key}", *args], cwd=origin, check=True, capture_output=True)
+        git("init", "-q")
+        for version in ("1.0.0", "1.1.0"):
+            (origin / "VERSION").write_text(f"{version}\n")
+            git("add", ".")
+            git("commit", "-q", "-m", f"v{version}")
+            git("tag", "-s", f"v{version}", "-m", f"v{version}")
+        cls.origin = origin
+
+    def setUp(self):
+        self.engine = self.dir / "engine"
+        shutil.rmtree(self.engine, ignore_errors=True)
+        subprocess.run(["git", "clone", "-q", self.origin, self.engine], check=True)
+        subprocess.run(["git", "-c", "advice.detachedHead=false", "checkout", "-q", "v1.0.0"], cwd=self.engine,
+                       check=True)
+        (self.engine / ".venv/bin").mkdir(parents=True)
+        (self.engine / ".venv/bin/ansible-playbook").write_text(self.PLAYBOOK)
+        (self.engine / ".venv/bin/ansible-playbook").chmod(0o755)
+        self.log = self.dir / "stand.log"
+        self.log.write_text("")
+
+    def upgrade(self, *args, answer="", changed=2, rc=0, interrupt=False, apply_rc=0):
+        env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_LOG": str(self.log),
+               "STUB_CHANGED": str(changed), "STUB_RC": str(rc), "STUB_INT": "1" if interrupt else "",
+               "STUB_APPLY_RC": str(apply_rc)}
+        run = subprocess.run(["bash", str(self.engine / "infra"), "upgrade", "v1.1.0", *args], input=answer,
+                             env=env, capture_output=True, text=True, timeout=60, start_new_session=True)
+        engine = subprocess.run(["git", "describe", "--tags"], cwd=self.engine, check=True, capture_output=True,
+                                text=True).stdout.strip()
+        return run, engine, self.log.read_text().splitlines()
+
+    def assertReturned(self, lines):
+        self.assertEqual([x for x in lines if x.startswith("install ")][-1], "install 1.0.0")
+        self.assertIn("infra-log upgrade v1.1.0: только просмотр — движок возвращён на v1.0.0", lines)
+
+    def test_check(self):
+        run, engine, lines = self.upgrade("--check")
+        self.assertEqual((run.returncode, engine), (0, "v1.0.0"), run.stderr)
+        self.assertReturned(lines)
+        self.assertIn("== Движок возвращён: v1.0.0", run.stdout)
+
+    def test_answer_no(self):
+        run, engine, lines = self.upgrade(answer="n\n")
+        self.assertEqual((run.returncode, engine), (1, "v1.0.0"), run.stderr)
+        self.assertReturned(lines)
+
+    def test_preview_failed(self):
+        run, engine, lines = self.upgrade(rc=2)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(engine, "v1.0.0", run.stderr)
+        self.assertReturned(lines)
+
+    def test_interrupted_preview(self):
+        run, engine, lines = self.upgrade(interrupt=True)
+        self.assertEqual((run.returncode, engine), (130, "v1.0.0"), run.stderr)
+        self.assertReturned(lines)
+
+    def test_nothing_to_change_keeps_new(self):
+        run, engine, lines = self.upgrade(changed=0)
+        self.assertEqual((run.returncode, engine), (0, "v1.1.0"), run.stderr)
+        self.assertIn("infra-log upgrade: движок v1.0.0 → v1.1.0", lines)
+        self.assertEqual([x for x in lines if x.startswith("install ")], ["install 1.1.0"])
+        self.assertFalse([x for x in lines if "только просмотр" in x])
+
+    def test_answer_yes_keeps_new(self):
+        run, engine, lines = self.upgrade(answer="y\n")
+        self.assertEqual((run.returncode, engine), (0, "v1.1.0"), run.stderr)
+        self.assertIn("infra-log upgrade: движок v1.0.0 → v1.1.0", lines)
+        self.assertTrue(lines[-1].startswith("systemd-run "), lines)
+        self.assertEqual([x for x in lines if x.startswith("install ")], ["install 1.1.0"])
+
+    def test_failed_apply_keeps_new(self):
+        # прогон начат — сервер мог уже измениться новой версией, назад её не отмотать
+        run, engine, lines = self.upgrade(answer="y\n", apply_rc=1)
+        self.assertEqual((run.returncode, engine), (1, "v1.1.0"), run.stderr)
+        self.assertTrue(lines[-1].startswith("systemd-run "), lines)
+
+
 if __name__ == "__main__":
     unittest.main()

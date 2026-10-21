@@ -111,7 +111,7 @@ infra init     # имя сервера, email для Let's Encrypt, ваши SSH
 | `sudo infra edit secrets` | то же для `secrets.yml`: ключи S3, ghcr, Telegram |
 | `sudo infra apply [--check]` | применить настройки; `--check` — только показать изменения |
 | `sudo infra update` | обновления: Docker, Postgres, Traefik, пакеты (новое ядро — перезагрузка) |
-| `sudo infra upgrade <версия>` | новая версия движка (git-тег, подписанный ключом из `SIGNERS`), затем `apply` |
+| `sudo infra upgrade <версия>` | новая версия движка (git-тег, подписанный ключом из `SIGNERS`), затем `apply`; `--check` и «нет» — движок прежний |
 | `sudo project-compose <проект> ps` | `docker compose` проекта из его папки и с его `.env` |
 | `sudo project-deploy <проект> rollback` | вернуть версию до последней автовыкладки |
 | `sudo project-backup <проект>` | снимок проекта сейчас; вернуть — `project-restore` (`ADMIN.md`) |

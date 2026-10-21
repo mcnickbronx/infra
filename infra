@@ -8,7 +8,7 @@
 #   sudo infra apply [--check] [-y] [...]   показать, что изменится, и после подтверждения применить
 #                                          (--check — только показать, -y — применить без вопроса)
 #   sudo infra update [--check] [-y]        обновления: Docker, Postgres, Traefik, пакеты, перезагрузка
-#   sudo infra upgrade <версия> [...]       движок другой версии (git-тег с подписью из SIGNERS), затем apply
+#   sudo infra upgrade <версия> [...]       движок другой версии (git-тег с подписью из SIGNERS), затем apply; --check и «нет» движок не меняют
 #   sudo infra run <плейбук> [...]          плейбук движка как есть — для проверок (tests/verify.yml)
 # Остальные параметры уходят ansible-playbook: --tags project, -e skip_lockout_check=true (если уверены).
 # Движок — папка этого скрипта (/opt/infra), его Ansible — .venv в ней; настройки и пароли —
@@ -350,6 +350,18 @@ tag_signed() {
   git -C "$ENGINE" -c gpg.ssh.allowedSignersFile="$signers" verify-tag "refs/tags/$1" >/dev/null 2>&1
 }
 
+# Сервер не менялся (--check, «нет», предпросмотр не прошёл, Ctrl+C до прогона) — движок возвращается
+# на прежний коммит: иначе infra status показал бы неприменённую версию, а следующий infra edit или
+# update молча применил бы её. engine_back <версия> <прежняя версия> <её коммит>
+engine_back() {
+  trap - INT
+  git -C "$ENGINE" -c advice.detachedHead=false checkout --quiet "$3"
+  "$ENGINE/install.sh" >/dev/null ||     # Ansible и коллекции — снова прежних версий
+    echo "infra: движок $2, но Ansible — от $1: запустите $ENGINE/install.sh" >&2
+  log "upgrade $1: только просмотр — движок возвращён на $2"
+  echo "== Движок возвращён: $2"
+}
+
 # Ручные правки кода прямо в /opt/infra не пропадают молча: с ними upgrade отказывает.
 # Тег, который на GitHub подменили, git не скачает (fetch откажет: «would clobber existing tag»)
 cmd_upgrade() {
@@ -359,19 +371,29 @@ cmd_upgrade() {
   if [ -n "$(git -C "$ENGINE" status --porcelain --untracked-files=no)" ]; then
     die "в $ENGINE есть ручные правки (git -C $ENGINE status) — перенесите их в ветку движка или отмените"
   fi
-  local before
+  local before before_ref rc=0
   before=$(git -C "$ENGINE" describe --tags --always)
+  before_ref=$(git -C "$ENGINE" rev-parse HEAD)
   git -C "$ENGINE" fetch --quiet --tags origin
   git -C "$ENGINE" rev-parse -q --verify "refs/tags/$version" >/dev/null ||
     die "нет версии $version (версии — git-теги vX.Y.Z: git -C $ENGINE tag)"
   tag_signed "$version" || die "версия $version не подписана ключом из $ENGINE/SIGNERS — не ставлю:
   её мог выпустить кто угодно с доступом к репозиторию на GitHub. Своя сборка без подписи или
   старая версия (до v1.7.1) — вручную, ADMIN.md, «Обновления»"
+  STAGE=""
+  # Ctrl+C до прогона — движок назад; начатый прогон ставит свой обработчик (apply_in_background)
+  trap '[ "$STAGE" = apply ] || engine_back "$version" "$before" "$before_ref"; exit 130' INT
   git -C "$ENGINE" -c advice.detachedHead=false checkout --quiet "refs/tags/$version"
   "$ENGINE/install.sh"            # Ansible и коллекции — тех версий, что в новом движке
   log "upgrade: движок $before → $(git -C "$ENGINE" describe --tags --always)"
   echo "== Движок: $(git -C "$ENGINE" describe --tags --always)"
-  cmd_apply "$@"
+  cmd_apply "$@" || rc=$?
+  trap - INT
+  # «Изменений нет» и начатый прогон, даже упавший, — сервер уже менялся этой версией: она остаётся
+  if [ "$STAGE" != apply ] && { [ -n "$CHECK" ] || [ "$rc" != 0 ]; }; then
+    engine_back "$version" "$before" "$before_ref"
+  fi
+  return "$rc"
 }
 
 # ---------- Новый сервер ----------

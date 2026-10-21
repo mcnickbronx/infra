@@ -74,7 +74,7 @@ above its output; you can type the same by hand.
 | `sudo infra edit [secrets]` | edit `server.yml` (or `secrets.yml`): validate, show the diff, ask «Apply?» |
 | `sudo infra apply [--check]` | apply the settings; `--check` only shows the changes |
 | `sudo infra update` | updates: Docker, Postgres, Traefik, packages (a new kernel means a reboot) |
-| `sudo infra upgrade <version>` | another engine version (a git tag signed by a key in `SIGNERS`), then `apply` |
+| `sudo infra upgrade <version>` | another engine version (a git tag signed by a key in `SIGNERS`), then `apply`; `--check` or «no» keeps the engine as it was |
 | `sudo project-compose <project> ps` | `docker compose` of a project, from its folder with its `.env` |
 | `sudo project-deploy <project> rollback` | roll back the last autodeploy |
 | `sudo project-backup <project>` | a project snapshot now; restore — `project-restore` |
