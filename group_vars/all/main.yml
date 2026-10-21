@@ -23,8 +23,9 @@ postgres_version: 17
 traefik_image: traefik:v3.7
 
 # ======================= 2. По умолчанию =======================
+# Другое значение — тем же ключом в server.yml; у подраздела «Проект» — ключом в блоке проекта.
 
-# --- Для сервера: другое значение — в server.yml ---
+# --- Сервер, люди и проекты ---
 # Обязательные (здесь их нет): server_name, admin_keys, admin_ips, acme_email — server.yml.example
 admin_user: admin   # логин администратора на сервере: вход только по ключу, sudo без пароля
 timezone: Europe/Moscow   # сервер и контейнеры (через base.yml)
@@ -32,12 +33,14 @@ projects: {}        # проекты сервера; все ключи прое�
 people: {}          # люди сервера: SSH-ключ и IP
 docker_users: []    # кто запускает контейнеры (группа docker = root на сервере)
 
+# --- Бэкап ---
 # Копия бэкапов в S3 (уровень 3, README, «Бэкапы»). Пусто — без S3;
 # например "s3:https://storage.yandexcloud.net/my-backups". Ключи — s3_access_key и
 # s3_secret_key в /etc/infra/secrets.yml
 restic_s3_repository_base: ""
 
-# Уведомления — в Telegram: бот, чат и прокси в /etc/infra/secrets.yml (ADMIN.md, «Уведомления»)
+# --- Уведомления ---
+# В Telegram: бот, чат и прокси в /etc/infra/secrets.yml (ADMIN.md, «Уведомления»)
 disk_alert_percent: 80          # уведомление: диск заполнен на столько процентов
 backup_disk_stop_percent: 90    # ночной бэкап не пишет локальный снимок, чтобы не заполнить диск; «КРИТИЧНО»
 memory_alert_percent: 10        # уведомление: свободной памяти меньше стольких процентов
@@ -47,8 +50,10 @@ notify_summary_time: "09:00"    # утренняя сводка в Telegram: в�
 backup_healthcheck_url: ""      # ночной бэкап
 monitor_healthcheck_url: ""     # health-check каждые 10 минут: есть проблемы — /fail со списком
 
+# --- Postgres ---
 postgres_memory_share: 0.4      # доля RAM сервера под кеши Postgres
 
+# --- Ссылка доступа ---
 # Вход по SSH с меняющегося IP (мобильный интернет, поездка): одна секретная ссылка на сервер
 # (sudo infra-access link). Открыть её и нажать кнопку — SSH открыт текущему IP на access_link_hours
 # часов; в Telegram — кто открыт. Без SSH-ключа ссылка не впускает: она только открывает порт.
@@ -57,6 +62,7 @@ access_link: true
 access_link_host: ""
 access_link_hours: 24
 
+# --- Лимиты запросов Traefik ---
 # Защита всех сайтов от HTTP-флуда: лимиты на один IP. С запасом: страница с картинками —
 # десятки запросов разом, а за одним IP бывает целый офис или мобильный оператор (CGNAT).
 # Расчёт — личный кабинет: страница — ~15 запросов к API разом, офис из 10 человек
@@ -66,13 +72,14 @@ traefik_ratelimit_average: 200    # запросов в секунду в сре
 traefik_ratelimit_burst: 600      # разовый всплеск сверх среднего
 traefik_inflight_max: 150         # одновременных незавершённых запросов
 
+# --- Docker ---
 # userns-remap: процессы контейнеров на хосте — не root (DECISIONS.md, «Защита от взломанного
 # контейнера»). web/ проекта открыт этим группам внутри контейнера: 0 — root,
 # 33 — www-data (nginx, apache, php), 1000 — типичный пользователь приложения.
 # «Permission denied» у образа — user: "1000:1000" в compose или gid образа в этот список.
 docker_remap_web_gids: [0, 33, 1000]
 
-# --- Для проекта: другое значение — ключом в блоке проекта в server.yml (memory, cpus...) ---
+# --- Проект: другое значение — ключом в блоке проекта в server.yml (memory, cpus...) ---
 # Все контейнеры проекта (через extends в base.yml) работают в systemd slice
 # proj-<проект>.slice: память и CPU ограничены на весь проект, как его сервисы их ни делят.
 # Утечка памяти или майнер во взломанном контейнере не займут весь сервер.
@@ -101,6 +108,7 @@ rootless_port_base: 40000
 # Пароли — из /etc/infra/secrets.yml: его читает site.yml, недостающие пароли дописывает роль
 # secrets. Пароль базы проекта — db_password_<проект>
 secrets: "{{ secrets_file | default({}) | combine(generated_secrets | default({})) }}"
+# {shop: '<пароль>', crm: '<пароль>'} — пароль базы каждого проекта с db; берёт роль postgres
 db_passwords: "{{ dict(db_projects | map(attribute='key')
                        | zip(db_projects | map(attribute='key') | map('regex_replace', '^', 'db_password_') | map('extract', secrets))) }}"
 postgres_admin_password: "{{ secrets.postgres_admin_password }}"   # вы, пользователь admin_user: все базы, через туннель

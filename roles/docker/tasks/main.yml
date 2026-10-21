@@ -68,6 +68,8 @@
 # base.yml задаёт то же самое для сервисов с extends, но extends никто не проверяет.
 # ip 127.0.0.1: `ports: ["8080:80"]` без адреса открывает порт только на localhost.
 # Иначе Docker открыл бы его в интернет мимо ufw. Явный 0.0.0.0:... по-прежнему откроет.
+# live-restore: контейнеры работают, пока Docker перезапускается (обновление, правка daemon.json).
+# default-address-pools 172.24.0.0/13 — сети, которые compose создаёт сам: мимо сетей проектов 172.20.<net>.
 - name: Настройки демона (ротация логов, пулы адресов, userns-remap, no-new-privileges, ports на localhost)
   ansible.builtin.template:
     src: daemon.json.j2

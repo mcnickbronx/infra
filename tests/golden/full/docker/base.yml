@@ -1,4 +1,7 @@
 # Управляется Ansible. Общие настройки для сервисов: безопасность и время сервера.
+# Два сервиса — по тому, от кого стартует образ (TEAM.md, «compose.yml»):
+#   hardened-strict — приложение не от root (Node, Python, Go, Java), без особых прав; сначала его;
+#   hardened        — образ стартует от root (nginx, apache, php-fpm) или не запустился со strict.
 # Подключение в compose проекта:
 #   services:
 #     api:

@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Установка движка на сервер — как установка панели. На новом сервере с Ubuntu 26.04, от root:
-# клон в /opt/infra, последняя подписанная версия и этот файл — команды в ADMIN.md, «Новый сервер».
-# Ставит Ansible в /opt/infra/.venv (версии — requirements-server.txt и requirements.yml), команду
-# infra и папку /etc/infra с secrets.yml из образца — с пустыми строками под ключи, которые
-# вписываете вы (пароли допишет первый sudo infra apply); server.yml создаёт sudo infra init.
-# Повторный запуск ничего не ломает — так же после infra upgrade обновляются Ansible и коллекции.
-# Существующие server.yml и secrets.yml не трогает.
+# Установка движка на сервер — как установка панели.
+#
+# Когда: на новом сервере с Ubuntu 26.04, от root — клон в /opt/infra, последняя подписанная
+# версия и этот файл (команды — ADMIN.md, «Новый сервер»). Повторный запуск ничего не ломает:
+# так же после infra upgrade обновляются Ansible и коллекции.
+#
+# Что ставит:
+#   - Ansible в /opt/infra/.venv (версии — requirements-server.txt и requirements.yml);
+#   - команду infra;
+#   - папку /etc/infra с secrets.yml из образца: пустые строки под ключи, которые вписываете вы,
+#     пароли допишет первый sudo infra apply. server.yml создаёт sudo infra init.
+#
+# Не трогает: существующие server.yml и secrets.yml.
 set -euo pipefail
 ENGINE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 CONF=/etc/infra
