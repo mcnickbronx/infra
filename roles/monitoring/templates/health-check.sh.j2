@@ -29,6 +29,10 @@ HOURLY_LATE={{ [(backup_hourly_step | int) * 3, 60] | max }}   # минут бе
 STATE=${HEALTH_STATE_DIR:-/var/lib/health-check}/problems   # о чём уже сообщили (--notify)
 FAILED=${STATE%/*}/notify-failed               # не удалось отправить — повтор не раньше чем через час
 RESOLVE_MIN=${HEALTH_RESOLVE_MINUTES:-30}      # «прошло» — когда проблемы нет столько минут
+# IPv4 сервера: сайты проверяются запросом на него, как к своим доменам ходят проекты без root, — через
+# Traefik и проект (TLS, роутер, бэкенд). Файрвол (запрос идёт через lo) и CrowdSec (IP сервера не банится)
+# он не проходит: бан посетителей так не виден. Нет IPv4 — 127.0.0.1
+SERVER_IP={{ server_ips | first | default('127.0.0.1') }}
 {% raw %}
 PROBLEMS=""
 # problem "что" ["подробности"]: «что» без цифр — ключ проблемы для --notify
@@ -281,6 +285,65 @@ check_certificates() {
   fi
 }
 
+# ---------- Сайты ----------
+# Главная / каждого домена из labels Traefik — с самого сервера: 5xx или нет ответа — сбой; 2xx–4xx
+# (редирект, admin-only, 404 у API) — сайт отвечает. Сертификат не проверяется (-k): это check_certificates.
+# Время ограничено при любом числе сайтов (бэкенды висят — до 15 с на запрос): первые SITES_MAX доменов,
+# по SITES_PARALLEL запросов сразу; худший случай — 3 волны × 15 с, пауза 10 с, повтор 3 × 15 с = 100 с
+SITES_MAX=30
+SITES_PARALLEL=10
+SITE_HOSTS=""
+
+# Код ответа главной; 000 — нет ответа (таймаут, отказ в соединении, обрыв)
+site_code() {
+  local code
+  code=$(curl -sk -o /dev/null -w '%{http_code}' --noproxy '*' --connect-timeout 5 -m 15 \
+    -A infra-health-check --resolve "$1:443:$SERVER_IP" "https://$1/" 2>/dev/null)
+  if [[ $code =~ ^[0-9]{3}$ ]]; then echo "$code"; else echo 000; fi
+}
+
+# «домен код» по строке на домен, в порядке ответов: волнами по SITES_PARALLEL запросов
+site_codes() {
+  local host n=0
+  for host in "$@"; do
+    echo "$host $(site_code "$host")" &
+    (( ++n % SITES_PARALLEL )) || wait
+  done
+  wait
+}
+
+# Домены из labels — в цикле по Docker, проверка — одна на все (check_sites). Только работающие здоровые
+# и без healthcheck: о нездоровых, перезапускающихся и упавших уже говорят проверки выше
+collect_sites() {
+  SITE_HOSTS+=$(docker ps --filter status=running --filter health=healthy --filter health=none --format '{{.Labels}}' 2>/dev/null |
+    grep -o 'Host([^)]*)' | grep -o '`[^`]*`' | tr -d '`' | sort -u)$'\n'
+}
+
+# Сбой — повтор через 10 с: выкладка контейнера без healthcheck — не тревога. Сначала домены общего
+# Docker, потом проектов без root: сверх SITES_MAX — не проверены, строкой в подробностях
+check_sites() {
+  local host code hosts=() failing=() down="" codes="" skipped=0
+  while read -r host; do
+    [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || continue     # не имя домена — не проверяем
+    if [ ${#hosts[@]} -lt "$SITES_MAX" ]; then hosts+=("$host"); else skipped=$((skipped + 1)); fi
+  done < <(awk 'NF && !seen[$0]++' <<<"$SITE_HOSTS")
+  [ ${#hosts[@]} -gt 0 ] || return 0
+  while read -r host code; do
+    case $code in 5??|000) failing+=("$host") ;; esac
+  done < <(site_codes "${hosts[@]}")
+  [ ${#failing[@]} -gt 0 ] || return 0
+  sleep 10
+  while read -r host code; do
+    case $code in 5??|000) down+="$host " ;; *) continue ;; esac
+    if [ "$code" = 000 ]; then codes+="$host — нет ответа за 15 с, "; else codes+="$host — $code, "; fi
+  done < <(site_codes "${failing[@]}" | sort)
+  [ "$skipped" -eq 0 ] || codes+="не проверены: $skipped (проверяются первые $SITES_MAX доменов), "
+  if [ -n "$down" ]; then
+    problem "Сайты не отвечают (проверка с самого сервера): ${down% }" \
+      "${codes%, }. Проверить: curl -sk -o /dev/null -w '%{http_code}\n' --resolve <домен>:443:$SERVER_IP https://<домен>/. Почему: sudo project-compose <проект> logs --tail 50; если выше упавшие или нездоровые контейнеры — причина скорее в них"
+  fi
+}
+
 # ---------- Автовыкладка и обновления ----------
 
 # Не удалась: project-deploy оставляет <проект>.failed — когда, на каком шаге и что работает теперь.
@@ -427,8 +490,10 @@ for DOCKER_HOST in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootl
   check_project_volumes
   check_orphan_volumes
   check_certificates
+  collect_sites
 done
 unset DOCKER_HOST
+check_sites
 check_autodeploy
 check_backup
 check_backup_hourly

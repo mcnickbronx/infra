@@ -334,6 +334,12 @@
         # Нездоровый контейнер проекта shop: healthcheck не проходит никогда — ждём, пока Docker так его отметит
         docker run -d --name verify-unhealthy --label com.docker.compose.project=shop --health-cmd false \
           --health-interval 1s --health-retries 1 {{ image }} sleep infinity >/dev/null || exit 1
+        # Сайт не отвечает: роутер Traefik на порт, который никто не слушает, — Traefik отдаёт 502
+        docker run -d --name verify-site-down --network proj-shop --label traefik.enable=true \
+          --label 'traefik.http.routers.verify-site-down.rule=Host(`site-down.invalid`)' \
+          --label traefik.http.routers.verify-site-down.entrypoints=websecure \
+          --label traefik.http.services.verify-site-down.loadbalancer.server.port=8999 \
+          {{ image }} sleep infinity >/dev/null || exit 1
         for _ in $(seq 30); do
           [ -n "$(docker ps -q --filter name=verify-unhealthy --filter health=unhealthy)" ] && break; sleep 1
         done
@@ -359,13 +365,14 @@
           - "'SSH открыт мимо белого списка, правила ufw: from 198.51.100.5 to any port 22 proto tcp.' in bad_health.stdout"
           - "'Контейнеры нездоровы (не проходят свой healthcheck): verify-unhealthy' in bad_health.stdout"
           - "', нездоровых 1' in bad_health.stdout"
+          - "'Сайты не отвечают (проверка с самого сервера): ' in bad_health.stdout and 'site-down.invalid' in bad_health.stdout"
         fail_msg: "{{ bad_health.stdout }}"
         quiet: true
 
     - name: "3. Уборка"
       ansible.builtin.shell: |
         set -e
-        docker rm -fv verify-unhealthy >/dev/null
+        docker rm -fv verify-unhealthy verify-site-down >/dev/null
         docker compose -f verify-bad.yml down -v >/dev/null 2>&1
         ufw delete allow from 198.51.100.5 to any port 22 proto tcp >/dev/null
         project-compose shop down >/dev/null 2>&1

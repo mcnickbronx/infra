@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -221,18 +222,40 @@ class HealthCheckContainers(unittest.TestCase):
     и уведомления: о новом — один раз, о прошедшем — один раз."""
 
     SCRIPT = ROOT / "tests/golden/full/monitoring/health-check.sh"
-    # Заглушка отвечает только на запрос нездоровых; остальные проверки видят пустой Docker
+    # Заглушка отвечает на запросы нездоровых, перезапускающихся и labels; остальные проверки видят
+    # пустой Docker. Labels с фильтром сайтов — только здоровых, без фильтра — и больных (STUB_SICK_LABELS)
     DOCKER = """#!/bin/bash
-if [ "$*" = "ps --filter health=unhealthy --filter status=running --format {{.Names}}" ]; then
-  [ -z "$STUB_UNHEALTHY" ] || printf '%s\\n' $STUB_UNHEALTHY
-fi
+case "$*" in
+  "ps --filter health=unhealthy --filter status=running --format {{.Names}}")
+    [ -z "$STUB_UNHEALTHY" ] || printf '%s\\n' $STUB_UNHEALTHY ;;
+  "ps --filter status=restarting --format {{.Names}}")
+    [ -z "$STUB_RESTARTING" ] || printf '%s\\n' $STUB_RESTARTING ;;
+  "ps --filter status=running --filter health=healthy --filter health=none --format {{.Labels}}")
+    printf '%s' "$STUB_LABELS" ;;
+  *"--format {{.Labels}}"*)
+    printf '%s' "$STUB_LABELS$STUB_SICK_LABELS" ;;
+esac
 """
     NOTIFY = '#!/bin/bash\nprintf "%s\\n---\\n" "$1" >> "$STUB_SENT"\n'
+    # curl: код по домену из STUB_SITES («домен=502» или «домен=502,200» — по попыткам), иначе 200;
+    # 000 — как настоящий при таймауте, с кодом 28, через STUB_HANG секунд. Аргументы — в STUB_CURL_LOG
+    CURL = """#!/bin/bash
+printf '%s\\n' "$*" >> "$STUB_CURL_LOG"
+url=${!#}; host=${url#https://}; host=${host%%/*}
+n=$(grep -cF -- "https://$host/" "$STUB_CURL_LOG")
+codes=$(printf '%s\\n' $STUB_SITES | awk -F= -v h="$host" '$1 == h { print $2 }')
+code=$(awk -F, -v n="$n" '{ print (n <= NF ? $n : $NF) }' <<<"${codes:-200}")
+[ "$code" != 000 ] || /bin/sleep "${STUB_HANG:-0}"
+printf '%s' "$code"
+[ "$code" != 000 ] || exit 28
+"""
+    SLEEP = '#!/bin/bash\nprintf "%s\\n" "$*" >> "$STUB_SLEPT"\n'
 
     def setUp(self):
         self.dir = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.dir)
-        for name, text in (("docker", self.DOCKER), ("infra-notify", self.NOTIFY)):
+        for name, text in (("docker", self.DOCKER), ("infra-notify", self.NOTIFY), ("curl", self.CURL),
+                           ("sleep", self.SLEEP)):
             (self.dir / name).write_text(text)
             (self.dir / name).chmod(0o755)
         # из эталона — функции (до «Все проверки») и цикл проверок контейнеров, как на сервере;
@@ -243,10 +266,12 @@ fi
         self.checks = head + tail[start:end + len("\ndone\n")]
         self.sent = self.dir / "sent"
 
-    def run_checks(self, unhealthy, *calls, resolve=30):
+    def run_checks(self, unhealthy, *calls, resolve=30, **stubs):
         env = {**os.environ, "PATH": f"{self.dir}:{os.environ['PATH']}", "STUB_UNHEALTHY": unhealthy,
                "STUB_SENT": str(self.sent), "HEALTH_STATE_DIR": str(self.dir / "state"),
-               "HEALTH_RESOLVE_MINUTES": str(resolve)}
+               "HEALTH_RESOLVE_MINUTES": str(resolve), "STUB_CURL_LOG": str(self.dir / "curl.log"),
+               "STUB_SLEPT": str(self.dir / "sleep.log"), "STUB_RESTARTING": "", "STUB_LABELS": "",
+               "STUB_SICK_LABELS": "", "STUB_SITES": "", **stubs}
         script = self.checks + "\n".join(calls) + "\n"
         return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=True).stdout
 
@@ -270,6 +295,92 @@ fi
         self.assertEqual(len(self.messages()), 2)
         self.assertIn("— прошло:", self.messages()[1])
         self.assertIn("shop-back-1", self.messages()[1])
+
+    # labels трёх работающих контейнеров: два имени через ||, условие с путём, Host с двумя именами
+    LABELS = ("com.docker.compose.project=shop,traefik.enable=true,"
+              "traefik.http.routers.shop.rule=Host(`shop.example.com`) || Host(`www.shop.example.com`)\n"
+              "traefik.http.routers.lab.rule=Host(`lab.example.com`) && PathPrefix(`/`),traefik.enable=true\n"
+              "traefik.http.routers.api.rule=Host(`api.example.com`, `api2.example.com`)\n")
+    SITES = ["shop.example.com", "www.shop.example.com", "lab.example.com", "api.example.com", "api2.example.com"]
+
+    def curls(self):
+        log = self.dir / "curl.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_sites_answering_are_fine(self):
+        out = self.run_checks("", "check_sites", 'render "$PROBLEMS"', STUB_LABELS=self.LABELS,
+                              STUB_SITES="shop.example.com=200 www.shop.example.com=301 lab.example.com=404 "
+                                         "api.example.com=403 api2.example.com=200")
+        self.assertEqual(out, "")
+        self.assertEqual(len(self.curls()), len(self.SITES))   # каждый домен — один раз, без повтора
+        self.assertFalse((self.dir / "sleep.log").exists())
+        for site in self.SITES:
+            calls = [c for c in self.curls() if c.endswith(f" https://{site}/")]
+            self.assertEqual(len(calls), 1, site)
+            self.assertIn(f"--resolve {site}:443:192.0.2.1 ", calls[0])   # публичный IPv4 сервера
+            self.assertNotIn("-L", calls[0].split())
+
+    def test_5xx_and_no_answer_after_retry(self):
+        out = self.run_checks("", "check_sites", 'render "$PROBLEMS"', STUB_LABELS=self.LABELS,
+                              STUB_SITES="shop.example.com=502 lab.example.com=000 api.example.com=503,200")
+        self.assertIn("Сайты не отвечают (проверка с самого сервера): lab.example.com shop.example.com\n", out)
+        self.assertEqual(out.count("Сайты не отвечают"), 1)
+        self.assertIn("shop.example.com — 502", out)
+        self.assertIn("lab.example.com — нет ответа", out)
+        self.assertIn("--resolve <домен>:443:192.0.2.1", out)
+        self.assertIn("project-compose <проект> logs --tail 50", out)
+        self.assertNotIn("api.example.com", out)               # 503, через 10 с — 200: выкладка, не сбой
+        self.assertEqual((self.dir / "sleep.log").read_text(), "10\n")   # одна пауза на все повторы
+        self.assertEqual(len(self.curls()), len(self.SITES) + 3)
+
+    def test_sick_containers_not_checked(self):
+        sick = ("traefik.http.routers.bad.rule=Host(`bad.example.com`)\n"
+                "traefik.http.routers.loop.rule=Host(`loop.example.com`)\n")
+        out = self.run_checks("shop-bad-1", "check_sites", 'render "$PROBLEMS"', STUB_RESTARTING="shop-loop-1",
+                              STUB_LABELS="traefik.http.routers.ok.rule=Host(`ok.example.com`)\n",
+                              STUB_SICK_LABELS=sick, STUB_SITES="bad.example.com=502 loop.example.com=000")
+        self.assertIn("Контейнеры нездоровы (не проходят свой healthcheck): shop-bad-1", out)
+        self.assertIn("Контейнеры перезапускаются по кругу: shop-loop-1", out)
+        self.assertNotIn("Сайты не отвечают", out)
+        self.assertEqual([c.split()[-1] for c in self.curls()], ["https://ok.example.com/"])
+
+    def test_odd_labels_and_no_docker(self):
+        labels = ("traefik.http.routers.a.rule=Host(`a.example.com`) && PathPrefix(`/api`),"
+                  "note=it's \"quoted\" $(echo pwned >> \"$STUB_CURL_LOG\") * ; `x`,"
+                  "traefik.http.routers.b.rule=HostRegexp(`^.+\\.example\\.com$`),"
+                  "traefik.http.routers.c.rule=Host(`user@evil.example.com`) || Host(`-o.example.com/x`) || Host(`--config`)\n"
+                  "traefik.http.routers.a2.rule=Host(`a.example.com`)\n")
+        self.assertEqual(self.run_checks("", "check_sites", 'render "$PROBLEMS"', STUB_LABELS=labels), "")
+        self.assertEqual([c.split()[-1] for c in self.curls()], ["https://a.example.com/"])
+        (self.dir / "curl.log").unlink()
+        self.assertEqual(self.run_checks("", "check_sites", 'render "$PROBLEMS"'), "")    # Docker пуст или не отвечает
+        self.assertEqual(self.curls(), [])
+
+    def test_sites_notified_once(self):
+        self.run_checks("", "check_sites", "notify_changes", STUB_LABELS=self.LABELS,
+                        STUB_SITES="shop.example.com=502")
+        self.run_checks("", "check_sites", "notify_changes", STUB_LABELS=self.LABELS,
+                        STUB_SITES="shop.example.com=504")
+        self.assertEqual(len(self.messages()), 1)                # 502 → 504 — та же проблема
+        self.assertIn("— новое:", self.messages()[0])
+        self.assertIn("Сайты не отвечают (проверка с самого сервера): shop.example.com", self.messages()[0])
+        self.run_checks("", "check_sites", "notify_changes", resolve=0, STUB_LABELS=self.LABELS)
+        self.assertEqual(len(self.messages()), 2)
+        self.assertIn("— прошло:", self.messages()[1])
+        self.assertIn("shop.example.com", self.messages()[1])
+
+    def test_hanging_sites_time_is_bounded(self):
+        # 35 доменов, 10 «висят» (заглушка curl ждёт 1 с, потом 000): по одному — 20 с и больше
+        names = [f"s{i:02}.example.com" for i in range(35)]
+        labels = "".join(f"traefik.http.routers.r{i}.rule=Host(`{n}`)\n" for i, n in enumerate(names))
+        start = time.monotonic()
+        out = self.run_checks("", "check_sites", 'render "$PROBLEMS"', STUB_LABELS=labels, STUB_HANG="1",
+                              STUB_SITES=" ".join(f"{n}=000" for n in names[:10]))
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertIn("Сайты не отвечают (проверка с самого сервера): " + " ".join(names[:10]) + "\n", out)
+        self.assertIn("не проверены: 5", out)                    # больше 30 доменов — проверяются первые 30
+        self.assertEqual(sorted({c.split()[-1] for c in self.curls()}), [f"https://{n}/" for n in names[:30]])
+        self.assertIn("\ndone\nunset DOCKER_HOST\ncheck_sites\n", self.SCRIPT.read_text())   # после цикла по Docker
 
 
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
