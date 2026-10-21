@@ -3,6 +3,8 @@ entryPoints:
   web:
     address: ":80"
     http:
+      # То же, что на websecure: заголовки-двойники выбрасываются.
+      aliasHeadersStrategy: delete
       redirections:
         entryPoint:
           to: websecure
@@ -10,6 +12,10 @@ entryPoints:
   websecure:
     address: ":443"
     http:
+      # Заголовки-двойники с «_» или «.» в имени (X_Forwarded_For, X.Real.Ip) выбрасываются:
+      # бэкенд, который не отличает их от настоящих, не получит подделку. Без опции Traefik
+      # предупреждает при каждом старте.
+      aliasHeadersStrategy: delete
       # Все роутеры на 443 автоматически получают SSL и заголовки безопасности,
       # командам не нужно прописывать это в labels. Баны CrowdSec действуют раньше,
       # в файрволе (firewall-bouncer, роль crowdsec): забаненный IP сюда не доходит.
