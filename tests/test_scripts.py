@@ -670,7 +670,8 @@ class ProjectDeployTo(unittest.TestCase):
     """project-deploy <проект> to <тег>: образа нет — .env побайтно тот же; есть — выкладка, и в .env заменена одна
     строка DEPLOY_IMAGE, владелец и права прежние; .env-ссылка — отказ; сбой выкладки — прежние версия и .env.
     Стенд: скрипт с папками проекта и состояния во временной папке; docker, project-compose, flock, infra-log —
-    заглушки, пишут строку в журнал стенда; chown, chmod и mv — на Python (--reference и -T на Mac нет)."""
+    заглушки, пишут строку в журнал стенда; chown, chmod, mv и dd — на Python (--reference, -T и iflag=nofollow
+    на Mac нет)."""
 
     REPO = "ghcr.io/example/shop"
     HASH = "bb168cfcfece1b663da0141574e4994eed9eea20"
@@ -707,6 +708,10 @@ esac
         "chown": PYTHON + "ref = os.stat(args[0].split('=', 1)[1]); os.chown(args[1], ref.st_uid, ref.st_gid)\n",
         "chmod": PYTHON + "os.chmod(args[1], stat.S_IMODE(os.stat(args[0].split('=', 1)[1]).st_mode))\n",
         "mv": PYTHON + "os.replace(args[0], args[1])\n",
+        # dd if=<файл> [iflag=nofollow]: с nofollow ссылку не открывает (O_NOFOLLOW), как GNU dd и uutils
+        "dd": PYTHON + "opts = dict(a.split('=', 1) for a in args)\n"
+              "flags = os.O_RDONLY | (os.O_NOFOLLOW if 'nofollow' in opts.get('iflag', '').split(',') else 0)\n"
+              "sys.stdout.buffer.write(os.fdopen(os.open(opts['if'], flags), 'rb').read())\n",
     }
 
     def setUp(self):
@@ -837,6 +842,36 @@ esac
                 self.assertIn(error, run.stderr)
                 self.assertEqual(self.env.read_text(), text + "\n")
                 self.assertEqual(lines, [pulled] if pulled else [])
+
+    def swap_env(self, stub, when, then):
+        """Заглушка stub при аргументах when (шаблон case) подменяет .env ссылкой на .env чужого проекта (папка 0700),
+        как участник проекта, у которого web/ открыта на запись, и запускает then. Затем to <хеш>"""
+        other = self.dir / "other"
+        other.mkdir(mode=0o700)
+        (other / ".env").write_text("DEPLOY_IMAGE=ghcr.io/example/other:main\ndb_password_other=s3cret\n")
+        (self.bin / stub).write_text(f'#!/bin/bash\ncase "$*" in {when}) rm -f .env && ln -s "{other}/.env" .env ;; esac\n'
+                                     f'exec {then} "$@"\n')
+        (self.bin / stub).chmod(0o755)
+        run, lines = self.deploy("to", self.HASH)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn(f"работает {self.REPO}:{self.HASH}, но .env не записан", run.stderr)
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.NEW}")
+        self.assertTrue(self.env.is_symlink())                    # root по ссылке не писал
+        self.assertEqual(self.leftovers(), ["compose.yml"])       # временного .env.* нет
+        self.assertFalse([p.name for p in self.web.iterdir()
+                          if not p.is_symlink() and p.is_file() and "s3cret" in p.read_text()])
+        self.assertFalse([x for x in lines if "DEPLOY_IMAGE" in x], lines)
+        return run
+
+    def test_env_swapped_during_rollout(self):
+        # подменили, пока шёл запуск, — повторная проверка перед чтением
+        (self.bin / "project-compose").rename(self.bin / "project-compose.real")
+        run = self.swap_env("project-compose", '*" up "*', f'"{self.bin}/project-compose.real"')
+        self.assertIn("ссылка или не файл", run.stderr)
+
+    def test_env_swapped_after_check(self):
+        # подменили уже после проверки, перед чтением, — dd с nofollow ссылку не открывает
+        self.swap_env("mktemp", "*", shutil.which("mktemp"))
 
 if __name__ == "__main__":
     unittest.main()

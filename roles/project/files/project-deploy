@@ -209,12 +209,17 @@ to() {
   [ "$IMAGE" != "$TO" ] || return 0
 
   # .env — как в project-db-env: новый рядом и на место одним mv (web/ открыта участникам на запись,
-  # и файл, который root пишет по имени, могли бы подменить ссылкой); владелец и права — прежние
+  # и файл, который root пишет по имени, могли бы подменить ссылкой); владелец и права — прежние.
+  # Выкладка шла минуты — за это время .env могли подменить ссылкой на чужой файл, и root прочёл бы его
+  # в .env проекта: проверка ещё раз, а читает dd с nofollow — ссылку, подложенную после проверки, он не откроет
+  local half="работает $TO, но .env не записан — таймер вернёт образ из .env; впишите DEPLOY_IMAGE=$TO сами"
+  [ -f .env ] && [ ! -L .env ] ||
+    { echo "$NAME: .env подменили — теперь это ссылка или не файл, root его не читает; $half" >&2; exit 1; }
   ENV_NEW=$(mktemp .env.XXXXXX)
   trap 'rm -f "$ENV_NEW"' EXIT
-  sed "s|^DEPLOY_IMAGE=.*|DEPLOY_IMAGE=$TO|" .env > "$ENV_NEW" && chown --reference=.env "$ENV_NEW" &&
-    chmod --reference=.env "$ENV_NEW" && mv -fT "$ENV_NEW" .env ||
-    { echo "$NAME: работает $TO, но .env не записан — таймер вернёт образ из .env; впишите DEPLOY_IMAGE=$TO сами" >&2; exit 1; }
+  dd if=.env iflag=nofollow status=none | sed "s|^DEPLOY_IMAGE=.*|DEPLOY_IMAGE=$TO|" > "$ENV_NEW" &&
+    chown --reference=.env "$ENV_NEW" && chmod --reference=.env "$ENV_NEW" && mv -fT "$ENV_NEW" .env ||
+    { echo "$NAME: $half" >&2; exit 1; }
   echo "$NAME: в .env DEPLOY_IMAGE=$TO"
   infra-log "выкладка $NAME: DEPLOY_IMAGE ${IMAGE##*/} → ${TO##*/}"
 }
