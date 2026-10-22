@@ -1,0 +1,30 @@
+# Образ Traefik на сервере не старше того, что нужно traefik.yml.j2: незнакомую опцию в настройках
+# Traefik не принимает и не стартует — сайты сервера не откроются. А apply и upgrade образ не скачивают,
+# свежий ставит только infra update. Проверка идёт и в --check: предпросмотр apply и upgrade
+# остановится до изменений. Не в preflight: тот проверяет только описание сервера, без сервера.
+- name: Версия образа Traefik на сервере
+  ansible.builtin.command: >-
+    docker image inspect --format '{{ '{{' }}index .Config.Labels "org.opencontainers.image.version"{{ '}}' }}'
+    {{ traefik_image }}
+  register: traefik_image_version
+  changed_when: false
+  check_mode: false     # только читает; иначе в --check stdout пустой
+  # Образа нет (свежий сервер, другой traefik_image) или ещё нет Docker — compose скачает нужный тег
+  failed_when: false
+
+- name: Образ Traefik не старше нужного настройкам
+  vars:
+    # Поднимать вместе с новой опцией в traefik.yml.j2; сейчас — aliasHeadersStrategy (v3.7.12)
+    traefik_needs: "3.7.12"
+    found: "{{ traefik_image_version.stdout | trim }}"
+  ansible.builtin.assert:
+    that:
+      - found is match('v?[0-9]+[.][0-9]+[.][0-9]+')
+      - found | regex_search('[0-9]+[.][0-9]+[.][0-9]+') is version(traefik_needs, '>=')
+    fail_msg: >-
+      Образ {{ traefik_image }} на сервере — Traefik {{ found or 'без ярлыка версии' }}, а настройкам движка
+      нужен v{{ traefik_needs }} или новее: со старым Traefik не стартует, и сайты сервера не откроются.
+      Сначала свежий образ — sudo infra update (свой traefik_image в server.yml — не ниже v{{ traefik_needs }}),
+      потом снова apply или upgrade. Настройки Traefik не тронуты, сайты работают как прежде.
+    quiet: true
+  when: traefik_image_version.rc == 0

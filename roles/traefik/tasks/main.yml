@@ -1,3 +1,7 @@
+# Раньше всего: образ Traefik на сервере не старше нужного настройкам ниже
+- name: Образ Traefik
+  ansible.builtin.import_tasks: image.yml
+
 - name: Папки Traefik
   ansible.builtin.file:
     path: "{{ item.path }}"
