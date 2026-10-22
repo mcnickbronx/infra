@@ -1,5 +1,6 @@
 """Проверки Python-кода репозитория без сервера: python3 -m unittest discover -s tests
 (запускает tools/check.sh). Нужен только стандартный Python; для проверки подписи — git и ssh-keygen."""
+import hashlib
 import importlib.machinery
 import importlib.util
 import os
@@ -23,6 +24,56 @@ def load(name, path):
 
 
 wl = load("ufw_sync_whitelist", "roles/base/files/ufw-sync-whitelist")
+
+
+class SecretSums(unittest.TestCase):
+    """infra: отпечатки паролей (secret_sums) и их сравнение (sums_diff) — какие пароли появились, сменились,
+    удалены. Файл отпечатков пишет то админ (его локаль), то служба infra-apply (локаль C): порядок строк
+    в нём не должен влиять на итог."""
+
+    def setUp(self):
+        # из infra — две функции целиком, как есть
+        text = (ROOT / "infra").read_text()
+        parts = []
+        for name in ("secret_sums", "sums_diff"):
+            start = text.find(f"\n{name}() {{\n")
+            end = text.find("\n}\n", start)
+            self.assertTrue(0 <= start < end, f"в infra нет функции {name}")
+            parts.append(text[start:end + len("\n}\n")])
+        self.functions = "set -euo pipefail\n" + "".join(parts)
+
+    def run_bash(self, call, locale="C", **env):
+        env = {**os.environ, "LC_ALL": locale, **env}
+        run = subprocess.run(["bash", "-c", self.functions + call + "\n"], env=env, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout
+
+    def diff(self, old, new):
+        return self.run_bash('sums_diff "$OLD" "$NEW"', OLD=old, NEW=new)
+
+    def test_changed_when_old_file_sorted_in_other_locale(self):
+        # старый файл записан в локали, где «_» не в счёт (dbpass выше db_password_shop), новый — в C
+        old = "dbpass 1111aaaa1111aaaa\ndb_password_shop 2222bbbb2222bbbb\nrestic_password 3333cccc3333cccc"
+        new = "db_password_shop 4444dddd4444dddd\ndbpass 1111aaaa1111aaaa\nrestic_password 3333cccc3333cccc"
+        self.assertEqual(self.diff(old, new), "сменились db_password_shop\n")
+
+    def test_added_and_removed_in_other_order(self):
+        old = "s3_secret_key 1111aaaa1111aaaa\ndbpass 2222bbbb2222bbbb\ndb_password_shop 3333cccc3333cccc"
+        new = "db_password_lab 4444dddd4444dddd\ndb_password_shop 3333cccc3333cccc\ndbpass 2222bbbb2222bbbb"
+        self.assertEqual(self.diff(old, new), "появились db_password_lab\nудалены s3_secret_key\n")
+        self.assertEqual(self.diff(new, new), "")
+
+    def test_sums_in_c_order_without_blanks(self):
+        secrets = pathlib.Path(tempfile.mkdtemp()) / "secrets.yml"
+        self.addCleanup(shutil.rmtree, secrets.parent)
+        secrets.write_text('# пароли сервера\ndbpass: one-fake\ns3_secret_key: ""  # вписать\n'
+                           "db_password_shop: two-fake\ntelegram_token: ''\nrestic_password: # потом\n")
+        expected = "".join(f"{key} {hashlib.sha256(value.encode()).hexdigest()[:16]}\n"
+                           for key, value in (("db_password_shop", "two-fake"), ("dbpass", "one-fake")))
+        # тот же порядок, кто бы ни запустил: в en_US.UTF-8 на Linux «_» при сортировке не в счёт
+        for locale in ("C", "en_US.UTF-8"):
+            with self.subTest(locale=locale):
+                self.assertEqual(self.run_bash('secret_sums "$SECRETS"', locale, SECRETS=str(secrets)), expected)
 
 
 class UfwWhitelist(unittest.TestCase):
