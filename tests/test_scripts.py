@@ -873,5 +873,21 @@ esac
         # подменили уже после проверки, перед чтением, — dd с nofollow ссылку не открывает
         self.swap_env("mktemp", "*", shutil.which("mktemp"))
 
+    def test_failed_to_keeps_failed_head_banned(self):
+        # голова ветки уже не удалась, администратор переходит на хорошую версию — и to тоже не удался:
+        # отметка остаётся, таймер упавшую голову снова не выкладывает
+        bad = "sha256:" + "3" * 64
+        tags = f"{self.REPO}:main={bad} {self.REPO}:{self.HASH}={self.NEW}"
+        (self.states / "shop.failed-ref").write_text(f"{self.REPO}@{bad}\n")
+        run, _ = self.deploy("to", self.HASH, STUB_FAIL_UP="1", STUB_TAGS=tags)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("не удалось на шаге «запуск»", run.stderr)
+        self.assertEqual(self.state("failed-ref"), f"{self.REPO}@{bad}")
+        self.log.unlink()
+        run, lines = self.deploy(STUB_TAGS=tags)                   # таймер, через 15 секунд
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+        self.assertFalse([x for x in lines if not x.startswith("docker ") or x.startswith("docker run")], lines)
+
 if __name__ == "__main__":
     unittest.main()
