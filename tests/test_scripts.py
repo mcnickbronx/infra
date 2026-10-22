@@ -531,6 +531,85 @@ class SignedUpgrade(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
+class ReleaseScript(unittest.TestCase):
+    """tools/release.sh: проверки до изменений, CHANGELOG с пустым «Не выпущено» сверху, коммит и подписанный тег."""
+
+    CHANGELOG = "# Изменения движка\n\n## Не выпущено\n\n- новое раз\n- новое два\n\n## v1.0.0 — 2026-01-01 — первая\n\n- было\n"
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.repo = self.dir / "engine"
+        (self.repo / "tools").mkdir(parents=True)
+        key = self.dir / "author"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "author", "-f", key], check=True)
+        public = pathlib.Path(f"{key}.pub").read_text().split()
+        (self.repo / "SIGNERS").write_text(f'author namespaces="git" {public[0]} {public[1]}\n')
+        shutil.copy(ROOT / "infra", self.repo / "infra")
+        if (ROOT / "tools/release.sh").exists():
+            shutil.copy(ROOT / "tools/release.sh", self.repo / "tools/release.sh")
+        (self.repo / "CHANGELOG.md").write_text(self.CHANGELOG)
+        self.env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "RELEASE_CHECK": "true"}
+        self.git("init", "-q", "-b", "main")
+        for k, v in (("user.name", "t"), ("user.email", "t@example.org"), ("gpg.format", "ssh"),
+                     ("user.signingkey", str(key))):
+            self.git("config", k, v)
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "v1.0.0")
+        self.git("tag", "-s", "v1.0.0", "-m", "v1.0.0")
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.repo, env=self.env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def release(self, *args):
+        return subprocess.run(["bash", str(self.repo / "tools/release.sh"), *args], cwd=self.dir, env=self.env,
+                              capture_output=True, text=True)
+
+    def assertRefused(self, *args):
+        head = self.git("rev-parse", "HEAD")
+        changelog = (self.repo / "CHANGELOG.md").read_text()
+        result = self.release(*args)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual((self.repo / "CHANGELOG.md").read_text(), changelog)
+        self.assertEqual(self.git("tag", "-l"), "v1.0.0")
+        return result.stderr
+
+    def test_release(self):
+        result = self.release("1.0.1", "заголовок")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("git push origin main v1.0.1", result.stdout)
+        today = time.strftime("%Y-%m-%d")
+        self.assertEqual((self.repo / "CHANGELOG.md").read_text(), self.CHANGELOG.replace(
+            "## Не выпущено\n", f"## Не выпущено\n\n## v1.0.1 — {today} — заголовок\n"))
+        self.assertEqual(self.git("log", "--format=%s", "v1.0.0..HEAD"), "v1.0.1: заголовок")
+        self.assertEqual(self.git("diff", "--name-only", "v1.0.0", "HEAD"), "CHANGELOG.md")
+        self.assertEqual(self.git("rev-parse", "v1.0.1^{commit}"), self.git("rev-parse", "HEAD"))
+        signed = subprocess.run(["bash", str(self.repo / "infra"), "tag-signed", "v1.0.1"], env=self.env)
+        self.assertEqual(signed.returncode, 0)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_nothing_unreleased(self):
+        (self.repo / "CHANGELOG.md").write_text("## Не выпущено\n\n## v1.0.0 — 2026-01-01 — первая\n\n- было\n")
+        self.git("commit", "-q", "-am", "пусто")
+        self.assertIn("пусто", self.assertRefused("1.0.1", "заголовок"))
+
+    def test_dirty_tree(self):
+        (self.repo / "infra").write_text("правка")
+        self.assertIn("несохранённое", self.assertRefused("1.0.1", "заголовок"))
+
+    def test_version_not_newer(self):
+        self.assertIn("не новее", self.assertRefused("0.9.9", "заголовок"))
+        self.assertIn("уже есть", self.assertRefused("1.0.0", "заголовок"))
+        self.assertIn("использование", self.assertRefused("1.0", "заголовок"))
+
+    def test_only_from_main(self):
+        self.git("switch", "-q", "-c", "other")
+        self.assertIn("main", self.assertRefused("1.0.1", "заголовок"))
+
+
+@unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class UpgradePreview(unittest.TestCase):
     """infra upgrade: сервер не менялся (--check, «нет», предпросмотр не прошёл, Ctrl+C) — движок прежней версии;
     «изменений нет» и «да» — новой. Стенд: «origin» с подписанными v1.0.0 и v1.1.0, движок — его клон на v1.0.0,
