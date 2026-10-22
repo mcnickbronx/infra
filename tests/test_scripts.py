@@ -789,7 +789,11 @@ esac
         # chown --reference=<файл> | <uid>:<gid> и chmod --reference=<файл> | <восьмеричные>: по ссылке идут, как GNU без -h
         "chown": PYTHON + "who, path = args\n"
                  "if who.startswith('--reference='): ref = os.stat(who.split('=', 1)[1]); who = f'{ref.st_uid}:{ref.st_gid}'\n"
-                 "os.chown(path, *map(int, who.split(':')))\n",
+                 "os.chown(path, *map(int, who.split(':')))\n"
+                 # STUB_RESTORE_ENV — крючок «после чтения, до сверки stat»: участник возвращает прежний .env (тот же inode)
+                 # с <.env>.held на место ссылки — сверка stat подмены не видит, защищает только nofollow у dd
+                 "if os.environ.get('STUB_RESTORE_ENV'):\n"
+                 "    os.replace(os.environ['STUB_RESTORE_ENV'] + '.held', os.environ['STUB_RESTORE_ENV'])\n",
         "chmod": PYTHON + "how, path = args\n"
                  "os.chmod(path, stat.S_IMODE(os.stat(how.split('=', 1)[1]).st_mode) if how.startswith('--reference=') else int(how, 8))\n",
         # stat -c <формат> <файл>: %i %u %g %a %F, по ссылке не идёт (lstat), как GNU stat и uutils без -L
@@ -975,6 +979,21 @@ esac
         # подменили уже после проверки, перед чтением, — dd с nofollow ссылку не открывает
         self.swap_env("mktemp", "*", shutil.which("mktemp"))
 
+    def test_env_swapped_after_check_and_back_refused(self):
+        # подменили ссылкой на чужой файл перед чтением, а прежний .env вернули до сверки stat (тот же inode —
+        # сверка не ловит): отказ даёт только dd с nofollow, текст чужого файла не попал ни в один файл
+        victim = victim_file(self.dir)
+        participant_mktemp(self.bin, self.web, victim, swap="env-back")
+        run, _ = self.deploy("to", self.HASH, STUB_RESTORE_ENV=str(self.env))
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn(f"работает {self.REPO}:{self.HASH}, но .env не записан", run.stderr)
+        self.assertEqual((victim.read_text(), victim.stat().st_mode & 0o777), ("victim\n", 0o600))
+        self.assertEqual(files_with(self.proj, "victim"), [])
+        self.assertEqual(self.fs("mv"), ["mv compose.yml.new compose.yml"])     # .env не трогали
+        self.assertFalse([p.name for p in self.proj.iterdir() if p.name.startswith(".env")])
+        held = self.web / ".env.held"
+        self.assertEqual((self.env if not self.env.is_symlink() else held).read_text(), self.ENV)
+
     def test_failed_to_keeps_failed_head_banned(self):
         # голова ветки уже не удалась, администратор переходит на хорошую версию — и to тоже не удался:
         # отметка остаётся, таймер упавшую голову снова не выкладывает
@@ -1061,7 +1080,8 @@ def victim_file(root):
 def participant_mktemp(bin_dir, web, victim, swap):
     """mktemp с участником проекта, которому web/ открыта на запись: настоящий mktemp, путь — в журнал файловых
     команд; затем участник подменяет ссылкой на victim временный файл, если он создан в web/ (swap="tmp"),
-    или сам .env (swap="env")"""
+    или сам .env (swap="env"); swap="env-back" — .env откладывает в .env.held, на его место ссылку (вернуть прежний
+    файл до сверки stat — крючок STUB_RESTORE_ENV в chown)"""
     real = os.path.realpath(web)
     (bin_dir / "mktemp").write_text(f"""#!/bin/bash
 f=$({shutil.which("mktemp")} "$@") || exit
@@ -1069,6 +1089,7 @@ echo "mktemp $f" >> "$STUB_FSLOG"
 case {swap} in
   tmp) [ "$(cd "$(dirname "$f")" && pwd -P)" != "{real}" ] || {{ rm -f "$f" && ln -s "{victim}" "$f"; }} ;;
   env) rm -f "{web}/.env" && ln -s "{victim}" "{web}/.env" ;;
+  env-back) {shutil.which("mv")} "{web}/.env" "{web}/.env.held" && ln -s "{victim}" "{web}/.env" ;;
 esac
 echo "$f"
 """)
@@ -1182,6 +1203,20 @@ class ProjectDbEnv(unittest.TestCase):
         self.assertVictimIntact(victim)
         self.assertEqual(self.leftovers(), [])
         self.assertFalse(self.fs("mv"))
+
+    def test_env_swapped_after_check_and_back_refused(self):
+        # подменили ссылкой перед чтением, а прежний .env вернули до сверки stat (тот же inode — сверка не ловит):
+        # отказ даёт только dd с nofollow; сбой dd не глотается — .env не остаётся с одними строками DB_*
+        victim = victim_file(self.dir)
+        participant_mktemp(self.bin, self.web, victim, swap="env-back")
+        run = self.db_env(STUB_RESTORE_ENV=str(self.env))
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("меняли, пока root его переписывал", run.stderr)
+        self.assertVictimIntact(victim)
+        self.assertFalse(self.fs("mv"))
+        self.assertEqual([p.name for p in self.proj.iterdir() if p.name != "web"], [])    # временного .env.* нет
+        held = self.web / ".env.held"
+        self.assertEqual((self.env if not self.env.is_symlink() else held).read_text(), self.ENV)
 
     def test_env_swapped_before_mv_refused(self):
         # .env подменили ссылкой после чтения, до mv (крючок в setfacl): stat перед mv видит другой файл — отказ
