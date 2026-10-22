@@ -4,6 +4,8 @@
 #   project-deploy <проект>            — выложить, если в реестре новый образ (так каждые 15 секунд
 #                                        зовёт таймер project-deploy@<проект>.timer)
 #   project-deploy <проект> rollback   — вернуть версию, которая стояла до последней выкладки
+#   project-deploy <проект> to <тег>   — выложить тот же образ с другим тегом (у сайтов web-start —
+#                                        полный хеш коммита) и записать его в DEPLOY_IMAGE в .env
 #
 # Договорённость с проектом (TEAM.md, «Автовыкладка»):
 #   - в .env проекта DEPLOY_IMAGE=ghcr.io/<владелец>/<образ>:<ветка> — его собирает CI;
@@ -25,14 +27,18 @@
 #                шлёт уведомление
 #   lock         одна выкладка проекта за раз
 #
-# Порядок в файле: состояние, шаги выкладки, deploy и rollback, запуск — в самом конце.
+# Порядок в файле: состояние, шаги выкладки, deploy, rollback и to, запуск — в самом конце.
 set -Eeuo pipefail
 
-NAME=${1:?Использование: project-deploy <проект> [rollback]}
+NAME=${1:?Использование: project-deploy <проект> [rollback | to <тег>]}
 ACTION=${2:-deploy}
+TAG=${3:-}
 [[ $NAME =~ ^[a-z][a-z0-9_]*$ ]] || { echo "Недопустимое имя проекта: $NAME" >&2; exit 1; }
-[[ $ACTION =~ ^(deploy|rollback)$ ]] ||
-  { echo "Неизвестное действие «${ACTION}»: project-deploy <проект> [rollback]" >&2; exit 1; }
+[[ $ACTION =~ ^(deploy|rollback|to)$ ]] ||
+  { echo "Неизвестное действие «${ACTION}»: project-deploy <проект> [rollback | to <тег>]" >&2; exit 1; }
+# Тег — по правилам Docker: так он не выходит за строку DEPLOY_IMAGE в .env
+[ "$ACTION" != to ] || [[ $TAG =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
+  { echo "Тег образа — латиница, цифры, _ . - (до 128 знаков, первый — не . и не -): project-deploy $NAME to <тег>" >&2; exit 1; }
 WEB=/srv/projects/$NAME/web
 STATE=/var/lib/project-deploy/$NAME
 
@@ -98,7 +104,7 @@ up() { compose up -d --wait --wait-timeout 180 --remove-orphans; }
 
 # ---------- Выкладка новой версии ----------
 # OLD — версия, которая работает, NEW — версия из реестра, BACK — что вернуть при сбое: OLD,
-# а при первой выкладке — образ, на котором проект запускали руками (общие для deploy и fail)
+# а при первой выкладке — образ, на котором проект запускали руками (общие для deploy, to и fail)
 deploy() {
   OLD=$(state current)
   BACK=${OLD:-$(running_image)}
@@ -110,7 +116,11 @@ deploy() {
     [ -z "$BACK" ] || docker tag "$BACK" "$IMAGE"        # docker pull перевесил имя из .env на неё — вернуть
     exit 0
   fi
+  roll_out
+}
 
+# Выложить NEW под именем из .env; сбой на шаге — fail
+roll_out() {
   echo "$NAME: новая версия $NEW"
   switch_to "$NEW" || fail "compose.yml из образа"
   make_dirs || fail "папки проекта"
@@ -175,15 +185,49 @@ rollback() {
   infra-log "откат $NAME: готово, работает $(short "$prev")"
 }
 
+# ---------- Другая версия вручную ----------
+# to <тег>: тот же образ, что в DEPLOY_IMAGE, с другим тегом. Сначала образ: нет его в реестре (CI ещё
+# собирает, опечатка в хеше) — ничего не меняется. Есть — выкладка, как у новой версии, и только после неё —
+# тег в .env: сбой — работает прежняя версия, и .env прежний (таймер берёт образ из .env и до успеха
+# нового не видит). Решение администратора, как откат: версия, которая уже не удалась, выкладывается снова
+to() {
+  local repo=$IMAGE
+  [ ! -L .env ] || { echo "$NAME: .env — ссылка, а не файл: root по ссылке не пишет" >&2; exit 1; }
+  [ "$(grep -c '^DEPLOY_IMAGE=' .env)" = 1 ] ||
+    { echo "$NAME: в .env несколько строк DEPLOY_IMAGE — оставьте одну и повторите" >&2; exit 1; }
+  [[ $IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._/:-]*$ ]] ||
+    { echo "$NAME: DEPLOY_IMAGE=$IMAGE — to меняет только тег (ghcr.io/<владелец>/<образ>:<тег>), не дайджест @sha256" >&2; exit 1; }
+  [[ ${IMAGE##*/} != *:* ]] || repo=${IMAGE%:*}         # тег — после последнего /: в registry:5000/x «:» — порт
+  TO=$repo:$TAG
+  docker pull -q "$TO" >/dev/null ||
+    { echo "$NAME: $TO не скачать (нет такого тега — CI ещё собирает или опечатка) — ничего не менял" >&2; exit 1; }
+  NEW=$(version_of "$TO")
+  [ -n "$NEW" ] || { echo "$NAME: у образа $TO нет дайджеста реестра" >&2; exit 1; }
+  OLD=$(state current)
+  BACK=${OLD:-$(running_image)}
+  if [ "$NEW" = "$OLD" ]; then echo "$NAME: эта версия уже работает"; else roll_out; fi
+  [ "$IMAGE" != "$TO" ] || return 0
+
+  # .env — как в project-db-env: новый рядом и на место одним mv (web/ открыта участникам на запись,
+  # и файл, который root пишет по имени, могли бы подменить ссылкой); владелец и права — прежние
+  ENV_NEW=$(mktemp .env.XXXXXX)
+  trap 'rm -f "$ENV_NEW"' EXIT
+  sed "s|^DEPLOY_IMAGE=.*|DEPLOY_IMAGE=$TO|" .env > "$ENV_NEW" && chown --reference=.env "$ENV_NEW" &&
+    chmod --reference=.env "$ENV_NEW" && mv -fT "$ENV_NEW" .env ||
+    { echo "$NAME: работает $TO, но .env не записан — таймер вернёт образ из .env; впишите DEPLOY_IMAGE=$TO сами" >&2; exit 1; }
+  echo "$NAME: в .env DEPLOY_IMAGE=$TO"
+  infra-log "выкладка $NAME: DEPLOY_IMAGE ${IMAGE##*/} → ${TO##*/}"
+}
+
 # ---------- Запуск ----------
 mkdir -p /var/lib/project-deploy
 exec 9>"$STATE.lock"
 if [ "$ACTION" = deploy ]; then
   flock -n 9 || exit 0                                  # прошлая выкладка ещё идёт — проверим через 15 секунд
 else
-  # Откат вручную ждёт, пока таймер закончит проверку (около секунды). Идёт выкладка — не ждём:
+  # Откат и to ждут, пока таймер закончит проверку (около секунды). Идёт выкладка — не ждём:
   # после неё «прежней» станет другая версия
-  flock -w 30 9 || { echo "$NAME: идёт выкладка — откат не выполнен; посмотрите журнал и повторите" >&2; exit 1; }
+  flock -w 30 9 || { echo "$NAME: идёт выкладка — ничего не менял; посмотрите журнал и повторите" >&2; exit 1; }
 fi
 cd "$WEB"
 IMAGE=$(sed -n 's/^DEPLOY_IMAGE=//p' .env 2>/dev/null | tail -1 | tr -d "\"'") || true   # нет .env — пусто
@@ -192,4 +236,5 @@ IMAGE=$(sed -n 's/^DEPLOY_IMAGE=//p' .env 2>/dev/null | tail -1 | tr -d "\"'") |
 case $ACTION in
   deploy) deploy ;;
   rollback) rollback ;;
+  to) to ;;
 esac

@@ -664,5 +664,179 @@ exit "$STUB_RC"
         self.assertTrue(lines[-1].startswith("systemd-run "), lines)
 
 
+
+@unittest.skipUnless(shutil.which("jq"), "нужен jq")
+class ProjectDeployTo(unittest.TestCase):
+    """project-deploy <проект> to <тег>: образа нет — .env побайтно тот же; есть — выкладка, и в .env заменена одна
+    строка DEPLOY_IMAGE, владелец и права прежние; .env-ссылка — отказ; сбой выкладки — прежние версия и .env.
+    Стенд: скрипт с папками проекта и состояния во временной папке; docker, project-compose, flock, infra-log —
+    заглушки, пишут строку в журнал стенда; chown, chmod и mv — на Python (--reference и -T на Mac нет)."""
+
+    REPO = "ghcr.io/example/shop"
+    HASH = "bb168cfcfece1b663da0141574e4994eed9eea20"
+    OLD, NEW = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    ENV = ('DEBUG=False\n#DEPLOY_IMAGE=ghcr.io/example/shop:v0\nDEPLOY_IMAGE="ghcr.io/example/shop:main"\n'
+           "SITE_NAME=Магазин\n")
+    # docker: в реестре — только теги из STUB_TAGS («образ:тег=дайджест») и любые @sha256
+    DOCKER = """#!/bin/bash
+echo "docker $*" >> "$STUB_LOG"
+ref=${!#}
+digest=$(printf '%s\\n' $STUB_TAGS | awk -F= -v r="$ref" '$1 == r { print $2 }')
+case $1 in
+  pull) [ -n "$digest" ] || [[ $ref == *@sha256:* ]] || { echo "Error response from daemon: manifest unknown" >&2; exit 1; } ;;
+  image) [ -z "$digest" ] || echo "${ref%:*}@$digest" ;;
+  run) printf 'services:\\n  api:\\n    image: ${DEPLOY_IMAGE}\\n' ;;
+esac
+"""
+    # project-compose: STUB_FAIL_UP — первый up не проходит (возврат прежней версии — проходит)
+    COMPOSE = """#!/bin/bash
+echo "project-compose $*" >> "$STUB_LOG"
+case "$*" in
+  *"config --format json") echo '{"services":{}}' ;;
+  *"config --services") echo api ;;
+  *" up "*) [ -z "$STUB_FAIL_UP" ] || [ "$(grep -c ' up ' "$STUB_LOG")" -gt 1 ] || exit 1 ;;
+esac
+"""
+    PYTHON = "#!/usr/bin/env python3\nimport os, stat, sys\nargs = [a for a in sys.argv[1:] if a not in ('-f', '-T', '-fT')]\n"
+    STUBS = {
+        "docker": DOCKER,
+        "project-compose": COMPOSE,
+        "project-docker-host": "#!/bin/sh\n",
+        "flock": "#!/bin/sh\n",
+        "infra-log": '#!/bin/sh\necho "infra-log $*" >> "$STUB_LOG"\n',
+        "chown": PYTHON + "ref = os.stat(args[0].split('=', 1)[1]); os.chown(args[1], ref.st_uid, ref.st_gid)\n",
+        "chmod": PYTHON + "os.chmod(args[1], stat.S_IMODE(os.stat(args[0].split('=', 1)[1]).st_mode))\n",
+        "mv": PYTHON + "os.replace(args[0], args[1])\n",
+    }
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.bin, self.web, self.states = self.dir / "bin", self.dir / "web", self.dir / "state"
+        for d in (self.bin, self.web, self.states):
+            d.mkdir()
+        for name, text in self.STUBS.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        script = (ROOT / "roles/project/files/project-deploy").read_text()
+        for old, new in (("/srv/projects/$NAME/web", f'"{self.web}"'), ("/var/lib/project-deploy", f'"{self.states}"')):
+            if old not in script:
+                raise AssertionError(f"в project-deploy нет «{old}» — стенду нечего подменить")
+            script = script.replace(old, new)
+        (self.dir / "project-deploy").write_text(script)
+        self.env = self.web / ".env"
+        self.env.write_text(self.ENV)
+        self.env.chmod(0o640)
+        (self.states / "shop.current").write_text(f"{self.REPO}@{self.OLD}\n")
+        self.log = self.dir / "log"
+
+    def deploy(self, *args, **stubs):
+        env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_LOG": str(self.log), "STUB_FAIL_UP": "",
+               "STUB_TAGS": f"{self.REPO}:main={self.OLD} {self.REPO}:v1={self.OLD} {self.REPO}:{self.HASH}={self.NEW}",
+               **stubs}
+        run = subprocess.run(["bash", str(self.dir / "project-deploy"), "shop", *args], env=env,
+                             capture_output=True, text=True)
+        return run, self.log.read_text().splitlines() if self.log.exists() else []
+
+    def state(self, name):
+        path = self.states / f"shop.{name}"
+        return path.read_text().strip() if path.exists() else None
+
+    def leftovers(self):
+        return sorted(p.name for p in self.web.iterdir() if p.name != ".env")
+
+    def test_unknown_tag_keeps_env(self):
+        before = self.env.read_bytes()
+        run, lines = self.deploy("to", "bb168cf")                   # опечатка: короткий хеш
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("ничего не менял", run.stderr)
+        self.assertEqual(self.env.read_bytes(), before)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+        self.assertFalse([x for x in lines if not x.startswith("docker ")], lines)
+
+    def test_known_tag_rolls_out_and_replaces_one_line(self):
+        # версия, которая уже не удалась, — решение администратора: выкладывается
+        (self.states / "shop.failed-ref").write_text(f"{self.REPO}@{self.NEW}\n")
+        (self.states / "shop.failed").write_text("2026-10-20 03:00 запуск: работает прежняя версия\n")
+        before = self.env.read_text().splitlines()
+        run, lines = self.deploy("to", self.HASH)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        after = self.env.read_text().splitlines()
+        self.assertEqual(len(after), len(before))
+        changed = [(a, b) for a, b in zip(before, after) if a != b]
+        self.assertEqual(changed, [('DEPLOY_IMAGE="ghcr.io/example/shop:main"', f"DEPLOY_IMAGE={self.REPO}:{self.HASH}")])
+        self.assertEqual(self.env.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.leftovers(), ["compose.yml"])
+        self.assertEqual((self.state("current"), self.state("previous")),
+                         (f"{self.REPO}@{self.NEW}", f"{self.REPO}@{self.OLD}"))
+        self.assertIsNone(self.state("failed-ref"))
+        self.assertIsNone(self.state("failed"))
+        self.assertTrue([x for x in lines if x.startswith("project-compose shop up ")], lines)
+        self.assertIn(f"infra-log выкладка shop: DEPLOY_IMAGE shop:main → shop:{self.HASH}", lines)
+
+    def test_env_link_refused(self):
+        target = self.dir / "target.env"
+        target.write_text(self.ENV)
+        self.env.unlink()
+        self.env.symlink_to(target)
+        run, lines = self.deploy("to", self.HASH)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("ссылка", run.stderr)
+        self.assertTrue(self.env.is_symlink())
+        self.assertEqual(target.read_text(), self.ENV)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(lines, [])
+
+    def test_bad_tag_refused_before_docker(self):
+        for tag in ("main;id", "../x", "a/b", "-x", ".x", "", "a" * 129):
+            with self.subTest(tag=tag):
+                run, lines = self.deploy("to", tag)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn("Тег образа", run.stderr)
+                self.assertEqual(lines, [])
+        self.assertEqual(self.env.read_text(), self.ENV)
+
+    def test_failed_rollout_keeps_env_and_version(self):
+        before = self.env.read_bytes()
+        run, lines = self.deploy("to", self.HASH, STUB_FAIL_UP="1")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("не удалось на шаге «запуск»", run.stderr)
+        self.assertEqual(self.env.read_bytes(), before)
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+        self.assertEqual(self.state("failed-ref"), f"{self.REPO}@{self.NEW}")
+        self.assertIn(f"docker tag {self.REPO}@{self.OLD} {self.REPO}:main", lines)   # прежний образ — на место
+        self.assertFalse([x for x in lines if "DEPLOY_IMAGE" in x], lines)
+
+    def test_same_version_only_env(self):
+        before = self.env.read_bytes()
+        run, lines = self.deploy("to", "main")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("эта версия уже работает", run.stdout)
+        self.assertEqual(self.env.read_bytes(), before)
+        run, lines = self.deploy("to", "v1")                        # другой тег того же образа
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f"DEPLOY_IMAGE={self.REPO}:v1\n", self.env.read_text())
+        self.assertFalse([x for x in lines if " up " in x], lines)
+
+    def test_image_forms(self):
+        cases = (
+            ("DEPLOY_IMAGE=ghcr.io/example/shop@sha256:" + "1" * 64, "не дайджест", None),
+            ("DEPLOY_IMAGE=ghcr.io/example/shop:main\nDEPLOY_IMAGE=ghcr.io/example/shop:dev", "несколько строк", None),
+            ("DEBUG=False", "нет DEPLOY_IMAGE", None),
+            # без тега и реестр с портом: «:» в имени — не тег
+            ("DEPLOY_IMAGE=registry.example.com:5000/shop", "не скачать",
+             f"docker pull -q registry.example.com:5000/shop:{self.HASH}"),
+        )
+        for text, error, pulled in cases:
+            with self.subTest(env=text):
+                self.log.unlink(missing_ok=True)
+                self.env.write_text(text + "\n")
+                run, lines = self.deploy("to", self.HASH)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn(error, run.stderr)
+                self.assertEqual(self.env.read_text(), text + "\n")
+                self.assertEqual(lines, [pulled] if pulled else [])
+
 if __name__ == "__main__":
     unittest.main()

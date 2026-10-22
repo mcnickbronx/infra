@@ -178,7 +178,8 @@ project() {
            up      "Запустить или обновить (up -d) — после правки .env или compose.yml"
            restart "Перезапустить контейнеры"
            down    "Остановить — сайт перестанет отвечать")
-    autodeploy "$p" && items+=(deploys "Журнал автовыкладки" rollback "Откатить на прошлую версию")
+    autodeploy "$p" && items+=(deploys "Журнал автовыкладки" to "Перейти на версию образа (тег)…"
+                               rollback "Откатить на прошлую версию")
     items+=(backup "Бэкап сейчас")
     has_db "$p" && items+=(dbenv "Доступ к базе — в .env проекта" dbpass "Сменить пароль базы")
     # Копия базы — только в проекты *_dev (защита прода, как в project-db-copy)
@@ -202,12 +203,22 @@ project() {
       rollback)
         confirm "Откатить $p на версию, которая стояла до последней выкладки? Откаченную версию автовыкладка больше не выложит — только следующую новую." &&
           run "sudo project-deploy $p rollback" project-deploy "$p" rollback ;;
+      to) deploy_to "$p" ;;
       backup) run "sudo project-backup $p" project-backup "$p" ;;
       dbenv) dbenv "$p" ;;
       dbpass) dbpass "$p" ;;
       dbcopy) dbcopy "$p" ;;
     esac
   done
+}
+
+# Перейти на версию образа (project-deploy <проект> to <тег>): тег проверяет сам project-deploy
+deploy_to() {
+  local p=$1
+  input "Тег образа $p — у сайтов на web-start полный хеш коммита.\n\nОбраза с этим тегом нет в реестре — ничего не изменится; есть — выкладка сразу, тег — в DEPLOY_IMAGE в .env:" || return 0
+  [ -n "$REPLY" ] || return 0
+  confirm "Выложить $p с тегом $REPLY? Сбой — останется версия, которая работает сейчас." &&
+    run "sudo project-deploy $p to $REPLY" project-deploy "$p" to "$REPLY"
 }
 
 # Копия базы другого проекта в этот (project-db-copy): откуда, с файлами или без, подтверждение

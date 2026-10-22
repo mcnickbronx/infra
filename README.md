@@ -115,6 +115,7 @@ infra init     # имя сервера, email для Let's Encrypt, ваши SSH
 | `sudo infra upgrade <версия>` | новая версия движка (git-тег, подписанный ключом из `SIGNERS`), затем `apply`; `--check` и «нет» — движок прежний |
 | `sudo project-compose <проект> ps` | `docker compose` проекта из его папки и с его `.env` |
 | `sudo project-deploy <проект> rollback` | вернуть версию до последней автовыкладки |
+| `sudo project-deploy <проект> to <тег>` | выложить образ с этим тегом и записать его в `.env`; нет в реестре — ничего не меняется |
 | `sudo project-backup <проект>` | снимок проекта сейчас; вернуть — `project-restore` (`ADMIN.md`) |
 | `sudo project-db-env <проект>` | доступ к базе — в `.env` проекта, пароль на экран не выводится |
 | `sudo project-db-copy <проект> <проект>_dev` | заменить базу dev копией прод-базы |
