@@ -287,18 +287,33 @@ check_certificates() {
 
 # ---------- Сайты ----------
 # Главная / каждого домена из labels Traefik — с самого сервера: 5xx или нет ответа — сбой; 2xx–4xx
-# (редирект, admin-only, 404 у API) — сайт отвечает. Сертификат не проверяется (-k): это check_certificates.
+# (редирект, admin-only, 404 у API) — сайт отвечает. back.<домен> — бэкенд сайта web-start: у него /api/health,
+# сбой — любой ответ, кроме 200. Сертификат не проверяется (-k): это check_certificates.
 # Время ограничено при любом числе сайтов (бэкенды висят — до 15 с на запрос): первые SITES_MAX доменов,
 # по SITES_PARALLEL запросов сразу; худший случай — 3 волны × 15 с, пауза 10 с, повтор 3 × 15 с = 100 с
 SITES_MAX=30
 SITES_PARALLEL=10
 SITE_HOSTS=""
 
-# Код ответа главной; 000 — нет ответа (таймаут, отказ в соединении, обрыв)
+# Путь проверки: у back.<домен> — /api/health, у остальных — пусто, то есть главная /
+site_path() {
+  case $1 in back.*) echo /api/health ;; esac
+}
+
+# Сбой по коду ответа: у back.<домен> — всё, кроме 200; у остальных — 5xx и 000
+site_down() {
+  case $1 in
+    back.*) [ "$2" != 200 ] ;;
+    *) [[ $2 == 5?? || $2 == 000 ]] ;;
+  esac
+}
+
+# Код ответа главной (у back.<домен> — /api/health); 000 — нет ответа (таймаут, отказ в соединении, обрыв)
 site_code() {
-  local code
+  local code path
+  path=$(site_path "$1")
   code=$(curl -sk -o /dev/null -w '%{http_code}' --noproxy '*' --connect-timeout 5 -m 15 \
-    -A infra-health-check --resolve "$1:443:$SERVER_IP" "https://$1/" 2>/dev/null)
+    -A infra-health-check --resolve "$1:443:$SERVER_IP" "https://$1${path:-/}" 2>/dev/null)
   if [[ $code =~ ^[0-9]{3}$ ]]; then echo "$code"; else echo 000; fi
 }
 
@@ -329,18 +344,20 @@ check_sites() {
   done < <(awk 'NF && !seen[$0]++' <<<"$SITE_HOSTS")
   [ ${#hosts[@]} -gt 0 ] || return 0
   while read -r host code; do
-    case $code in 5??|000) failing+=("$host") ;; esac
+    if site_down "$host" "$code"; then failing+=("$host"); fi
   done < <(site_codes "${hosts[@]}")
   [ ${#failing[@]} -gt 0 ] || return 0
   sleep 10
   while read -r host code; do
-    case $code in 5??|000) down+="$host " ;; *) continue ;; esac
-    if [ "$code" = 000 ]; then codes+="$host — нет ответа за 15 с, "; else codes+="$host — $code, "; fi
+    site_down "$host" "$code" || continue
+    down+="$host "
+    [ "$code" != 000 ] || code="нет ответа за 15 с"
+    codes+="$host$(site_path "$host") — $code, "
   done < <(site_codes "${failing[@]}" | sort)
   [ "$skipped" -eq 0 ] || codes+="не проверены: $skipped (проверяются первые $SITES_MAX доменов), "
   if [ -n "$down" ]; then
     problem "Сайты не отвечают (проверка с самого сервера): ${down% }" \
-      "${codes%, }. Проверить: curl -sk -o /dev/null -w '%{http_code}\n' --resolve <домен>:443:$SERVER_IP https://<домен>/. Почему: sudo project-compose <проект> logs --tail 50; если выше упавшие или нездоровые контейнеры — причина скорее в них"
+      "${codes%, }. Проверить: curl -sk -o /dev/null -w '%{http_code}\n' --resolve <домен>:443:$SERVER_IP https://<домен>/ (у back.* — https://<домен>/api/health). Почему: sudo project-compose <проект> logs --tail 50; если выше упавшие или нездоровые контейнеры — причина скорее в них"
   fi
 }
 

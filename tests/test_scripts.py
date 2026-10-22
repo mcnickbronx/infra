@@ -333,6 +333,34 @@ printf '%s' "$code"
         self.assertEqual((self.dir / "sleep.log").read_text(), "10\n")   # одна пауза на все повторы
         self.assertEqual(len(self.curls()), len(self.SITES) + 3)
 
+    # бэкенды сайтов web-start (back.<домен>) — по /api/health, сбой — любой ответ, кроме 200
+    BACKS = ["back.shop.example.com", "back.lab.example.com", "back.api.example.com"]
+    BACK_LABELS = "traefik.http.routers.shop.rule=Host(`shop.example.com`)\n" + "".join(
+        f"traefik.http.routers.b{i}.rule=Host(`{b}`)\n" for i, b in enumerate(BACKS))
+
+    def test_backend_checked_by_api_health(self):
+        out = self.run_checks("", "check_sites", 'render "$PROBLEMS"', STUB_LABELS=self.BACK_LABELS,
+                              STUB_SITES="shop.example.com=404 " + " ".join(f"{b}=200" for b in self.BACKS))
+        self.assertEqual(out, "")
+        self.assertEqual(sorted(c.split()[-1] for c in self.curls()),
+                         sorted([f"https://{b}/api/health" for b in self.BACKS] + ["https://shop.example.com/"]))
+        for back in self.BACKS:
+            calls = [c for c in self.curls() if c.endswith(f" https://{back}/api/health")]
+            self.assertIn(f"--resolve {back}:443:192.0.2.1 ", calls[0])
+
+    def test_backend_not_200_after_retry(self):
+        out = self.run_checks("", "check_sites", 'render "$PROBLEMS"', STUB_LABELS=self.BACK_LABELS,
+                              STUB_SITES="shop.example.com=200 back.shop.example.com=404 back.lab.example.com=000 "
+                                         "back.api.example.com=301,200")
+        self.assertIn("Сайты не отвечают (проверка с самого сервера): back.lab.example.com back.shop.example.com\n", out)
+        self.assertEqual(out.count("Сайты не отвечают"), 1)
+        self.assertIn("back.shop.example.com/api/health — 404", out)
+        self.assertIn("back.lab.example.com/api/health — нет ответа", out)
+        self.assertIn("https://<домен>/api/health", out)
+        self.assertNotIn("back.api.example.com", out)          # 301, через 10 с — 200: выкладка, не сбой
+        self.assertEqual((self.dir / "sleep.log").read_text(), "10\n")
+        self.assertEqual(len(self.curls()), 4 + 3)
+
     def test_sick_containers_not_checked(self):
         sick = ("traefik.http.routers.bad.rule=Host(`bad.example.com`)\n"
                 "traefik.http.routers.loop.rule=Host(`loop.example.com`)\n")
