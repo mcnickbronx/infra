@@ -39,7 +39,8 @@ TAG=${3:-}
 # Тег — по правилам Docker: так он не выходит за строку DEPLOY_IMAGE в .env
 [ "$ACTION" != to ] || [[ $TAG =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
   { echo "Тег образа — латиница, цифры, _ . - (до 128 знаков, первый — не . и не -): project-deploy $NAME to <тег>" >&2; exit 1; }
-WEB=/srv/projects/$NAME/web
+PROJ=/srv/projects/$NAME
+WEB=$PROJ/web
 STATE=/var/lib/project-deploy/$NAME
 
 # ---------- Состояние ----------
@@ -144,6 +145,8 @@ roll_out() {
 fail() {
   local when result
   when=$(date '+%F %H:%M')
+  # Ручной to — с пометкой: health-check не отсылает к журналу таймера и не обещает, что версия выложится сама
+  [ "$ACTION" != to ] || when+=" вручную (to $TAG),"
   echo "$NAME: не удалось на шаге «$1» — возвращаю прежнюю версию" >&2
   # Отметка — одна версия, и сбой to (решение администратора) стоящую не затирает: это версия из ветки в .env,
   # которая не удалась или откачена, — без отметки таймер выложил бы её снова через 15 секунд
@@ -196,6 +199,9 @@ rollback() {
 to() {
   local repo=$IMAGE
   [ ! -L .env ] || { echo "$NAME: .env — ссылка, а не файл: root по ссылке не пишет" >&2; exit 1; }
+  # Временный .env — в папке проекта (ниже): её права — до выкладки, чтобы отказ ничего не менял
+  [ "$(stat -c %u -- "$PROJ")" = "$(id -u)" ] && (( (8#$(stat -c %a -- "$PROJ") & 8#022) == 0 )) ||
+    { echo "$NAME: в папку $PROJ пишет не только root — временный .env туда не кладу, ничего не менял; права вернёт sudo infra apply" >&2; exit 1; }
   [ "$(grep -c '^DEPLOY_IMAGE=' .env)" = 1 ] ||
     { echo "$NAME: в .env несколько строк DEPLOY_IMAGE — оставьте одну и повторите" >&2; exit 1; }
   [[ $IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._/:-]*$ ]] ||
@@ -211,17 +217,23 @@ to() {
   if [ "$NEW" = "$OLD" ]; then echo "$NAME: эта версия уже работает"; else roll_out; fi
   [ "$IMAGE" != "$TO" ] || return 0
 
-  # .env — как в project-db-env: новый рядом и на место одним mv (web/ открыта участникам на запись,
-  # и файл, который root пишет по имени, могли бы подменить ссылкой); владелец и права — прежние.
-  # Выкладка шла минуты — за это время .env могли подменить ссылкой на чужой файл, и root прочёл бы его
-  # в .env проекта: проверка ещё раз, а читает dd с nofollow — ссылку, подложенную после проверки, он не откроет
+  # Новый .env — во временном файле в папке проекта, затем на место одним mv. Папку проекта пишет только root
+  # (роль project: root, 0750 — это и проверяем), web/ — и участники: временный файл там подменили бы ссылкой,
+  # и root записал бы в цель ссылки и поставил ей владельца и права .env. Та же файловая система — mv переименовывает,
+  # а ссылку на месте .env заменяет, не идя по ней. .env читается один раз, без перехода по ссылке (dd с nofollow);
+  # владелец, права и ACL (доступ контейнеров и пользователя проекта без root) — прежние, с того же файла:
+  # подменили его, пока root переписывал, — отказ. Выкладка шла минуты — .env мог стать ссылкой: проверка ещё раз
   local half="работает $TO, но .env не записан — таймер вернёт образ из .env; впишите DEPLOY_IMAGE=$TO сами"
+  local before uid gid mode
   [ -f .env ] && [ ! -L .env ] ||
     { echo "$NAME: .env подменили — теперь это ссылка или не файл, root его не читает; $half" >&2; exit 1; }
-  ENV_NEW=$(mktemp .env.XXXXXX)
+  before=$(stat -c '%i %u %g %a %F' -- .env) || { echo "$NAME: $half" >&2; exit 1; }
+  read -r _ uid gid mode _ <<<"$before"
+  ENV_NEW=$(mktemp "$PROJ/.env.XXXXXX")
   trap 'rm -f "$ENV_NEW"' EXIT
   dd if=.env iflag=nofollow status=none | sed "s|^DEPLOY_IMAGE=.*|DEPLOY_IMAGE=$TO|" > "$ENV_NEW" &&
-    chown --reference=.env "$ENV_NEW" && chmod --reference=.env "$ENV_NEW" && mv -fT "$ENV_NEW" .env ||
+    chown "$uid:$gid" "$ENV_NEW" && getfacl -n -p -- .env | setfacl --set-file=- "$ENV_NEW" && chmod "$mode" "$ENV_NEW" &&
+    [ "$(stat -c '%i %u %g %a %F' -- .env)" = "$before" ] && mv -fT "$ENV_NEW" .env ||
     { echo "$NAME: $half" >&2; exit 1; }
   echo "$NAME: в .env DEPLOY_IMAGE=$TO"
   infra-log "выкладка $NAME: DEPLOY_IMAGE ${IMAGE##*/} → ${TO##*/}"

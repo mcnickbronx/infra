@@ -10,7 +10,8 @@
 set -euo pipefail
 NAME=${1:?Использование: project-db-env <проект> [приставка, например DEV_]}
 PREFIX=${2:-}
-ENV_FILE=/srv/projects/$NAME/web/.env
+PROJ=/srv/projects/$NAME
+ENV_FILE=$PROJ/web/.env
 die() { echo "project-db-env: $*" >&2; exit 1; }
 
 [[ $NAME =~ ^[a-z][a-z0-9_]*$ ]] || die "имя проекта — строчные латинские буквы, цифры и _"
@@ -20,19 +21,29 @@ PASSWORD=$(sed -nE "s/^db_password_$NAME:[[:space:]]*\"?([^\"]*)\"?[[:space:]]*$
 # Проект без root (rootless) видит Postgres по адресу на infra0, остальные — по шлюзу своей сети
 HOST=$(project-docker-host "$NAME" db_host)
 [ -n "$HOST" ] || HOST=$(docker network inspect "proj-$NAME" -f '{{(index .IPAM.Config 0).Gateway}}')
+# Новый .env — во временном файле в папке проекта, затем на место одним mv. Папку проекта пишет только root
+# (роль project: root, 0750 — это и проверяем), web/ — и участники: временный файл там подменили бы ссылкой,
+# и root записал бы в цель ссылки и поставил ей владельца и права .env. Та же файловая система — mv переименовывает,
+# а ссылку на месте .env заменяет, не идя по ней. .env читается один раз, без перехода по ссылке (dd с nofollow);
+# владелец, права и ACL (доступ контейнеров и пользователя проекта без root) — прежние, с того же файла:
+# подменили его, пока root переписывал, — отказ
+[ "$(stat -c %u -- "$PROJ")" = "$(id -u)" ] && (( (8#$(stat -c %a -- "$PROJ") & 8#022) == 0 )) ||
+  die "в папку $PROJ пишет не только root — временный .env туда не кладу; права вернёт sudo infra apply"
 [ -L "$ENV_FILE" ] && die "$ENV_FILE — ссылка, а не файл: root не пишет пароль по ссылке"
 [ -f "$ENV_FILE" ] || die "нет $ENV_FILE — сначала .env проекта"
-
-# Новый .env — рядом, затем на место одним mv: web/ открыта участникам на запись, и файл,
-# дописываемый root по имени, могли бы между делом подменить ссылкой. Владелец и права — прежние
-TMP=$(mktemp "$ENV_FILE.XXXXXX")
+changed="$ENV_FILE меняли, пока root его переписывал, — ничего не менял, повторите"
+before=$(stat -c '%i %u %g %a %F' -- "$ENV_FILE") || die "$changed"
+read -r _ uid gid mode _ <<<"$before"
+TMP=$(mktemp "$PROJ/.env.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
-{
-  grep -vE "^${PREFIX}DB_(HOST|PORT|NAME|USER|PASSWORD)=" "$ENV_FILE" || true
-  printf '%sDB_HOST=%s\n%sDB_PORT=5432\n%sDB_NAME=%s\n%sDB_USER=%s\n%sDB_PASSWORD=%s\n' \
-    "$PREFIX" "$HOST" "$PREFIX" "$PREFIX" "$NAME" "$PREFIX" "$NAME" "$PREFIX" "$PASSWORD"
-} > "$TMP"
-chown --reference="$ENV_FILE" "$TMP"
-chmod --reference="$ENV_FILE" "$TMP"
+# код конвейера — от dd (pipefail): grep без строк кроме DB_* тоже даёт 1, его глушим
+dd if="$ENV_FILE" iflag=nofollow status=none | { grep -vE "^${PREFIX}DB_(HOST|PORT|NAME|USER|PASSWORD)=" || true; } > "$TMP" ||
+  die "$changed"
+printf '%sDB_HOST=%s\n%sDB_PORT=5432\n%sDB_NAME=%s\n%sDB_USER=%s\n%sDB_PASSWORD=%s\n' \
+  "$PREFIX" "$HOST" "$PREFIX" "$PREFIX" "$NAME" "$PREFIX" "$NAME" "$PREFIX" "$PASSWORD" >> "$TMP"
+chown "$uid:$gid" "$TMP"
+getfacl -n -p -- "$ENV_FILE" | setfacl --set-file=- "$TMP" || die "$changed"
+chmod "$mode" "$TMP"
+[ "$(stat -c '%i %u %g %a %F' -- "$ENV_FILE")" = "$before" ] || die "$changed"
 mv -fT "$TMP" "$ENV_FILE"
 echo "${PREFIX}DB_* в $ENV_FILE обновлены. Контейнеры увидят их после: sudo project-compose $NAME up -d --force-recreate"

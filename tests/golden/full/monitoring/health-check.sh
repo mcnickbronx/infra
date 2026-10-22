@@ -366,11 +366,16 @@ check_sites() {
 # Не удалась: project-deploy оставляет <проект>.failed — когда, на каком шаге и что работает теперь.
 # Отметки проектов без автовыкладки убирает роль project
 check_autodeploy() {
-  local f p
+  local f p failed
   for f in /var/lib/project-deploy/*.failed; do
     [ -e "$f" ] || continue
-    p=$(basename "$f" .failed)
-    problem "Автовыкладка $p не удалась: $(cat "$f"). Причина: sudo journalctl -u project-deploy@$p -n 50. Исправленная версия выложится сама"
+    p=$(basename "$f" .failed) failed=$(cat "$f")
+    case $failed in
+      # ручной project-deploy <проект> to <тег>: причину администратор видел в выводе команды, таймер эту версию не выложит
+      *" вручную (to "*)
+        problem "Выкладка $p не удалась: $failed. Причина — в выводе команды; приложение — sudo project-compose $p logs --tail 50. DEPLOY_IMAGE в .env прежний; повторить — sudo project-deploy $p to <тег>" ;;
+      *) problem "Автовыкладка $p не удалась: $failed. Причина: sudo journalctl -u project-deploy@$p -n 50. Исправленная версия выложится сама" ;;
+    esac
   done
 }
 

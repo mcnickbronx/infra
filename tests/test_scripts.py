@@ -749,8 +749,9 @@ class ProjectDeployTo(unittest.TestCase):
     """project-deploy <проект> to <тег>: образа нет — .env побайтно тот же; есть — выкладка, и в .env заменена одна
     строка DEPLOY_IMAGE, владелец и права прежние; .env-ссылка — отказ; сбой выкладки — прежние версия и .env.
     Стенд: скрипт с папками проекта и состояния во временной папке; docker, project-compose, flock, infra-log —
-    заглушки, пишут строку в журнал стенда; chown, chmod, mv и dd — на Python (--reference, -T и iflag=nofollow
-    на Mac нет)."""
+    заглушки, пишут строку в журнал стенда; chown, chmod, stat, mv, dd, getfacl и setfacl — на Python (их ключей
+    и ACL на Mac нет), пишут строку в журнал файловых команд. Папка проекта (/srv/projects/<проект>) — proj,
+    web/ — внутри."""
 
     REPO = "ghcr.io/example/shop"
     HASH = "bb168cfcfece1b663da0141574e4994eed9eea20"
@@ -777,15 +778,34 @@ case "$*" in
   *" up "*) [ -z "$STUB_FAIL_UP" ] || [ "$(grep -c ' up ' "$STUB_LOG")" -gt 1 ] || exit 1 ;;
 esac
 """
-    PYTHON = "#!/usr/bin/env python3\nimport os, stat, sys\nargs = [a for a in sys.argv[1:] if a not in ('-f', '-T', '-fT')]\n"
+    PYTHON = ("#!/usr/bin/env python3\nimport os, stat, sys\nargs = [a for a in sys.argv[1:] if a not in ('-f', '-T', '-fT', '--')]\n"
+              "open(os.environ.get('STUB_FSLOG', os.devnull), 'a').write(' '.join([os.path.basename(sys.argv[0])] + args) + '\\n')\n")
     STUBS = {
         "docker": DOCKER,
         "project-compose": COMPOSE,
         "project-docker-host": "#!/bin/sh\n",
         "flock": "#!/bin/sh\n",
         "infra-log": '#!/bin/sh\necho "infra-log $*" >> "$STUB_LOG"\n',
-        "chown": PYTHON + "ref = os.stat(args[0].split('=', 1)[1]); os.chown(args[1], ref.st_uid, ref.st_gid)\n",
-        "chmod": PYTHON + "os.chmod(args[1], stat.S_IMODE(os.stat(args[0].split('=', 1)[1]).st_mode))\n",
+        # chown --reference=<файл> | <uid>:<gid> и chmod --reference=<файл> | <восьмеричные>: по ссылке идут, как GNU без -h
+        "chown": PYTHON + "who, path = args\n"
+                 "if who.startswith('--reference='): ref = os.stat(who.split('=', 1)[1]); who = f'{ref.st_uid}:{ref.st_gid}'\n"
+                 "os.chown(path, *map(int, who.split(':')))\n",
+        "chmod": PYTHON + "how, path = args\n"
+                 "os.chmod(path, stat.S_IMODE(os.stat(how.split('=', 1)[1]).st_mode) if how.startswith('--reference=') else int(how, 8))\n",
+        # stat -c <формат> <файл>: %i %u %g %a %F, по ссылке не идёт (lstat), как GNU stat и uutils без -L
+        "stat": PYTHON + "fmt, path = args[1:]\nst = os.lstat(path)\n"
+                "kind = {stat.S_IFREG: 'regular empty file' if not st.st_size else 'regular file', stat.S_IFLNK: 'symbolic link',\n"
+                "        stat.S_IFDIR: 'directory'}.get(stat.S_IFMT(st.st_mode), 'other')\n"
+                "for k, v in (('%i', st.st_ino), ('%u', st.st_uid), ('%g', st.st_gid), ('%a', f'{stat.S_IMODE(st.st_mode):o}'), ('%F', kind)):\n"
+                "    fmt = fmt.replace(k, str(v))\nprint(fmt)\n",
+        # getfacl -n -p <файл>: по ссылке идёт, как GNU getfacl; ACL на Mac нет — только строка «# file:» и права
+        "getfacl": PYTHON + "os.stat(args[-1])\nprint(f'# file: {args[-1]}\\nuser::rw-\\ngroup::r--\\nother::---')\n",
+        # setfacl --set-file=- <файл>: файла не меняет, «# file:» с stdin — в журнал. STUB_SWAP_ENV — крючок «после чтения,
+        # до mv»: этот .env участник подменяет ссылкой на STUB_SWAP_TO
+        "setfacl": PYTHON + "acl = sys.stdin.read().splitlines()\nos.stat(args[-1])\n"
+                   "open(os.environ.get('STUB_FSLOG', os.devnull), 'a').write(f'acl {acl[0]}\\n')\n"
+                   "if os.environ.get('STUB_SWAP_ENV'):\n"
+                   "    os.remove(os.environ['STUB_SWAP_ENV']); os.symlink(os.environ['STUB_SWAP_TO'], os.environ['STUB_SWAP_ENV'])\n",
         "mv": PYTHON + "os.replace(args[0], args[1])\n",
         # dd if=<файл> [iflag=nofollow]: с nofollow ссылку не открывает (O_NOFOLLOW), как GNU dd и uutils
         "dd": PYTHON + "opts = dict(a.split('=', 1) for a in args)\n"
@@ -796,14 +816,15 @@ esac
     def setUp(self):
         self.dir = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.dir)
-        self.bin, self.web, self.states = self.dir / "bin", self.dir / "web", self.dir / "state"
-        for d in (self.bin, self.web, self.states):
+        self.bin, self.proj, self.states = self.dir / "bin", self.dir / "proj", self.dir / "state"
+        self.web = self.proj / "web"
+        for d in (self.bin, self.proj, self.web, self.states):
             d.mkdir()
         for name, text in self.STUBS.items():
             (self.bin / name).write_text(text)
             (self.bin / name).chmod(0o755)
         script = (ROOT / "roles/project/files/project-deploy").read_text()
-        for old, new in (("/srv/projects/$NAME/web", f'"{self.web}"'), ("/var/lib/project-deploy", f'"{self.states}"')):
+        for old, new in (("/srv/projects/$NAME", f'"{self.proj}"'), ("/var/lib/project-deploy", f'"{self.states}"')):
             if old not in script:
                 raise AssertionError(f"в project-deploy нет «{old}» — стенду нечего подменить")
             script = script.replace(old, new)
@@ -812,10 +833,11 @@ esac
         self.env.write_text(self.ENV)
         self.env.chmod(0o640)
         (self.states / "shop.current").write_text(f"{self.REPO}@{self.OLD}\n")
-        self.log = self.dir / "log"
+        self.log, self.fslog = self.dir / "log", self.dir / "fslog"
 
     def deploy(self, *args, **stubs):
         env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_LOG": str(self.log), "STUB_FAIL_UP": "",
+               "STUB_FSLOG": str(self.fslog),
                "STUB_TAGS": f"{self.REPO}:main={self.OLD} {self.REPO}:v1={self.OLD} {self.REPO}:{self.HASH}={self.NEW}",
                **stubs}
         run = subprocess.run(["bash", str(self.dir / "project-deploy"), "shop", *args], env=env,
@@ -827,7 +849,8 @@ esac
         return path.read_text().strip() if path.exists() else None
 
     def leftovers(self):
-        return sorted(p.name for p in self.web.iterdir() if p.name != ".env")
+        return sorted([p.name for p in self.web.iterdir() if p.name != ".env"] +
+                      [f"../{p.name}" for p in self.proj.iterdir() if p.name != "web"])
 
     def test_unknown_tag_keeps_env(self):
         before = self.env.read_bytes()
@@ -967,6 +990,217 @@ esac
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
         self.assertFalse([x for x in lines if not x.startswith("docker ") or x.startswith("docker run")], lines)
+
+    def fs(self, *names):
+        """Журнал файловых команд: строки этих команд по порядку"""
+        return [x for x in self.fslog.read_text().splitlines() if x.split()[0] in names]
+
+    def test_tmp_swapped_for_link_leaves_victim(self):
+        # временный .env, созданный в web/, участник подменяет ссылкой на чужой файл: root не пишет в него
+        # и не ставит ему владельца и права .env — временный файл в папке проекта, участнику туда не писать
+        victim = victim_file(self.dir)
+        participant_mktemp(self.bin, self.web, victim, swap="tmp")
+        run, _ = self.deploy("to", self.HASH)
+        self.assertEqual((victim.read_text(), victim.stat().st_mode & 0o777), ("victim\n", 0o600))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse(self.env.is_symlink())
+        self.assertIn(f"\nDEPLOY_IMAGE={self.REPO}:{self.HASH}\n", self.env.read_text())
+        self.assertEqual(self.env.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.leftovers(), ["compose.yml"])
+        tmp = self.fs("mktemp")[0].split()[1]
+        self.assertEqual(os.path.dirname(tmp), str(self.proj))
+        # владелец, ACL и права — с .env на временный файл, затем ещё раз stat .env и mv
+        st = self.env.stat()
+        self.assertEqual(self.fs("chown", "setfacl", "chmod", "stat", "mv", "acl")[-6:],
+                         [f"chown {st.st_uid}:{st.st_gid} {tmp}", f"setfacl --set-file=- {tmp}", "acl # file: .env",
+                          f"chmod 640 {tmp}", "stat -c %i %u %g %a %F .env", f"mv {tmp} .env"])
+
+    def test_env_swapped_before_mv_refused(self):
+        # .env подменили ссылкой после чтения, до mv (крючок в setfacl): stat перед mv видит другой файл — отказ
+        victim = victim_file(self.dir)
+        run, _ = self.deploy("to", self.HASH, STUB_SWAP_ENV=str(self.env), STUB_SWAP_TO=str(victim))
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn(f"работает {self.REPO}:{self.HASH}, но .env не записан", run.stderr)
+        self.assertEqual((victim.read_text(), victim.stat().st_mode & 0o777), ("victim\n", 0o600))
+        self.assertTrue(self.env.is_symlink())
+        self.assertEqual(self.leftovers(), ["compose.yml"])
+        self.assertEqual(files_with(self.proj, "victim"), [])
+        self.assertEqual(self.fs("mv"), ["mv compose.yml.new compose.yml"])     # .env не трогали
+
+    def test_open_project_dir_refused(self):
+        # в папку проекта пишет группа: временный .env туда не кладётся — отказ до выкладки, ничего не менял
+        before = self.env.read_bytes()
+        self.proj.chmod(0o770)
+        run, lines = self.deploy("to", self.HASH)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("пишет не только root", run.stderr)
+        self.assertIn("ничего не менял", run.stderr)
+        self.assertEqual(self.env.read_bytes(), before)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(lines, [])
+
+    def test_failed_to_marked_manual(self):
+        # сбой ручного to — с пометкой в .failed (по ней health-check не отсылает к журналу таймера), сбой таймера — без
+        self.deploy("to", self.HASH, STUB_FAIL_UP="1")
+        self.assertRegex(self.state("failed"), rf"^\d{{4}}-\d\d-\d\d \d\d:\d\d вручную \(to {self.HASH}\), запуск: работает прежняя версия$")
+        self.log.unlink()
+        self.deploy(STUB_FAIL_UP="1", STUB_TAGS=f"{self.REPO}:main=sha256:{'3' * 64}")
+        self.assertRegex(self.state("failed"), r"^\d{4}-\d\d-\d\d \d\d:\d\d запуск: работает прежняя версия$")
+
+
+def victim_file(root):
+    """Чужой файл (.env другого проекта, /etc/shadow): в папке 0700, права 0600, текст victim"""
+    other = root / "other"
+    other.mkdir(mode=0o700)
+    victim = other / "secret"
+    victim.write_text("victim\n")
+    victim.chmod(0o600)
+    return victim
+
+
+def participant_mktemp(bin_dir, web, victim, swap):
+    """mktemp с участником проекта, которому web/ открыта на запись: настоящий mktemp, путь — в журнал файловых
+    команд; затем участник подменяет ссылкой на victim временный файл, если он создан в web/ (swap="tmp"),
+    или сам .env (swap="env")"""
+    real = os.path.realpath(web)
+    (bin_dir / "mktemp").write_text(f"""#!/bin/bash
+f=$({shutil.which("mktemp")} "$@") || exit
+echo "mktemp $f" >> "$STUB_FSLOG"
+case {swap} in
+  tmp) [ "$(cd "$(dirname "$f")" && pwd -P)" != "{real}" ] || {{ rm -f "$f" && ln -s "{victim}" "$f"; }} ;;
+  env) rm -f "{web}/.env" && ln -s "{victim}" "{web}/.env" ;;
+esac
+echo "$f"
+""")
+    (bin_dir / "mktemp").chmod(0o755)
+
+
+def files_with(root, text):
+    """Обычные файлы (не ссылки) под root, в которых есть text"""
+    return [str(p) for p in root.rglob("*") if p.is_file() and not p.is_symlink() and text in p.read_text()]
+
+
+class ProjectDbEnv(unittest.TestCase):
+    """project-db-env <проект> [приставка]: строки DB_* в .env заменены, остальные на месте, владелец и права прежние;
+    временный файл — в папке проекта, не в web/: подменённые ссылкой временный файл или .env не меняют чужой файл
+    и не приносят его текст в .env. Стенд: скрипт с папкой проекта и secrets.yml во временной папке (пароль
+    тестовый); docker и project-docker-host — заглушки, файловые команды — те же, что у ProjectDeployTo."""
+
+    ENV = "DEBUG=False\nDB_HOST=192.0.2.1\nDB_PASSWORD=old\nDEV_DB_HOST=keep\nSITE_NAME=Магазин\n"
+    DB = "DB_HOST=172.20.5.1\nDB_PORT=5432\nDB_NAME=shop\nDB_USER=shop\nDB_PASSWORD=pw-test\n"
+    FILES = ("chown", "chmod", "stat", "dd", "mv", "getfacl", "setfacl")
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.bin, self.proj = self.dir / "bin", self.dir / "proj"
+        self.web = self.proj / "web"
+        for d in (self.bin, self.proj, self.web):
+            d.mkdir()
+        stubs = {"project-docker-host": "#!/bin/sh\n", "docker": "#!/bin/sh\necho 172.20.5.1\n",
+                 **{name: ProjectDeployTo.STUBS[name] for name in self.FILES}}
+        for name, text in stubs.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        secrets = self.dir / "secrets.yml"
+        secrets.write_text('db_password_shop: "pw-test"\n')
+        script = (ROOT / "roles/project/files/project-db-env").read_text()
+        for old, new in (("/srv/projects/$NAME", f'"{self.proj}"'), ("/etc/infra/secrets.yml", f'"{secrets}"')):
+            if old not in script:
+                raise AssertionError(f"в project-db-env нет «{old}» — стенду нечего подменить")
+            script = script.replace(old, new)
+        self.script = self.dir / "project-db-env"
+        self.script.write_text(script)
+        self.env = self.web / ".env"
+        self.env.write_text(self.ENV)
+        self.env.chmod(0o640)
+        self.fslog = self.dir / "fslog"
+
+    def db_env(self, *args, **stubs):
+        env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_FSLOG": str(self.fslog), **stubs}
+        return subprocess.run(["bash", str(self.script), "shop", *args], env=env, capture_output=True, text=True)
+
+    def leftovers(self):
+        return sorted([p.name for p in self.web.iterdir() if p.name != ".env"] +
+                      [f"../{p.name}" for p in self.proj.iterdir() if p.name != "web"])
+
+    def assertVictimIntact(self, victim):
+        self.assertEqual((victim.read_text(), victim.stat().st_mode & 0o777), ("victim\n", 0o600))
+        self.assertEqual(files_with(self.proj, "victim"), [])
+
+    def test_db_lines_replaced(self):
+        run = self.db_env()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.env.read_text(), "DEBUG=False\nDEV_DB_HOST=keep\nSITE_NAME=Магазин\n" + self.DB)
+        self.assertEqual(self.env.stat().st_mode & 0o777, 0o640)
+        self.assertNotIn("pw-test", run.stdout + run.stderr)
+        self.assertEqual(self.leftovers(), [])
+        # ACL — с .env на временный файл в папке проекта, до chmod
+        setfacl = self.fs("setfacl")
+        self.assertEqual(len(setfacl), 1, setfacl)
+        self.assertEqual(os.path.dirname(setfacl[0].split()[-1]), str(self.proj))
+        self.assertEqual([x.split()[0] for x in self.fs("chown", "setfacl", "chmod", "mv")], ["chown", "setfacl", "chmod", "mv"])
+        self.assertIn(f"acl # file: {self.env}", self.fslog.read_text().splitlines())
+        run = self.db_env("DEV_")                                   # dev-проект: DEV_DB_*, DB_* не тронуты
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.env.read_text(), "DEBUG=False\nSITE_NAME=Магазин\n" + self.DB +
+                         self.DB.replace("DB_", "DEV_DB_"))
+
+    def fs(self, *names):
+        return [x for x in self.fslog.read_text().splitlines() if x.split()[0] in names]
+
+    def test_env_link_refused(self):
+        victim = victim_file(self.dir)
+        self.env.unlink()
+        self.env.symlink_to(victim)
+        run = self.db_env()
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("ссылка", run.stderr)
+        self.assertTrue(self.env.is_symlink())
+        self.assertVictimIntact(victim)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_tmp_swapped_for_link_leaves_victim(self):
+        # временный файл, созданный в web/, участник подменяет ссылкой: root не пишет в чужой файл
+        victim = victim_file(self.dir)
+        participant_mktemp(self.bin, self.web, victim, swap="tmp")
+        run = self.db_env()
+        self.assertVictimIntact(victim)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse(self.env.is_symlink())
+        self.assertEqual(self.env.read_text(), "DEBUG=False\nDEV_DB_HOST=keep\nSITE_NAME=Магазин\n" + self.DB)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_env_swapped_after_check_refused(self):
+        # .env подменили ссылкой после проверки, перед чтением: dd с nofollow её не открывает — отказ,
+        # текст чужого файла не попал ни в один файл
+        victim = victim_file(self.dir)
+        participant_mktemp(self.bin, self.web, victim, swap="env")
+        run = self.db_env()
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("меняли, пока root его переписывал", run.stderr)
+        self.assertVictimIntact(victim)
+        self.assertEqual(self.leftovers(), [])
+        self.assertFalse(self.fs("mv"))
+
+    def test_env_swapped_before_mv_refused(self):
+        # .env подменили ссылкой после чтения, до mv (крючок в setfacl): stat перед mv видит другой файл — отказ
+        victim = victim_file(self.dir)
+        run = self.db_env(STUB_SWAP_ENV=str(self.env), STUB_SWAP_TO=str(victim))
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("меняли, пока root его переписывал", run.stderr)
+        self.assertTrue(self.env.is_symlink())
+        self.assertVictimIntact(victim)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_open_project_dir_refused(self):
+        self.proj.chmod(0o770)
+        run = self.db_env()
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("пишет не только root", run.stderr)
+        self.assertEqual(self.env.read_text(), self.ENV)
+        self.assertEqual(self.leftovers(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
