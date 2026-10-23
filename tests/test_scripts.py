@@ -1370,5 +1370,106 @@ class ProjectDbEnv(unittest.TestCase):
         self.assertEqual(self.leftovers(), [])
 
 
+class SettingsDiffMasked(unittest.TestCase):
+    """infra: diff server.yml в журнале событий — полный apply (log_settings_change в run-unit) и infra edit
+    (changes: экран и журнал). Значения ключей с token, password, secret… — ***, остальное и открытые ключи
+    людей — как есть. Стенд: infra из репозитория, /etc/infra и /var/lib/infra — во временной папке; Ansible,
+    Python (проверка YAML), infra-log, id, flock, редактор — заглушки; mktemp --suffix (на Mac нет) — тоже."""
+
+    OLD = ("server_name: srv\n"
+           "ghcr_token: oldtok777\n"
+           "people:\n"
+           "  ivan:\n"
+           '    key: "ssh-ed25519 AAAAold ivan@laptop"\n'
+           "projects:\n"
+           "  shop:\n"
+           "    net: 11\n"
+           "    memory: 1g\n")
+    NEW = ("server_name: srv\n"
+           "ghcr_token: abc123secret\n"
+           "people:\n"
+           "  ivan:\n"
+           '    key: "ssh-ed25519 AAAAnew ivan@laptop"\n'
+           "projects:\n"
+           "  shop:\n"
+           "    net: 11\n"
+           "    memory: 2g\n"
+           '    db_password: "p4ss"\n')
+    STUBS = {
+        "id": '#!/bin/sh\n[ "$1" = -u ] && echo 0 || exec /usr/bin/id "$@"\n',
+        "flock": "#!/bin/sh\nexit 0\n",
+        "mktemp": ('#!/bin/sh\ncase $1 in --suffix=*) s=${1#--suffix=}; shift\n'
+                   '  f=$(/usr/bin/mktemp "$@") && mv "$f" "$f$s" && echo "$f$s"; exit ;; esac\n'
+                   'exec /usr/bin/mktemp "$@"\n'),
+        "editor": '#!/bin/sh\ncp "$STUB_NEW" "$1"\n',                              # правка — новый server.yml
+    }
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.bin, self.etc, self.state, engine = (self.dir / x for x in ("bin", "etc", "state", "engine"))
+        for d in (self.bin, self.etc, self.state, engine / "roles/base/files", engine / ".venv/bin"):
+            d.mkdir(parents=True)
+        infra = (ROOT / "infra").read_text()
+        for old, new in (("\nCONF=/etc/infra\n", f'\nCONF="{self.etc}"\n'),
+                         ("\nSTATE=/var/lib/infra ", f'\nSTATE="{self.state}" '),
+                         ('"${ARGS[@]}"', '${ARGS[@]+"${ARGS[@]}"}'),
+                         ('"${CLEANUP[@]}"', '${CLEANUP[@]+"${CLEANUP[@]}"}')):
+            if old not in infra:
+                raise AssertionError(f"в infra нет «{old.strip()}» — стенду нечего подменить")
+            infra = infra.replace(old, new)
+        files = {**{self.bin / name: text for name, text in self.STUBS.items()},
+                 engine / "infra": infra,
+                 engine / "roles/base/files/infra-log":
+                     '#!/bin/sh\necho "infra-log $*" >> "$STUB_LOG"\n[ "$1" != - ] || cat >> "$STUB_LOG"\n',
+                 engine / ".venv/bin/ansible-playbook": "#!/bin/sh\necho PLAY RECAP\necho 'srv : ok=40 changed=0'\n",
+                 engine / ".venv/bin/python": "#!/bin/sh\ncat >/dev/null\n"}                # YAML в порядке
+        for path, text in files.items():
+            path.write_text(text)
+            path.chmod(0o755)
+        (self.etc / "server.yml").write_text(self.OLD)
+        (self.etc / "secrets.yml").write_text("")
+        self.new = self.dir / "new.yml"
+        self.new.write_text(self.NEW)
+        self.log = self.dir / "stand.log"
+        self.log.write_text("")
+        self.infra = engine / "infra"
+
+    def infra_run(self, *args):
+        env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_LOG": str(self.log),
+               "STUB_NEW": str(self.new), "SUDO_EDITOR": str(self.bin / "editor")}
+        run = subprocess.run(["bash", str(self.infra), *args], input="", env=env, capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        return run
+
+    def assertMasked(self, text):
+        self.assertIn("+ghcr_token: ***", text)
+        self.assertIn("-ghcr_token: ***", text)
+        self.assertIn("+    db_password: ***", text)
+        for secret in ("oldtok777", "abc123secret", "p4ss"):
+            self.assertNotIn(secret, text)
+        self.assertIn("-    memory: 1g", text)                                   # остальное — как есть
+        self.assertIn("+    memory: 2g", text)
+        self.assertIn('+    key: "ssh-ed25519 AAAAnew ivan@laptop"', text)       # открытый ключ — не секрет
+
+    def test_full_apply(self):
+        # служба infra-apply: копия server.yml прошлого полного apply — старая, в /etc/infra — новая
+        shutil.copy(self.etc / "server.yml", self.state / "server.yml")
+        (self.etc / "server.yml").write_text(self.NEW)
+        self.infra_run("run-unit", "site.yml")
+        log = self.log.read_text()
+        self.assertIn("infra-log настройки (server.yml) изменены с прошлого полного apply:", log)
+        self.assertMasked(log)
+
+    def test_edit(self):
+        run = self.infra_run("edit")
+        self.assertEqual((self.etc / "server.yml").read_text(), self.NEW)
+        log = self.log.read_text()
+        self.assertIn("infra-log edit: server.yml изменён", log)
+        self.assertMasked(log)
+        self.assertMasked(run.stdout)                                             # и на экране
+
+
 if __name__ == "__main__":
     unittest.main()

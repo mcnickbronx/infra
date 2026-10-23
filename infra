@@ -142,13 +142,22 @@ secret_sums() {
   done | LC_ALL=C sort
 }
 
-# Что поменяли в server.yml с прошлого полного apply — diff в журнал
+# Пароли и токены в diff server.yml — звёздочками: у ключа с token, password, passwd, secret, api_key,
+# private_key в имени значение — ***, ключ и знак +/- остаются (видно, что поменяли). Журнал событий
+# лежит в бэкапах и уходит в уведомления — токену там не место. Открытые ключи людей (key:) — как есть.
+# Многострочное значение (ключ: |) — звёздочками только первая строка. sed без флага I (BSD sed на Mac):
+# ключи server.yml строчные
+mask_secrets() {
+  sed -E 's/^([-+ ][[:space:]]*(-[[:space:]]+)?[a-z0-9_]*(token|password|passwd|secret|api_key|private_key)[a-z0-9_]*[[:space:]]*:)[[:space:]]+[^[:space:]#].*$/\1 ***/'
+}
+
+# Что поменяли в server.yml с прошлого полного apply — diff в журнал (пароли — звёздочками)
 log_settings_change() {
   if [ ! -f "$STATE/server.yml" ]; then
     log "настройки (server.yml): первый apply"
   elif ! diff -q "$STATE/server.yml" "$CONF/server.yml" >/dev/null; then
     log "настройки (server.yml) изменены с прошлого полного apply:"
-    { diff -u --label было --label стало "$STATE/server.yml" "$CONF/server.yml" || true; } | tail -n +3 | log -   # код diff — 1
+    { diff -u --label было --label стало "$STATE/server.yml" "$CONF/server.yml" || true; } | tail -n +3 | mask_secrets | log -   # код diff — 1
   fi
 }
 
@@ -604,14 +613,15 @@ cmd_edit() {
   done
 }
 
-# Что поменялось: у server.yml — diff, у secrets.yml — только имена ключей (значения — пароли)
+# Что поменялось: у server.yml — diff (пароли — звёздочками), у secrets.yml — только имена ключей
+# (значения — пароли)
 changes() {
   local keys
   if [ "$1" = secrets.yml ]; then
     keys=$(sums_diff "$(secret_sums "$2")" "$(secret_sums "$3")")
     echo "${keys:-ключи и значения те же — изменились комментарии или оформление}"
   else
-    { diff -u --label было --label стало "$2" "$3" || true; } | tail -n +3     # код diff — 1
+    { diff -u --label было --label стало "$2" "$3" || true; } | tail -n +3 | mask_secrets   # код diff — 1
   fi
 }
 
