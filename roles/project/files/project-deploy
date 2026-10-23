@@ -63,6 +63,21 @@ own_image() {
 # Версия для журнала событий: образ и начало дайджеста (repo@sha256:0123456789ab)
 short() { sed -E 's/(sha256:[0-9a-f]{12})[0-9a-f]*/\1/' <<<"${1:-—}"; }
 
+# Коммит, из которого собран образ $1, — ярлык org.opencontainers.image.revision (его ставит CI web-start):
+# его, в отличие от дайджеста, можно дать to <тег>. Нет ярлыка или не похож на хеш — пусто
+revision() {
+  local rev
+  rev=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$1" 2>/dev/null) || rev=
+  [[ $rev =~ ^[0-9a-f]{7,64}$ ]] && echo "$rev" || true
+}
+
+# Имя сервера для уведомления — как у команды infra (server_name в server.yml); нет его — имя хоста
+server_name() {
+  local name
+  name=$(sed -nE "s/^server_name:[[:space:]]*[\"']?([a-z0-9-]+).*/\1/p" /etc/infra/server.yml 2>/dev/null | head -1) || true
+  echo "${name:-$(hostname)}"
+}
+
 # ---------- Шаги выкладки ----------
 compose() { project-compose "$NAME" "$@"; }
 # Проект без root (rootless): образы и контейнеры — в его Docker. Скачивает образ root (вход в ghcr —
@@ -150,7 +165,13 @@ roll_out() {
   set_state current "$NEW"
   rm -f "$STATE.failed" "$STATE.failed-ref" compose.yml.prev
   echo "$NAME: выложено"
-  infra-log "выкладка $NAME: готово, $(short "$NEW")"
+  rev=$(revision "$NEW")
+  infra-log "выкладка $NAME: готово, $(short "$NEW")${rev:+, коммит $rev}"
+  # Таймер выложил новую версию — строка в Telegram: push дошёл до сайта (to и откат человек видит в выводе).
+  # timeout 15: при закрытом Telegram infra-notify ждёт минуту и дольше, а замок проекта ещё наш — rollback и to ждут
+  # его 30 с (ниже); 9>&- — отправке замок не нужен. Не ушло — не повторяем: выкладка — в журнале событий
+  [ "$ACTION" != deploy ] ||
+    timeout 15 infra-notify "🚀 $(server_name): $NAME — выложена новая версия${rev:+, коммит ${rev:0:7}}" >/dev/null 2>&1 9>&- || true
 }
 
 # Шаг $1 не удался: эту версию больше не пробовать, вернуть прежние образ и compose.yml.

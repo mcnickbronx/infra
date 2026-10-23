@@ -437,6 +437,8 @@
     # первая автовыкладка (v2) не удалась — работает v0; выкладка v1 с папкой данных, которую
     # создаёт project-deploy; отказ v4 с возвратом v1, v4 не пробуется снова; v3; откат при
     # идущей выкладке отказывает; откат вручную без уведомления; откаченная версия не выкладывается.
+    # Уведомления «выложена новая версия» — в файл (INFRA_NOTIFY_DRY; у таймера — drop-in в /run, как в сценарии 8):
+    # их два — v1 и v3; сбои, откат и «нового нет» — без них.
     - name: "4. Реестр образов и пять версий проекта"
       ansible.builtin.shell: |
         set -euo pipefail
@@ -474,6 +476,10 @@
         set -uo pipefail
         cd {{ web }}
         log_start=$(wc -l < /var/log/infra.log)
+        notify=/tmp/verify-deploy-notify; rm -f $notify; export INFRA_NOTIFY_DRY=$notify
+        install -d /run/systemd/system/project-deploy@shop.service.d
+        printf '[Service]\nEnvironment=INFRA_NOTIFY_DRY=%s\n' $notify > /run/systemd/system/project-deploy@shop.service.d/dry.conf
+        systemctl daemon-reload
         echo "DEPLOY_IMAGE=localhost:5000/verify:test" > .env
         put() { docker tag localhost:5000/verify:$1 localhost:5000/verify:test && docker push -q localhost:5000/verify:test >/dev/null; }
         page() { project-compose shop exec -T web wget -q -O- http://127.0.0.1:8080/ 2>&1; }
@@ -496,6 +502,8 @@
         project-deploy shop >/dev/null 2>&1; echo "after_rollback=$?:$(page)"
         events() { tail -n +$((log_start + 1)) /var/log/infra.log | grep -c "$1"; }
         echo "logged=$(events 'выкладка shop: готово'):$(events 'выкладка shop: .* не удалась'):$(events 'откат shop: готово')"
+        echo "notified=$(grep -c '^🚀 .*: shop — выложена новая версия' $notify)"
+        rm -rf /run/systemd/system/project-deploy@shop.service.d $notify; systemctl daemon-reload
       args:
         executable: /bin/bash
       register: autodeploy
@@ -516,6 +524,7 @@
           - r.rollback == '0:v1:0'
           - r.after_rollback == '0:v1'
           - r.logged == '2:2:1'                 # в журнале событий: v1 и v3, отказы v2 и v4, откат
+          - r.notified == '2'                   # «выложена новая версия» — v1 и v3
         fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
         quiet: true
 
@@ -1157,6 +1166,10 @@
         done
         rm -rf "$b"
         echo "DEPLOY_IMAGE=$reg/verify-rl:test" > $w/.env
+        notify=/tmp/verify-rl-notify; rm -f $notify; export INFRA_NOTIFY_DRY=$notify    # «выложена новая версия» — в файл
+        install -d /run/systemd/system/project-deploy@$p.service.d
+        printf '[Service]\nEnvironment=INFRA_NOTIFY_DRY=%s\n' $notify > /run/systemd/system/project-deploy@$p.service.d/dry.conf
+        systemctl daemon-reload
         put() { docker tag $reg/verify-rl:$1 $reg/verify-rl:test && docker push -q $reg/verify-rl:test >/dev/null; }
         page() { curl -sk --resolve $host:443:127.0.0.1 https://$host/; }
         wait_page() { for i in $(seq 1 20); do [ "$(page)" = "$1" ] && break; sleep 1; done; page; }
@@ -1166,6 +1179,8 @@
         pid=$(docker inspect -f '{{ '{{' }}.State.Pid{{ '}}' }}' "$(project-compose $p ps -q web)")
         echo "deploy_user=$(ps -o user= -p "$pid")"
         project-deploy $p rollback >/dev/null 2>&1; echo "rollback=$?:$(wait_page v1)"
+        echo "notified=$(grep -c "^🚀 .*: $p — выложена новая версия" $notify)"
+        rm -rf /run/systemd/system/project-deploy@$p.service.d $notify; systemctl daemon-reload
         # уборка: проект, реестр, образы, настройки Docker без root — как были
         project-compose $p down -v >/dev/null 2>&1
         env -u DOCKER_HOST docker rm -f verify-rl-registry >/dev/null 2>&1
@@ -1189,6 +1204,7 @@
           - r.v3 == '0:v3:v3'
           - r.deploy_user == 'labs-run'       # root в контейнере — пользователь группы
           - r.rollback == '0:v1'
+          - r.notified == '2'                 # «выложена новая версия» — v1 и v3
         fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
         quiet: true
       when: "'lab' in rootless_projects"

@@ -917,20 +917,22 @@ exit "$STUB_RC"
 class ProjectDeployTo(unittest.TestCase):
     """project-deploy <проект> to <тег>: образа нет — .env побайтно тот же; есть — выкладка, и в .env заменена одна
     строка DEPLOY_IMAGE, владелец и права прежние; .env-ссылка — отказ; сбой выкладки — прежние версия и .env.
-    Стенд: скрипт с папками проекта и состояния во временной папке; docker, project-compose, flock, infra-log —
-    заглушки, пишут строку в журнал стенда; chown, chmod, stat, mv, dd, getfacl и setfacl — на Python (их ключей
-    и ACL на Mac нет), пишут строку в журнал файловых команд. Папка проекта (/srv/projects/<проект>) — proj,
-    web/ — внутри."""
+    Стенд: скрипт с папками проекта и состояния во временной папке; docker, project-compose, flock, infra-log,
+    infra-notify, timeout — заглушки, пишут строку в журнал стенда; chown, chmod, stat, mv, dd, getfacl и setfacl —
+    на Python (их ключей и ACL на Mac нет), пишут строку в журнал файловых команд. Папка проекта
+    (/srv/projects/<проект>) — proj, web/ — внутри; /etc/infra/server.yml — server.yml стенда."""
 
     REPO = "ghcr.io/example/shop"
     HASH = "bb168cfcfece1b663da0141574e4994eed9eea20"
     OLD, NEW = "sha256:" + "1" * 64, "sha256:" + "2" * 64
     ENV = ('DEBUG=False\n#DEPLOY_IMAGE=ghcr.io/example/shop:v0\nDEPLOY_IMAGE="ghcr.io/example/shop:main"\n'
            "SITE_NAME=Магазин\n")
-    # docker: в реестре — только теги из STUB_TAGS («образ:тег=дайджест») и любые @sha256
+    # docker: в реестре — только теги из STUB_TAGS («образ:тег=дайджест») и любые @sha256; ярлык коммита образа
+    # (org.opencontainers.image.revision) — STUB_REV
     DOCKER = """#!/bin/bash
 echo "docker $*" >> "$STUB_LOG"
 ref=${!#}
+[[ "$*" != *image.revision* ]] || { echo "${STUB_REV:-}"; exit 0; }
 digest=$(printf '%s\\n' $STUB_TAGS | awk -F= -v r="$ref" '$1 == r { print $2 }')
 case $1 in
   pull) [ -n "$digest" ] || [[ $ref == *@sha256:* ]] || { echo "Error response from daemon: manifest unknown" >&2; exit 1; } ;;
@@ -955,6 +957,12 @@ esac
         "project-docker-host": "#!/bin/sh\n",
         "flock": "#!/bin/sh\n",
         "infra-log": '#!/bin/sh\necho "infra-log $*" >> "$STUB_LOG"\n',
+        # infra-notify: код — STUB_NOTIFY_RC (1 — Telegram не ответил)
+        "infra-notify": '#!/bin/sh\necho "infra-notify $*" >> "$STUB_LOG"\nexit ${STUB_NOTIFY_RC:-0}\n',
+        # timeout <секунды> <команда>: строка в журнал, «(с замком)» — команде достался дескриптор 9 (замок выкладки);
+        # затем команда — без ограничения времени
+        "timeout": '#!/bin/bash\n[ -e /dev/fd/9 ] && lock=" (с замком)" || lock=\n'
+                   'echo "timeout $*$lock" >> "$STUB_LOG"\nshift\nexec "$@"\n',
         # chown --reference=<файл> | <uid>:<gid> и chmod --reference=<файл> | <восьмеричные>: по ссылке идут, как GNU без -h
         "chown": PYTHON + "who, path = args\n"
                  "if who.startswith('--reference='): ref = os.stat(who.split('=', 1)[1]); who = f'{ref.st_uid}:{ref.st_gid}'\n"
@@ -998,8 +1006,11 @@ esac
         for name, text in self.STUBS.items():
             (self.bin / name).write_text(text)
             (self.bin / name).chmod(0o755)
+        conf = self.dir / "server.yml"                       # server_name — в уведомлении о выкладке
+        conf.write_text('server_name: "vds-x"   # имя сервера\nadmin_ips: []\n')
         script = (ROOT / "roles/project/files/project-deploy").read_text()
-        for old, new in (("/srv/projects/$NAME", f'"{self.proj}"'), ("/var/lib/project-deploy", f'"{self.states}"')):
+        for old, new in (("/srv/projects/$NAME", f'"{self.proj}"'), ("/var/lib/project-deploy", f'"{self.states}"'),
+                         ("/etc/infra/server.yml", f'"{conf}"')):
             if old not in script:
                 raise AssertionError(f"в project-deploy нет «{old}» — стенду нечего подменить")
             script = script.replace(old, new)
@@ -1100,6 +1111,89 @@ esac
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn(f"DEPLOY_IMAGE={self.REPO}:v1\n", self.env.read_text())
         self.assertFalse([x for x in lines if " up " in x], lines)
+
+    # Уведомление о выкладке: таймер выложил новую версию — строка в Telegram с коротким коммитом, в журнале событий —
+    # полный; to, откат, сбой и «нового нет» — без сообщения
+    NOTE = "infra-notify 🚀 vds-x: shop — выложена новая версия"
+
+    def timer(self, digest=None, **stubs):
+        return self.deploy(STUB_TAGS=f"{self.REPO}:main={digest or self.NEW}", **stubs)
+
+    def notes(self, lines):
+        return [x for x in lines if x.startswith("infra-notify")]
+
+    def test_timer_notifies_with_commit(self):
+        run, lines = self.timer(STUB_REV=self.HASH)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), [f"{self.NOTE}, коммит bb168cf"])
+        self.assertIn(f"infra-log выкладка shop: готово, {self.REPO}@sha256:{'2' * 12}, коммит {self.HASH}", lines)
+
+    def test_timer_notifies_without_label(self):
+        # образ без ярлыка (у front.yml web-start его нет) — сообщение и журнал без коммита
+        run, lines = self.timer()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), [self.NOTE])
+        self.assertIn(f"infra-log выкладка shop: готово, {self.REPO}@sha256:{'2' * 12}", lines)
+
+    def test_timer_bad_label_dropped(self):
+        # ярлык задаёт тот, кто собирает образ: не хеш — отброшен, в сообщение и журнал не идёт
+        for rev in ("abc; rm -rf /", "$(id)", "<no value>", "BB168CF", "abc123", f"{self.HASH}\nx", "a" * 65):
+            with self.subTest(rev=rev):
+                self.log.unlink(missing_ok=True)
+                (self.states / "shop.current").write_text(f"{self.REPO}@{self.OLD}\n")
+                run, lines = self.timer(STUB_REV=rev)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(self.notes(lines), [self.NOTE])
+                self.assertFalse([x for x in lines if "коммит" in x], lines)
+
+    def test_timer_telegram_down_deploy_ok(self):
+        run, lines = self.timer(STUB_REV=self.HASH, STUB_NOTIFY_RC="1")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(self.notes(lines)), 1)                 # пробовали один раз — и не повторяем
+        self.assertEqual((self.state("current"), self.state("previous")),
+                         (f"{self.REPO}@{self.NEW}", f"{self.REPO}@{self.OLD}"))
+        self.assertIsNone(self.state("failed"))
+
+    def test_timer_failed_rollout_no_notify(self):
+        run, lines = self.timer(STUB_FAIL_UP="1")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertEqual(self.notes(lines), [])
+        self.log.unlink()
+        run, lines = self.timer(digest=f"sha256:{'3' * 64}")        # следующая версия удалась — сообщение есть
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), [self.NOTE])
+
+    def test_timer_nothing_new_no_repeat(self):
+        # таймер проверяет каждые 15 секунд: сообщение — одно на версию, не на каждую проверку
+        self.timer()
+        run, lines = self.timer()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), [self.NOTE])
+
+    def test_manual_to_and_rollback_no_notify(self):
+        # to и откат запускает человек и видит вывод; у to коммит — в журнале событий
+        run, lines = self.deploy("to", self.HASH, STUB_REV=self.HASH)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f"infra-log выкладка shop: готово, {self.REPO}@sha256:{'2' * 12}, коммит {self.HASH}", lines)
+        run, lines = self.deploy("rollback", STUB_REV=self.HASH)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("откат выполнен", run.stdout)
+        self.assertEqual(self.notes(lines), [])
+
+    def test_timer_notify_limited_and_without_lock(self):
+        # Telegram закрыт — infra-notify ждёт минуту и дольше, а rollback и to ждут замок 30 с: отправка — через
+        # timeout 15 и без дескриптора замка
+        run, lines = self.timer(STUB_REV=self.HASH)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([x for x in lines if x.startswith("timeout")], [f"timeout 15 {self.NOTE}, коммит bb168cf"])
+
+    def test_timer_notify_without_server_name(self):
+        # в server.yml нет server_name — имя хоста
+        (self.dir / "server.yml").write_text("admin_ips: []\n")
+        host = subprocess.run(["hostname"], capture_output=True, text=True, check=True).stdout.strip()
+        run, lines = self.timer()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), [f"infra-notify 🚀 {host}: shop — выложена новая версия"])
 
     def test_image_forms(self):
         cases = (
