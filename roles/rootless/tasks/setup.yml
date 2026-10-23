@@ -222,8 +222,11 @@
       echo "$p: тома ($vols) сами не переезжают — перенесите вручную (README, «Проекты без root»)" >&2
       exit 1
     fi
-    # образ — заранее в Docker группы (вход в ghcr — у root): простой — только на перезапуск
-    image=""; [ ! -f "$w/.env" ] || image=$(sed -n 's/^DEPLOY_IMAGE=//p' "$w/.env" | tail -1 | tr -d "\"'")
+    # образ — заранее в Docker группы (вход в ghcr — у root): простой — только на перезапуск. web/ пишут участники:
+    # .env — без перехода по ссылке (dd с nofollow, как project-deploy), FIFO не ждёт (nonblock); ссылка — отказ до down
+    image=""; [ ! -f "$w/.env" ] ||
+      image=$(dd if="$w/.env" iflag=nofollow,nonblock status=none | sed -n 's/^DEPLOY_IMAGE=//p' | tail -1 | tr -d "\"'") ||
+      { echo "$p: web/.env — ссылка (root по ссылке не читает) или не читается — перевод не начат; замените ссылку файлом" >&2; exit 1; }
     [ -z "$image" ] || DOCKER_HOST={{ item.value.sock | quote }} docker pull -q "$image" >/dev/null
     if [ -z "$was" ]; then
       env -u DOCKER_HOST docker compose -p "$p" down 2>&1 | tail -n 3

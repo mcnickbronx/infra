@@ -250,7 +250,11 @@ else
   flock -w 30 9 || { echo "$NAME: идёт выкладка — ничего не менял; посмотрите журнал и повторите" >&2; exit 1; }
 fi
 cd "$WEB"
-IMAGE=$(sed -n 's/^DEPLOY_IMAGE=//p' .env 2>/dev/null | tail -1 | tr -d "\"'") || true   # нет .env — пусто
+# web/ пишут участники: .env — один раз и без перехода по ссылке (dd с nofollow: ссылка на месте .env — отказ, проверки
+# «до» и гонки нет, как в to); nonblock — FIFO на месте .env не вешает таймер. Нет .env или не прочитан — пусто
+IMAGE=$(dd if=.env iflag=nofollow,nonblock status=none 2>/dev/null | sed -n 's/^DEPLOY_IMAGE=//p' | tail -1 | tr -d "\"'") || IMAGE=
+[ -n "$IMAGE" ] || [ ! -L .env ] ||                     # -L — только для текста: защищает nofollow
+  { echo "$NAME: web/.env — ссылка: root по ссылке не читает, выкладка не идёт; замените ссылку файлом" >&2; exit 1; }
 [ -n "$IMAGE" ] || { echo "$NAME: нет DEPLOY_IMAGE в .env — автовыкладка не настроена" >&2; exit 1; }
 
 case $ACTION in

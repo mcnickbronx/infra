@@ -8,6 +8,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -900,9 +901,11 @@ esac
                    "if os.environ.get('STUB_SWAP_ENV'):\n"
                    "    os.remove(os.environ['STUB_SWAP_ENV']); os.symlink(os.environ['STUB_SWAP_TO'], os.environ['STUB_SWAP_ENV'])\n",
         "mv": PYTHON + "os.replace(args[0], args[1])\n",
-        # dd if=<файл> [iflag=nofollow]: с nofollow ссылку не открывает (O_NOFOLLOW), как GNU dd и uutils
+        # dd if=<файл> [iflag=nofollow[,nonblock]]: с nofollow ссылку не открывает (O_NOFOLLOW), с nonblock FIFO без
+        # писателя не ждёт (O_NONBLOCK: пустое чтение), как GNU dd и uutils
         "dd": PYTHON + "opts = dict(a.split('=', 1) for a in args)\n"
-              "flags = os.O_RDONLY | (os.O_NOFOLLOW if 'nofollow' in opts.get('iflag', '').split(',') else 0)\n"
+              "iflag = opts.get('iflag', '').split(',')\n"
+              "flags = os.O_RDONLY | (os.O_NOFOLLOW if 'nofollow' in iflag else 0) | (os.O_NONBLOCK if 'nonblock' in iflag else 0)\n"
               "sys.stdout.buffer.write(os.fdopen(os.open(opts['if'], flags), 'rb').read())\n",
     }
 
@@ -1154,6 +1157,47 @@ esac
         self.log.unlink()
         self.deploy(STUB_FAIL_UP="1", STUB_TAGS=f"{self.REPO}:main=sha256:{'3' * 64}")
         self.assertRegex(self.state("failed"), r"^\d{4}-\d\d-\d\d \d\d:\d\d запуск: работает прежняя версия$")
+
+    def test_timer_env_link_refused(self):
+        # таймер: участник заменил web/.env ссылкой на .env другого проекта — root по ней не читает: отказ, образ соседа
+        # не скачан своим входом в ghcr и не выложен, версия прежняя
+        other = self.dir / "other"
+        other.mkdir(mode=0o700)
+        (other / ".env").write_text("DEPLOY_IMAGE=ghcr.io/example/other:main\ndb_password_other=s3cret\n")
+        self.env.unlink()
+        self.env.symlink_to(other / ".env")
+        run, lines = self.deploy(STUB_TAGS=f"ghcr.io/example/other:main={self.NEW} {self.REPO}:main={self.OLD}")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("web/.env — ссылка", run.stderr)
+        self.assertEqual(lines, [])                                 # ни pull, ни up
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+        self.assertTrue(self.env.is_symlink())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_timer_env_fifo_does_not_hang(self):
+        # FIFO без писателя на месте web/.env: таймер не ждёт писателя — отказ за секунды, без pull. Страховка стенда:
+        # через 10 с FIFO открывается на запись и закрывается — ждущий его читатель получает конец файла
+        self.env.unlink()
+        os.mkfifo(self.env)
+        guard = threading.Timer(10, open_fifo_writer, [self.env])
+        guard.start()
+        self.addCleanup(guard.cancel)
+        start = time.monotonic()
+        run, lines = self.deploy()
+        self.assertLess(time.monotonic() - start, 5, "project-deploy ждал писателя FIFO")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("нет DEPLOY_IMAGE", run.stderr)
+        self.assertEqual(lines, [])
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+
+
+def open_fifo_writer(path):
+    """Открыть FIFO на запись без ожидания и закрыть: читатель, который ждёт писателя, получает конец файла.
+    Читателя нет — открыть нельзя (ENXIO), ждать некому"""
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+    except OSError:
+        pass
 
 
 def victim_file(root):
