@@ -8,7 +8,7 @@
 #   sudo infra apply [--check] [-y] [...]   показать, что изменится, и после подтверждения применить
 #                                          (--check — только показать, -y — применить без вопроса)
 #   sudo infra update [--check] [-y]        обновления: Docker, Postgres, Traefik, пакеты, перезагрузка
-#   sudo infra upgrade <версия> [...]       движок другой версии (git-тег с подписью из SIGNERS), затем apply; --check и «нет» движок не меняют
+#   sudo infra upgrade <версия> [...]       движок другой версии (git-тег с подписью из SIGNERS), затем apply и проверка tests/verify.yml; --check и «нет» движок не меняют
 #   sudo infra run <плейбук> [...]          плейбук движка как есть — для проверок (tests/verify.yml)
 # Остальные параметры уходят ansible-playbook: --tags project, -e skip_lockout_check=true (если уверены).
 # Движок — папка этого скрипта (/opt/infra), его Ansible — .venv в ней; настройки и пароли —
@@ -368,6 +368,19 @@ engine_back() {
   echo "== Движок возвращён: $2"
 }
 
+# Новая версия осталась, прогон прошёл или изменений нет — сервер проверяется тем, что она
+# обещает: tests/verify.yml, только чтение (раньше её запускали руками). Не прошла — ошибки или
+# Ctrl+C (Ansible ловит его сам и выходит кодом 99) — код 1, движок не возвращается: сервер уже
+# приведён к нему. verify_after_upgrade <версия> <прежняя версия>
+verify_after_upgrade() {
+  echo "== Проверка сервера: tests/verify.yml (только чтение)"
+  cmd_run tests/verify.yml && return 0
+  echo "infra: проверка после upgrade не прошла (причина выше) — движок остаётся $1 (был $2):
+сервер уже приведён к нему. Разбор — ADMIN.md, «Если что-то сломалось»;
+проверить ещё раз — sudo infra run tests/verify.yml" >&2
+  return 1
+}
+
 # Ручные правки кода прямо в /opt/infra не пропадают молча: с ними upgrade отказывает.
 # Тег, который на GitHub подменили, git не скачает (fetch откажет: «would clobber existing tag»)
 cmd_upgrade() {
@@ -395,9 +408,12 @@ cmd_upgrade() {
   echo "== Движок: $(git -C "$ENGINE" describe --tags --always)"
   cmd_apply "$@" || rc=$?
   trap - INT
-  # «Изменений нет» и начатый прогон, даже упавший, — сервер уже менялся этой версией: она остаётся
+  # «Изменений нет» и начатый прогон, даже упавший, — сервер уже менялся этой версией: она остаётся;
+  # прошёл — проверка сервера
   if [ "$STAGE" != apply ] && { [ -n "$CHECK" ] || [ "$rc" != 0 ]; }; then
     engine_back "$version" "$before" "$before_ref"
+  elif [ "$rc" = 0 ]; then
+    verify_after_upgrade "$version" "$before" || rc=1
   fi
   return "$rc"
 }

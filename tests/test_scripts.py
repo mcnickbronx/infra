@@ -612,12 +612,13 @@ class ReleaseScript(unittest.TestCase):
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class UpgradePreview(unittest.TestCase):
     """infra upgrade: сервер не менялся (--check, «нет», предпросмотр не прошёл, Ctrl+C) — движок прежней версии;
-    «изменений нет» и «да» — новой. Стенд: «origin» с подписанными v1.0.0 и v1.1.0, движок — его клон на v1.0.0,
-    /etc/infra и /var/lib/infra — во временной папке; Ansible, install.sh, infra-log, id, systemd — заглушки,
-    пишут строку в журнал стенда."""
+    «изменений нет» и «да» — новой, затем проверка сервера tests/verify.yml. Стенд: «origin» с подписанными v1.0.0
+    и v1.1.0, движок — его клон на v1.0.0, /etc/infra и /var/lib/infra — во временной папке; Ansible, install.sh,
+    infra-log, id, systemd — заглушки, пишут строку в журнал стенда."""
 
     PLAYBOOK = """#!/bin/sh
 echo "ansible-playbook $*" >> "$STUB_LOG"
+case " $* " in *" tests/verify.yml "*) exit "${STUB_VERIFY_RC:-0}" ;; esac   # проверка после upgrade
 [ -z "$STUB_INT" ] || kill -INT 0          # Ctrl+C в терминале — сигнал всей группе процессов
 echo "PLAY RECAP"
 echo "srv : ok=40 changed=$STUB_CHANGED failed=0"
@@ -686,15 +687,20 @@ exit "$STUB_RC"
         self.log = self.dir / "stand.log"
         self.log.write_text("")
 
-    def upgrade(self, *args, answer="", changed=2, rc=0, interrupt=False, apply_rc=0):
+    def upgrade(self, *args, answer="", changed=2, rc=0, interrupt=False, apply_rc=0, verify_rc=0):
         env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_LOG": str(self.log),
                "STUB_CHANGED": str(changed), "STUB_RC": str(rc), "STUB_INT": "1" if interrupt else "",
-               "STUB_APPLY_RC": str(apply_rc)}
+               "STUB_APPLY_RC": str(apply_rc), "STUB_VERIFY_RC": str(verify_rc)}
         run = subprocess.run(["bash", str(self.engine / "infra"), "upgrade", "v1.1.0", *args], input=answer,
                              env=env, capture_output=True, text=True, timeout=60, start_new_session=True)
         engine = subprocess.run(["git", "describe", "--tags"], cwd=self.engine, check=True, capture_output=True,
                                 text=True).stdout.strip()
         return run, engine, self.log.read_text().splitlines()
+
+    @staticmethod
+    def verify_calls(lines):
+        """Номера строк журнала стенда — вызовы Ansible с tests/verify.yml"""
+        return [i for i, x in enumerate(lines) if x.startswith("ansible-playbook ") and " tests/verify.yml" in x]
 
     def assertReturned(self, lines):
         self.assertEqual([x for x in lines if x.startswith("install ")][-1], "install 1.0.0")
@@ -733,7 +739,9 @@ exit "$STUB_RC"
         run, engine, lines = self.upgrade(answer="y\n")
         self.assertEqual((run.returncode, engine), (0, "v1.1.0"), run.stderr)
         self.assertIn("infra-log upgrade: движок v1.0.0 → v1.1.0", lines)
-        self.assertTrue(lines[-1].startswith("systemd-run "), lines)
+        applied = [i for i, x in enumerate(lines) if x.startswith("systemd-run ")]
+        self.assertTrue(applied, lines)
+        self.assertTrue([i for i in self.verify_calls(lines) if i > applied[-1]], lines)   # после прогона — проверка
         self.assertEqual([x for x in lines if x.startswith("install ")], ["install 1.1.0"])
 
     def test_failed_apply_keeps_new(self):
@@ -741,6 +749,50 @@ exit "$STUB_RC"
         run, engine, lines = self.upgrade(answer="y\n", apply_rc=1)
         self.assertEqual((run.returncode, engine), (1, "v1.1.0"), run.stderr)
         self.assertTrue(lines[-1].startswith("systemd-run "), lines)
+
+    def test_answer_yes_verifies_server(self):
+        # после прогона — tests/verify.yml через infra run: с записью в журнал событий
+        run, engine, lines = self.upgrade(answer="y\n")
+        self.assertEqual((run.returncode, engine), (0, "v1.1.0"), run.stderr)
+        self.assertIn("== Проверка сервера: tests/verify.yml (только чтение)", run.stdout)
+        self.assertEqual(lines[-3], "infra-log run: tests/verify.yml", lines)
+        self.assertEqual(self.verify_calls(lines), [len(lines) - 2], lines)
+        self.assertEqual(lines[-1], "infra-log run tests/verify.yml: готово", lines)
+
+    def test_nothing_to_change_verifies_server(self):
+        run, engine, lines = self.upgrade(changed=0)
+        self.assertEqual((run.returncode, engine), (0, "v1.1.0"), run.stderr)
+        self.assertEqual(len(self.verify_calls(lines)), 1, lines)
+
+    def test_partial_upgrade_verifies_whole_server(self):
+        # --tags — частичный прогон, но проверяется весь сервер: параметры apply в verify не идут
+        run, engine, lines = self.upgrade("--tags", "project", answer="y\n")
+        self.assertEqual((run.returncode, engine), (0, "v1.1.0"), run.stderr)
+        self.assertIn("--tags project", [x for x in lines if x.startswith("systemd-run ")][-1])
+        verify = [lines[i] for i in self.verify_calls(lines)]
+        self.assertEqual(len(verify), 1, lines)
+        self.assertNotIn("--tags", verify[0])
+
+    def test_no_verify_without_new_engine_applied(self):
+        # движок вернулся (--check, «нет», предпросмотр не прошёл, Ctrl+C) или прогон упал — проверки нет
+        for name, kwargs in (("--check", {"args": ("--check",)}), ("нет", {"answer": "n\n"}),
+                             ("предпросмотр не прошёл", {"rc": 2}), ("Ctrl+C", {"interrupt": True}),
+                             ("прогон упал", {"answer": "y\n", "apply_rc": 1})):
+            with self.subTest(name):
+                self.setUp()
+                run, engine, lines = self.upgrade(*kwargs.pop("args", ()), **kwargs)
+                self.assertEqual(self.verify_calls(lines), [], lines)
+                self.assertFalse([x for x in lines if "infra-log run" in x], lines)
+
+    def test_failed_verify(self):
+        # проверка не прошла — код 1, но движок новый: сервер уже приведён к нему
+        run, engine, lines = self.upgrade(answer="y\n", verify_rc=2)
+        self.assertEqual((run.returncode, engine), (1, "v1.1.0"), run.stderr)
+        self.assertIn("проверка после upgrade не прошла", run.stderr)
+        self.assertIn("движок остаётся v1.1.0 (был v1.0.0)", run.stderr)
+        self.assertIn("infra-log run tests/verify.yml: ошибка (код 2)", lines)
+        self.assertFalse([x for x in lines if "только просмотр" in x], lines)
+        self.assertEqual([x for x in lines if x.startswith("install ")], ["install 1.1.0"])
 
 
 
