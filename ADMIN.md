@@ -477,6 +477,9 @@ restic restore latest --tag project:shop --target /tmp/restore --include /var/ba
 runuser -u postgres -- pg_restore -d shop --clean --if-exists < /tmp/restore/var/backups/db/shop/shop.pgdump
 ```
 
+Последняя строка — только для дампов, сделанных движком (`project-backup`, `project-db-dump`): в них
+владелец таблиц — роль проекта. Дамп с другого сервера — «Проект с другого сервера (не infra)» ниже.
+
 **Сервер потерян** — новый сервер с настройками и паролями старого, из снимка старого (тег
 `system`, в нём `/etc`), затем проекты. Настройки и пароли — **до первого `apply`**: иначе
 движок создаст новые пароли, и ночной бэкап заведёт репозиторий не с тем паролем restic.
@@ -516,6 +519,38 @@ sudo project-restore shop /etc/restic/old-env && sudo project-compose shop up -d
 На новом сервере у базы проекта другой пароль (`secrets.yml` нового сервера), а при другом
 `net` — и адрес: поправьте `.env` проекта. Не получилось до переключения DNS —
 `sudo project-compose shop up -d` на старом сервере.
+
+**Проект с другого сервера (не infra)** — своя панель (HestiaCP и т. п.) или свои скрипты. Чужой дамп,
+залитый от `postgres` без `--no-owner`, оставляет таблицы за `postgres`: роль проекта получает
+`permission denied for table …`, сайт отвечает 500, хотя база на месте. Поэтому заливка — с
+`--no-owner --role=<проект>`, как в `project-restore`. Postgres старого сервера — не новее этого
+(`postgres_version`, сейчас 17): дамп из более новой версии здесь может не залиться.
+
+```bash
+# 1. Блок проекта — в server.yml, на сервере sudo infra apply: роль и пустая база shop, папка проекта.
+#    Контейнеры проекта до заливки не запускать: миграции создали бы таблицы в пустой базе
+# 2. На старом сервере — дамп в формате custom (имя базы там своё)
+sudo -u postgres pg_dump -Fc <база> > shop.pgdump
+# 3. Дамп и папку загрузок media/ — к себе, дамп — на новый сервер
+rsync -a old:shop.pgdump ~/shop/ && rsync -a old:<папка загрузок>/media ~/shop/
+rsync -a ~/shop/shop.pgdump admin@vds-new:
+# 4. На новом. Расширения в дампе; недоверенные (PostGIS, pgvector) — сначала поставить, как в «Остальное»
+pg_restore -l shop.pgdump | grep EXTENSION
+sudo -u postgres pg_restore --no-owner --no-acl --role=shop -d shop < shop.pgdump
+sudo -u postgres psql -d shop -c '\dt'          # Owner — shop, не postgres
+sudo project-db-env shop                         # доступ к базе — в .env проекта
+# 5. Файлы — участник проекта своим входом (root в web/ не пишет), со своего компьютера
+rsync -rlt ~/shop/media <логин>@vds-new:/srv/projects/shop/web/
+ssh <логин>@vds-new 'find /srv/projects/shop/web/media -type d -exec chmod 2770 {} +'
+# 6. sudo project-compose shop up -d, проверить по IP, переключить DNS; дамп у себя и на сервере — удалить
+```
+
+Залить может и участник проекта — туннелем и логином базы проекта (TEAM.md, «База данных»):
+`pg_restore --no-owner --no-acl -h 127.0.0.1 -p 15432 -U shop -d shop shop.pgdump`, готовый plain-дамп —
+`psql -h 127.0.0.1 -p 15432 -U shop -d shop -f shop.sql`. Недоверенные расширения — всё равно администратор.
+Ошибки `must be owner of extension …` (комментарий к расширению, которое поставил `postgres`) и у plain-дампа
+`role "…" does not exist` (владелец со старого сервера) — не страшны; другие — читать: таблица, которая
+не создалась, тянет за собой свои данные и индексы.
 
 ## Где смотреть, что происходило
 
