@@ -521,13 +521,15 @@ sudo project-restore shop /etc/restic/old-env && sudo project-compose shop up -d
 `sudo project-compose shop up -d` на старом сервере.
 
 **Проект с другого сервера (не infra)** — своя панель (HestiaCP и т. п.) или свои скрипты. Чужой дамп,
-залитый от `postgres` без `--no-owner`, оставляет таблицы за `postgres`: роль проекта получает
-`permission denied for table …`, сайт отвечает 500, хотя база на месте. Поэтому заливка — с
-`--no-owner --role=<проект>`, как в `project-restore`. Postgres старого сервера — не новее этого
+залитый от `postgres` без `--role=<проект>`, оставляет таблицы за `postgres` — и с `--no-owner` тоже:
+роль проекта получает `permission denied for table …`, сайт отвечает 500, хотя база на месте. Поэтому
+заливка — с `--role=<проект>` (таблицы создаёт роль проекта) и `--no-owner` (без ошибок про владельцев
+старого сервера), как в `project-restore`. Postgres старого сервера — не новее этого
 (`postgres_version`, сейчас 17): дамп из более новой версии здесь может не залиться.
 
 ```bash
-# 1. Блок проекта — в server.yml, на сервере sudo infra apply: роль и пустая база shop, папка проекта.
+# 1. Блок проекта с db: postgres — в server.yml, как в «Новый проект» (без db нет ни роли, ни базы);
+#    на сервере sudo infra apply: роль и пустая база shop, пустая папка web/.
 #    Контейнеры проекта до заливки не запускать: миграции создали бы таблицы в пустой базе
 # 2. На старом сервере — дамп в формате custom (имя базы там своё)
 sudo -u postgres pg_dump -Fc <база> > shop.pgdump
@@ -538,11 +540,14 @@ rsync -a ~/shop/shop.pgdump admin@vds-new:
 pg_restore -l shop.pgdump | grep EXTENSION
 sudo -u postgres pg_restore --no-owner --no-acl --role=shop -d shop < shop.pgdump
 sudo -u postgres psql -d shop -c '\dt'          # Owner — shop, не postgres
-sudo project-db-env shop                         # доступ к базе — в .env проекта
-# 5. Файлы — участник проекта своим входом (root в web/ не пишет), со своего компьютера
+# 5. Участник проекта своим входом (root в web/ не пишет), со своего компьютера, контейнеры не запуская:
+#    код, compose.yml (шаблон в TEAM.md) и .env — в web/, как в «Новый проект»; затем загрузки
 rsync -rlt ~/shop/media <логин>@vds-new:/srv/projects/shop/web/
-ssh <логин>@vds-new 'find /srv/projects/shop/web/media -type d -exec chmod 2770 {} +'
-# 6. sudo project-compose shop up -d, проверить по IP, переключить DNS; дамп у себя и на сервере — удалить
+ssh <логин>@vds-new 'find /srv/projects/shop/web/media -type d -exec chmod 02770 {} +'
+# 6. На новом: доступ к базе — в .env проекта (без .env из шага 5 команда откажет), затем запуск
+sudo project-db-env shop
+sudo project-compose shop up -d
+# 7. Проверить по IP, переключить DNS; дамп у себя и на сервере — удалить
 ```
 
 Залить может и участник проекта — туннелем и логином базы проекта (TEAM.md, «База данных»):
