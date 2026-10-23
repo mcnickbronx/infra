@@ -254,7 +254,7 @@ people:
 | Пороги уведомлений | `disk_alert_percent` (80), `memory_alert_percent` (10), `notify_summary_time` ("09:00") |
 | Ссылка доступа | `access_link: false` — выключить, `access_link_hours` (24, до 72), `access_link_host` — свой домен вместо sslip.io |
 | Часовой пояс | `timezone` (Europe/Moscow) |
-| Лимиты запросов к сайтам | `traefik_ratelimit_average` (200 в секунду), `traefik_inflight_max` (150) |
+| Лимиты запросов к сайтам | `traefik_ratelimit_average` (200 в секунду), `traefik_inflight_max` (500) |
 | Ubuntu 24.04 | `ubuntu_version: "24.04"` |
 
 Любое умолчание движка (`/opt/infra/group_vars/all/main.yml`) можно поменять так же — строкой

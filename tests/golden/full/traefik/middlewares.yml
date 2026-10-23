@@ -49,7 +49,7 @@ http:
             ipv6Subnet: 64
     site-inflight:
       inFlightReq:
-        amount: 150
+        amount: 500
         sourceCriterion:
           ipStrategy:
             ipv6Subnet: 64
