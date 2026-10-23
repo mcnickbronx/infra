@@ -1,0 +1,4 @@
+expect_error: "watch_sites в server.yml — список до 10 адресов"
+watch_sites: [
+  "https://a1.test/", "https://a2.test/", "https://a3.test/", "https://a4.test/", "https://a5.test/", "https://a6.test/",
+  "https://a7.test/", "https://a8.test/", "https://a9.test/", "https://a10.test/", "https://a11.test/"]

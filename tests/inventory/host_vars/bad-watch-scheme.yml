@@ -1,0 +1,3 @@
+# не строка, без схемы, другая схема, перевод строки в конце (его пропустил бы образец с $)
+expect_error: "не так: 8080, a.test/, ftp://a.test/, https://a.test/"
+watch_sites: [8080, a.test/, "ftp://a.test/", "https://a.test/\n"]

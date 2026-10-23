@@ -52,6 +52,9 @@ notify_summary_time: "09:00"    # утренняя сводка в Telegram: в�
 # Пусто — без пинга
 backup_healthcheck_url: ""      # ночной бэкап
 monitor_healthcheck_url: ""     # health-check каждые 10 минут: есть проблемы — /fail со списком
+# Страницы другого сервера: не открылись два раза подряд — «Сайты другого сервера не отвечают» отсюда
+# (тот лёг целиком — его сводка не придёт). Пусто — не проверяются (server.yml.example, «Уведомления»)
+watch_sites: []
 
 # --- Postgres ---
 postgres_memory_share: 0.4      # доля RAM сервера под кеши Postgres

@@ -1,0 +1,3 @@
+# строка из server.yml попадает в скрипт root: $(…), пробел, кавычка — стоп
+expect_error: "не так: https://a.test/$(id), https://a.test/x y, https://a.test/'x'"
+watch_sites: ["https://a.test/", "https://a.test/$(id)", "https://a.test/x y", "https://a.test/'x'"]

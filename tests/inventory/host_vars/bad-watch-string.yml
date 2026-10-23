@@ -1,0 +1,2 @@
+expect_error: "watch_sites в server.yml — список до 10 адресов страниц другого сервера"
+watch_sites: "https://a.test/"

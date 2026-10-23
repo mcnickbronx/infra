@@ -33,6 +33,8 @@ RESOLVE_MIN=${HEALTH_RESOLVE_MINUTES:-30}      # «прошло» — когда
 # Traefik и проект (TLS, роутер, бэкенд). Файрвол (запрос идёт через lo) и CrowdSec (IP сервера не банится)
 # он не проходит: бан посетителей так не виден. Нет IPv4 — 127.0.0.1
 SERVER_IP=192.0.2.1
+# Страницы другого сервера (watch_sites в server.yml; формат проверил preflight): check_watch_sites
+WATCH_SITES=(https://shop.other.test/ https://back.shop.other.test/api/health)
 
 PROBLEMS=""
 # problem "что" ["подробности"]: «что» без цифр — ключ проблемы для --notify
@@ -375,6 +377,44 @@ check_sites() {
   fi
 }
 
+# Страницы другого сервера (WATCH_SITES): лёг целиком — его сводка не придёт, а сообщение придёт отсюда.
+# Запрос — как у посетителя, через обычный DNS, все адреса разом (их до 10); сбой — 5xx и нет ответа,
+# 2xx–4xx — сервер отвечает (это проверка сервера, не приложения). Сбой — повтор упавших через 30 с:
+# мигание сети — не тревога; худший случай — 15 + 30 + 15 = 60 с. DNS этого сервера не отвечает
+# (check_dns, выше) — не проверяются: тревога была бы о чужом сервере, а лежит свой
+watch_codes() {
+  local url code
+  for url in "$@"; do
+    {
+      code=$(curl -sk -o /dev/null -w '%{http_code}' --noproxy '*' --connect-timeout 5 -m 15 \
+        -A infra-health-check "$url" 2>/dev/null)
+      [[ $code =~ ^[0-9]{3}$ ]] || code=000
+      echo "$url $code"
+    } &
+  done
+  wait
+}
+
+check_watch_sites() {
+  [ ${#WATCH_SITES[@]} -gt 0 ] || return 0
+  [[ $PROBLEMS != *"DNS сервера не отвечает"* ]] || return 0
+  local url code failing=() down="" codes=""
+  while read -r url code; do
+    [[ $code == 5?? || $code == 000 ]] && failing+=("$url")
+  done < <(watch_codes "${WATCH_SITES[@]}")
+  [ ${#failing[@]} -gt 0 ] || return 0
+  sleep 30
+  while read -r url code; do
+    [[ $code == 5?? || $code == 000 ]] || continue
+    down+="$url "
+    [ "$code" != 000 ] || code="нет ответа за 15 с"
+    codes+="$url — $code, "
+  done < <(watch_codes "${failing[@]}" | sort)
+  [ -n "$down" ] || return 0
+  problem "Сайты другого сервера не отвечают (проверка с $SERVER): ${down% }" \
+    "${codes%, }. Сервер лёг целиком или сеть до него: открыть адрес с компьютера, зайти на сервер по SSH, панель хостера; его сводка не придёт"
+}
+
 # ---------- Автовыкладка и обновления ----------
 
 # Не удалась: project-deploy оставляет <проект>.failed — когда, на каком шаге и что работает теперь.
@@ -531,6 +571,7 @@ for DOCKER_HOST in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootl
 done
 unset DOCKER_HOST
 check_sites
+check_watch_sites
 check_autodeploy
 check_backup
 check_backup_hourly

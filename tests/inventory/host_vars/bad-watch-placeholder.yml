@@ -1,0 +1,2 @@
+expect_error: "Заполните (сейчас там заготовка): watch_sites"
+watch_sites: ["https://example.org/", "https://back.example.org/api/health"]

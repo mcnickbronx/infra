@@ -85,6 +85,9 @@ projects:
 # Вдобавок — пинг своего healthchecks (облачный не принимает российские IP):
 # backup_healthcheck_url: "https://hc.example.org/ping/..."
 # monitor_healthcheck_url: "https://hc.example.org/ping/..."
+# Страницы сайтов другого сервера: не открылись два раза подряд — сообщение отсюда (тот лёг целиком, его
+# сводка не придёт). Пара серверов следит друг за другом — задайте на обоих. До 10 адресов; 2xx–4xx — отвечает
+# watch_sites: ["https://example.org/", "https://back.example.org/api/health"]
 
 # --- Ссылка доступа (ADMIN.md, «Ссылка доступа»)
 # SSH с меняющегося IP на сутки; включена по умолчанию:

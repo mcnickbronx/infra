@@ -252,6 +252,7 @@ people:
 | Копия в S3 | `restic_s3_repository_base`, ключи `s3_access_key`, `s3_secret_key` (шаг 6) |
 | Telegram | `telegram_bot_token`, `telegram_chat_id`, `telegram_proxy` в `secrets.yml` (шаг 7) |
 | Пороги уведомлений | `disk_alert_percent` (80), `memory_alert_percent` (10), `notify_summary_time` ("09:00") |
+| Другой сервер лёг | `watch_sites: [<адрес страницы>, …]` — страницы другого сервера, до 10; не открылись — сообщение отсюда (ADMIN.md, «Уведомления в Telegram») |
 | Ссылка доступа | `access_link: false` — выключить, `access_link_hours` (24, до 72), `access_link_host` — свой домен вместо sslip.io |
 | Часовой пояс | `timezone` (Europe/Moscow) |
 | DNS сервера | `dns_servers: [<адрес>, <адрес>]` — когда хостер не пропускает публичные DNS (по умолчанию — DNS хостера; ADMIN.md, «Остальное») |

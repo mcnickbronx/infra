@@ -499,6 +499,85 @@ exit 2
         self.assertEqual(out, "")
         self.assertEqual([c for c in calls if c.startswith("getent ")], [f"getent ahosts {self.DNS_NAMES[0]}"])
 
+    # Страницы другого сервера (watch_sites, check_watch_sites): в эталоне — из tests/inventory/host_vars/full.yml
+    WATCHED = ["https://shop.other.test/", "https://back.shop.other.test/api/health"]
+
+    def watch(self, *calls, **stubs):
+        return self.run_checks("", *calls, **stubs)
+
+    def test_watch_answering_is_fine(self):
+        # 404 и 301 — сервер отвечает: это проверка сервера, а не приложения
+        out = self.watch("check_watch_sites", 'render "$PROBLEMS"',
+                         STUB_SITES="shop.other.test=404 back.shop.other.test=301")
+        self.assertEqual(out, "")
+        self.assertFalse((self.dir / "sleep.log").exists())
+        self.assertEqual(sorted(c.split()[-1] for c in self.curls()), sorted(self.WATCHED))   # по разу, ровно эти адреса
+        for call in self.curls():
+            self.assertNotIn("--resolve", call)            # обычный DNS, как у посетителя: не на свой IP
+            self.assertIn("--noproxy * ", call)
+            self.assertIn(" -m 15 ", call)
+            self.assertNotIn("-L", call.split())
+
+    def test_watch_down_twice_is_one_problem(self):
+        out = self.watch("check_watch_sites", 'render "$PROBLEMS"',
+                         STUB_SITES="shop.other.test=503 back.shop.other.test=000")
+        self.assertEqual(out.count("• "), 1)
+        self.assertIn("• Сайты другого сервера не отвечают (проверка с full): "
+                      "https://back.shop.other.test/api/health https://shop.other.test/\n", out)
+        self.assertIn("https://back.shop.other.test/api/health — нет ответа за 15 с", out)
+        self.assertIn("https://shop.other.test/ — 503", out)
+        self.assertIn("его сводка не придёт", out)
+        self.assertEqual((self.dir / "sleep.log").read_text(), "30\n")   # одна пауза на все повторы
+        self.assertEqual(len(self.curls()), 4)
+
+    def test_watch_retry_brings_up(self):
+        # упал один раз, через 30 с ответил — мигание сети, не тревога; повторяется только упавший
+        out = self.watch("check_watch_sites", 'render "$PROBLEMS"', STUB_SITES="back.shop.other.test=502,200")
+        self.assertEqual(out, "")
+        self.assertEqual((self.dir / "sleep.log").read_text(), "30\n")
+        self.assertEqual(sorted(c.split()[-1] for c in self.curls()), sorted(self.WATCHED + [self.WATCHED[1]]))
+
+    def test_watch_notified_once_then_resolved_once(self):
+        self.watch("check_watch_sites", "notify_changes", STUB_SITES="shop.other.test=000")
+        self.watch("check_watch_sites", "notify_changes", STUB_SITES="shop.other.test=000")   # через 10 минут — молчит
+        self.assertEqual(len(self.messages()), 1)
+        self.assertIn("— новое:", self.messages()[0])
+        self.assertIn("Сайты другого сервера не отвечают (проверка с full): https://shop.other.test/", self.messages()[0])
+        self.watch("check_watch_sites", "notify_changes")                  # ответил — «прошло» не сразу
+        self.assertEqual(len(self.messages()), 1)
+        self.watch("check_watch_sites", "notify_changes", resolve=0)
+        self.assertEqual(len(self.messages()), 2)
+        self.assertIn("— прошло:", self.messages()[1])
+        self.assertIn("Сайты другого сервера не отвечают", self.messages()[1])
+
+    def test_watch_empty_list_no_requests(self):
+        self.assertEqual(self.watch("WATCH_SITES=()", "check_watch_sites", 'render "$PROBLEMS"',
+                                    STUB_SITES="shop.other.test=000"), "")
+        self.assertEqual(self.curls(), [])
+        self.assertFalse((self.dir / "sleep.log").exists())
+
+    def test_watch_skipped_when_own_dns_down(self):
+        # свой DNS не отвечает (настоящий check_dns) — тревога о чужом сервере была бы ложной
+        for name, text in (("timeout", self.TIMEOUT), ("getent", self.GETENT)):
+            (self.dir / name).write_text(text)
+            (self.dir / name).chmod(0o755)
+        out = self.watch("check_dns", "check_watch_sites", 'render "$PROBLEMS"', STUB_DNS_OK="",
+                         STUB_DNS_LOG=str(self.dir / "dns.log"), STUB_SITES="shop.other.test=000")
+        self.assertEqual(out.count("• "), 1)
+        self.assertIn("• DNS сервера не отвечает", out)
+        self.assertEqual(self.curls(), [])
+
+    def test_watch_time_is_bounded(self):
+        # 10 адресов «висят» (заглушка curl ждёт 1 с): все разом, а не по одному — 20 с и больше
+        urls = [f"https://w{i}.other.test/" for i in range(10)]
+        start = time.monotonic()
+        out = self.watch(f"WATCH_SITES=({' '.join(urls)})", "check_watch_sites", 'render "$PROBLEMS"', STUB_HANG="1",
+                         STUB_SITES=" ".join(f"w{i}.other.test=000" for i in range(10)))
+        self.assertLess(time.monotonic() - start, 8)
+        self.assertIn("Сайты другого сервера не отвечают (проверка с full): " + " ".join(sorted(urls)) + "\n", out)
+        self.assertEqual(len(self.curls()), 20)
+        self.assertIn("\ncheck_sites\ncheck_watch_sites\n", self.SCRIPT.read_text())   # в списке проверок, после check_dns
+
 
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class SignedUpgrade(unittest.TestCase):

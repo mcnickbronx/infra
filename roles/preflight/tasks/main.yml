@@ -352,6 +352,24 @@
       в элементе{{ (', не адрес: ' ~ bad_dns.stdout_lines | join(', ')) if bad_dns.stdout else '' }}
     quiet: true
 
+# Адреса попадают в health-check.sh, который работает от root: только схема, имя или IPv4, порт и путь —
+# без пробелов, кавычек, $, `, ; и перевода строки (поэтому \Z, а не $). До 10 — все проверяются разом,
+# худший случай — минута
+- name: watch_sites — список адресов страниц
+  vars:
+    url_re: '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/?&=%+-]*)?\Z'
+    urls: "{{ watch_sites if watch_sites is sequence and watch_sites is not string and watch_sites is not mapping else [] }}"
+    bad: "{{ (urls | reject('string') | list) + (urls | select('string') | reject('match', url_re) | list) }}"
+  ansible.builtin.assert:
+    that:
+      - watch_sites is sequence and watch_sites is not string and watch_sites is not mapping
+      - watch_sites | length <= 10
+      - bad | length == 0
+    fail_msg: >-
+      watch_sites в server.yml — список до 10 адресов страниц другого сервера вида https://example.com/
+      или https://back.example.com/api/health{{ (', не так: ' ~ bad | map('string') | join(', ')) if bad else '' }}
+    quiet: true
+
 # В Postgres локальный вход (peer) пускает пользователя Linux в роль с тем же именем:
 # человек по имени shop вошёл бы в базу проекта shop без пароля.
 - name: Имена людей и администратора не совпадают с именами проектов
@@ -445,6 +463,7 @@
       acme_email: "{{ acme_email }}"
       backup_healthcheck_url: "{{ backup_healthcheck_url }}"
       monitor_healthcheck_url: "{{ monitor_healthcheck_url }}"
+      watch_sites: "{{ watch_sites | join(' ') }}"     # example.com настоящий и отвечает: следили бы за ним
       s3_access_key: "{{ restic_aws_access_key_id }} {{ restic_aws_secret_access_key }}"
     placeholders: >-
       {{ filled | dict2items | selectattr('value', 'search', 'замените|(@|//)example\.(com|org|net)\b')
