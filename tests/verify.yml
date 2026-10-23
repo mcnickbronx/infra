@@ -21,6 +21,8 @@
       - docker-cleanup.timer
       - crowdsec-hubupdate.timer        # правила CrowdSec — таймер самого пакета
       - postgresql.service
+      - sysstat.service                 # история нагрузки (sar), роль base
+      - sysstat-collect.timer
     autodeploy_timers: "{{ autodeploy_projects | map('regex_replace', '^', 'project-deploy@') | map('regex_replace', '$', '.timer') | list }}"
     access_units: "{{ ['infra-access-web.service', 'infra-access.path', 'infra-access-expire.timer'] if access_link else [] }}"
     # Путь, права и владелец — как их ставит роль project
@@ -102,6 +104,21 @@
         fail_msg: "следующий запуск в :{{ hourly_next.stdout }}, а шаг — {{ backup_hourly_step }} минут от :05"
         quiet: true
       when: hourly_backup_projects | length > 0
+
+    # Таймер активен, а снимков нет — sar утром покажет пустоту. Снимок раз в 10 минут,
+    # служба при старте пишет свой — свежий файл есть и сразу после apply
+    - name: Свежие снимки sysstat
+      ansible.builtin.find:
+        paths: /var/log/sysstat
+        patterns: "sa[0-9][0-9]"
+        age: -20m
+      register: sysstat_fresh
+
+    - name: sysstat пишет историю — снимок за последние 20 минут
+      ansible.builtin.assert:
+        that: sysstat_fresh.matched > 0
+        fail_msg: "В /var/log/sysstat нет файла saДД моложе 20 минут: ENABLED в /etc/default/sysstat, systemctl status sysstat-collect"
+        quiet: true
 
     - name: Сценарии CrowdSec
       ansible.builtin.command: cscli scenarios list -o raw

@@ -94,12 +94,42 @@
 # ---------- Система ----------
 # python-is-python3: команда python запускает системный python3 (в Ubuntu её нет).
 # Python проектов — в их образах, этот только для скриптов на хосте.
+# sysstat — история нагрузки, памяти и дисков (sar), ADMIN.md, «Где смотреть».
 - name: Базовые пакеты
   ansible.builtin.apt:
     name: [ca-certificates, curl, ufw, unattended-upgrades, acl, jq, python3-debian, git, python-is-python3,
-           mc, bash-completion]
+           mc, bash-completion, sysstat]
     update_cache: true
     cache_valid_time: 3600
+
+# sysstat пишет снимок раз в 10 минут (sysstat-collect.timer) в /var/log/sysstat/saДД.
+# ENABLED="true" нужен в обоих выпусках: в 26.04 без него службы пакета не запускаются
+# (ExecCondition), в 24.04 пакет ставится с ENABLED="false" и при установке и обновлении
+# выключает свои таймеры. Хранит пакет 7 дней — 28 явно (больше 28 — другие имена файлов).
+# В --check на сервере без пакета его файлов и юнитов ещё нет (установка только показана) —
+# тогда настройка пропускается
+- name: sysstat уже установлен
+  ansible.builtin.stat:
+    path: /usr/lib/systemd/system/sysstat.service
+  register: sysstat_unit
+
+- name: sysstat — сбор включён, история 28 дней
+  ansible.builtin.lineinfile:
+    path: "{{ item.path }}"
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+  loop:
+    - { path: /etc/default/sysstat, regexp: '^ENABLED=', line: 'ENABLED="true"' }
+    - { path: /etc/sysstat/sysstat, regexp: '^HISTORY=', line: 'HISTORY=28' }
+  when: not ansible_check_mode or sysstat_unit.stat.exists
+
+- name: sysstat — служба и таймеры сбора и суточной сводки работают
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: [sysstat.service, sysstat-collect.timer, sysstat-summary.timer]
+  when: not ansible_check_mode or sysstat_unit.stat.exists
 
 # Ввод команд для всех: стрелки ищут в истории по набранному началу (docker ↑ — прошлые
 # команды docker), Tab — без учёта регистра и сразу со списком вариантов.

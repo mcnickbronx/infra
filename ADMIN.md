@@ -598,6 +598,7 @@ sudo grep 'shop' /var/log/infra.log     # всё про проект shop
 | ночной бэкап | `sudo journalctl -u backup` |
 | автовыкладка проекта | `sudo journalctl -u project-deploy@<проект>` |
 | проверки сервера (health-check) | `sudo health-check.sh` — что не так сейчас; `sudo journalctl -u health-check` — каждые 10 минут, о новом и прошедшем — в Telegram |
+| нагрузка, память, диски за прошлые дни (sysstat: снимок раз в 10 минут, хранится 28 дней) | `sar -q -s 02:30:00 -e 03:30:00` — нагрузка сегодня с 02:30 до 03:30, `sar -r` — память, `sar -d -p` — чтение и запись дисков (не место на них); вчера — `sar -q -1`, другой день — `sar -q -f /var/log/sysstat/sa<ДД>`; старше 10 дней файл сжат: `xz -dc /var/log/sysstat/sa<ДД>.xz > /tmp/sa<ДД>`, затем `-f /tmp/sa<ДД>` |
 | пакеты: `update` и обновления безопасности | `/var/log/apt/history.log`, `/var/log/unattended-upgrades/` |
 | входы по SSH | `sudo journalctl -u ssh` |
 | баны CrowdSec | `sudo cscli alerts list`, `sudo cscli decisions list` |
