@@ -461,6 +461,43 @@ printf '%s' "$code"
         self.assertEqual(sorted({c.split()[-1] for c in self.curls()}), [f"https://{n}/" for n in names[:30]])
         self.assertIn("\ndone\nunset DOCKER_HOST\ncheck_sites\n", self.SCRIPT.read_text())   # после цикла по Docker
 
+    # DNS сервера (check_dns): getent разрешает только имена из STUB_DNS_OK (остальные — код 2, как настоящий),
+    # timeout — без ожидания; оба пишут вызовы в журнал
+    DNS_NAMES = ["acme-v02.api.letsencrypt.org", "registry-1.docker.io", "api.telegram.org"]
+    TIMEOUT = '#!/bin/bash\nprintf "timeout %s\\n" "$*" >> "$STUB_DNS_LOG"\nshift\nexec "$@"\n'
+    GETENT = """#!/bin/bash
+printf 'getent %s\\n' "$*" >> "$STUB_DNS_LOG"
+case " $STUB_DNS_OK " in *" $2 "*) exit 0 ;; esac
+exit 2
+"""
+
+    def check_dns(self, ok):
+        for name, text in (("timeout", self.TIMEOUT), ("getent", self.GETENT)):
+            (self.dir / name).write_text(text)
+            (self.dir / name).chmod(0o755)
+        log = self.dir / "dns.log"
+        out = self.run_checks("", "check_dns", 'render "$PROBLEMS"', STUB_DNS_OK=ok, STUB_DNS_LOG=str(log))
+        return out, log.read_text().splitlines()
+
+    def test_dns_down_is_one_problem(self):
+        out, calls = self.check_dns("")
+        self.assertEqual(out.count("• "), 1)
+        self.assertIn("• DNS сервера не отвечает: не разрешается ни одно из имён", out)
+        self.assertIn("dns_servers в server.yml", out)
+        self.assertEqual([c for c in calls if c.startswith("getent ")], [f"getent ahosts {n}" for n in self.DNS_NAMES])
+        self.assertEqual([c for c in calls if c.startswith("timeout ")], [f"timeout 5 getent ahosts {n}" for n in self.DNS_NAMES])
+        self.assertIn("\ncheck_failed_units\ncheck_dns\n", self.SCRIPT.read_text())     # в списке проверок
+
+    def test_dns_one_name_is_enough(self):
+        out, calls = self.check_dns(self.DNS_NAMES[-1])
+        self.assertEqual(out, "")
+        self.assertEqual(len([c for c in calls if c.startswith("getent ")]), 3)
+
+    def test_dns_stops_at_first_resolved(self):
+        out, calls = self.check_dns(self.DNS_NAMES[0])
+        self.assertEqual(out, "")
+        self.assertEqual([c for c in calls if c.startswith("getent ")], [f"getent ahosts {self.DNS_NAMES[0]}"])
+
 
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class SignedUpgrade(unittest.TestCase):

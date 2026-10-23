@@ -321,6 +321,37 @@
       203.0.113.0/24 или 2001:db8::1 — по одному адресу на элемент списка
     quiet: true
 
+# DNS сервера — только адреса, без подсетей и портов: адрес с ошибкой systemd-resolved пропускает
+# (строкой в своём журнале), и сервер остался бы на DNS хостера. Строка вместо списка — тоже стоп
+- name: Адреса в dns_servers
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -I
+      - -c
+      - |
+        import ipaddress, json, sys
+        for a in json.loads(sys.argv[1]):
+            try:
+                ipaddress.ip_address(a if isinstance(a, str) else "-")   # число из YAML (8) ip_address принял бы
+            except ValueError:
+                print(f"'{a}'")
+      - "{{ (dns_servers if dns_servers is sequence and dns_servers is not string and dns_servers is not mapping
+             else []) | to_json }}"
+  register: bad_dns
+  changed_when: false
+  check_mode: false     # только читает; иначе в --check stdout пустой и проверка ниже не работает
+
+- name: dns_servers — список IP-адресов
+  ansible.builtin.assert:
+    that:
+      - dns_servers is sequence and dns_servers is not string and dns_servers is not mapping
+      - bad_dns.stdout == ''
+    fail_msg: >-
+      dns_servers в server.yml — список IP-адресов DNS вида 192.0.2.53 или 2001:db8::53, по адресу
+      в элементе{{ (', не адрес: ' ~ bad_dns.stdout_lines | join(', ')) if bad_dns.stdout else '' }}
+    quiet: true
+
 # В Postgres локальный вход (peer) пускает пользователя Linux в роль с тем же именем:
 # человек по имени shop вошёл бы в базу проекта shop без пароля.
 - name: Имена людей и администратора не совпадают с именами проектов

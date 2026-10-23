@@ -43,6 +43,54 @@
       {%- endif %}
     quiet: true
 
+# ---------- DNS ----------
+# Свои DNS сервера (dns_servers) — до пакетов: apt ниже уже идёт через них. Файл — настройка
+# systemd-resolved; убрали ключ — файл удаляется, сервер снова на DNS хостера. Имя 60-… — в начале
+# диапазона /etc (60–90, resolved.conf(5)): адреса DNS= из всех файлов папки складываются, наши — первыми
+- name: Службы сервера (dns_servers — работает ли systemd-resolved)
+  ansible.builtin.service_facts:
+  when: dns_servers | length > 0
+
+- name: dns_servers подействует — systemd-resolved работает
+  vars:
+    resolved: "{{ ansible_facts.services['systemd-resolved.service'] | default({}) }}"
+  ansible.builtin.assert:
+    that: resolved.state | default('') == 'running'
+    fail_msg: >-
+      dns_servers задан, а systemd-resolved не работает ({{ resolved.state | default('не установлен') }}) —
+      файл не подействует. DNS этого сервера — в /etc/resolv.conf: правьте его руками и уберите dns_servers из server.yml
+    quiet: true
+  when: dns_servers | length > 0
+
+- name: Папка настроек systemd-resolved
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d
+    state: directory
+    mode: "0755"
+  when: dns_servers | length > 0
+
+- name: Свои DNS сервера (dns_servers)
+  ansible.builtin.template:
+    src: resolved-dns.conf.j2
+    dest: /etc/systemd/resolved.conf.d/60-infra-dns.conf
+    mode: "0644"
+  register: dns_conf
+  when: dns_servers | length > 0
+
+- name: Своих DNS серверов нет — файла нет
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d/60-infra-dns.conf
+    state: absent
+  register: dns_conf_gone
+  when: dns_servers | length == 0
+
+# Сразу, а не обработчиком: тот сработал бы в конце прогона, после apt. Без DNS — доли секунды
+- name: systemd-resolved перечитал DNS сервера
+  ansible.builtin.systemd:
+    name: systemd-resolved
+    state: restarted
+  when: dns_conf is changed or dns_conf_gone is changed
+
 # ---------- Система ----------
 # python-is-python3: команда python запускает системный python3 (в Ubuntu её нет).
 # Python проектов — в их образах, этот только для скриптов на хосте.

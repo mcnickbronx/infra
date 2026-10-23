@@ -4,6 +4,7 @@ backup_healthcheck_url: "https://hc.fixture.test/backup"
 monitor_healthcheck_url: "https://hc.fixture.test/monitor"
 access_link_host: access.fixture.test
 access_link_hours: 12
+dns_servers: [192.0.2.53, "2001:db8::53"]
 
 docker_users: [dina]
 projects:

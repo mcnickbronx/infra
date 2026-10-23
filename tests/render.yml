@@ -10,6 +10,7 @@
     templates:
       - base/10-hardening.conf
       - base/whitelist.json
+      - base/resolved-dns.conf
       - docker/daemon.json
       - docker/base.yml
       - postgres/90-ansible.conf

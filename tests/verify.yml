@@ -388,6 +388,27 @@
       loop: "{{ projects.keys() | list }}"
       changed_when: false
 
+    # Имена, которыми движок пользуется на каждом сервере: Let's Encrypt, Docker Hub, Telegram (как у health-check)
+    - name: Имена разрешаются (DNS сервера работает)
+      ansible.builtin.command: getent ahosts {{ item }}
+      loop: [acme-v02.api.letsencrypt.org, registry-1.docker.io, api.telegram.org]
+      changed_when: false
+
+    - name: DNS сервера у systemd-resolved
+      ansible.builtin.command: resolvectl dns
+      register: resolved_dns
+      changed_when: false
+      when: dns_servers | default([]) | length > 0
+
+    - name: systemd-resolved знает dns_servers из server.yml (строка Global)
+      vars:
+        in_global: "{{ (resolved_dns.stdout_lines | select('match', '^Global:') | first | default('Global:')).split()[1:] }}"
+      ansible.builtin.assert:
+        that: dns_servers | difference(in_global) | length == 0
+        fail_msg: "resolvectl dns: в Global {{ in_global }}, нет {{ dns_servers | difference(in_global) }}"
+        quiet: true
+      when: dns_servers | default([]) | length > 0
+
     - name: health-check выполняется без ошибок
       ansible.builtin.command: /usr/local/bin/health-check.sh
       environment:

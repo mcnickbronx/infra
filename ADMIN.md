@@ -49,7 +49,7 @@
 Поменять что-то можно тремя способами, от простого к сложному.
 
 **1. Значение в `server.yml`** — любое умолчание движка (`/opt/infra/group_vars/all/main.yml`):
-лимиты проектов, лимиты запросов Traefik, версии, уведомления, S3, часовой пояс. Ключ с опечаткой
+лимиты проектов, лимиты запросов Traefik, версии, уведомления, S3, часовой пояс, DNS сервера. Ключ с опечаткой
 остановит проверка в начале `apply`.
 
 **2. Свой файл рядом с файлом движка** — движок его подключает, но не пишет:
@@ -300,6 +300,7 @@ Telegram недоступен — следующая попытка через �
 | Проекту нужно PostGIS или pgvector | `sudo apt-get install -y postgresql-17-postgis-3` (pgvector — `postgresql-17-pgvector`, расширение `vector`), затем `sudo -u postgres psql -d <проект> -c 'CREATE EXTENSION postgis'` — и в `<проект>_dev`, если он есть. Пакет запишите комментарием в `server.yml`: на новом сервере и при смене версии Postgres его ставят заново, иначе восстановление базы проекта остановится на расширении. Доверенные расширения (`pg_trgm`, `unaccent`…) проект ставит сам миграцией (TEAM.md, «Расширения Postgres») |
 | Сайт переводят на CDN | сначала доработать лимиты Traefik (комментарий в `roles/traefik/templates/middlewares.yml.j2`) и проверить на тестовой VDS: иначе все посетители сайта придут с адресов CDN и упрутся в лимит одного IP |
 | Сменился ваш IP | `admin_ips` в `server.yml` → `sudo infra apply` (со старого IP, пока пускает; иначе — консоль хостера, ниже). Полный: IP администратора — ещё в белом списке CrowdSec и в `admin-only` Traefik |
+| Хостер не пропускает публичные DNS (apt, pip, выкладка — `Temporary failure in name resolution`; health-check — «DNS сервера не отвечает») | `dns_servers` в `server.yml` — адреса DNS, которые хостер пропускает (`server.yml.example`) → `sudo infra apply --tags base`: движок кладёт `/etc/systemd/resolved.conf.d/60-infra-dns.conf` до установки пакетов и перезапускает `systemd-resolved`; проверить — `resolvectl dns` (в строке `Global` — ваши адреса). Контейнеры видят новые DNS после пересоздания: `sudo project-compose <проект> up -d --force-recreate`. Новый сервер: `install.sh` (pip) идёт раньше `apply` — сначала свой файл в `/etc/systemd/resolved.conf.d/` (`[Resolve]` и строка `DNS=<адреса через пробел>`) и `sudo systemctl restart systemd-resolved`, после `apply` с ключом — убрать его. Убрали ключ → `apply` — файла нет, DNS снова от хостера. Откат движка на версию без `dns_servers` (v1.10.0 и старше) — сначала убрать ключ из `server.yml`, иначе проверка в начале `apply` остановит на «неизвестные ключи» |
 
 ### Ссылка доступа: SSH с меняющегося IP
 

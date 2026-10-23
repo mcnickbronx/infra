@@ -1,0 +1,2 @@
+expect_error: "dns_servers в server.yml — список IP-адресов DNS"
+dns_servers: "192.0.2.53"

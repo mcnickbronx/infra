@@ -107,6 +107,20 @@ check_failed_units() {
   fi
 }
 
+# Имена, которыми движок пользуется на каждом сервере: Let's Encrypt (сертификаты), Docker Hub (образы),
+# Telegram (уведомления). Разрешилось хоть одно — DNS работает; ни одно — тревога (до 15 с, только когда
+# DNS лежит). Уведомление о ней может не уйти — Telegram тоже по имени: его видно в sudo infra status,
+# а в Telegram оно придёт, когда DNS вернётся (повтор раз в час)
+DNS_NAMES="acme-v02.api.letsencrypt.org registry-1.docker.io api.telegram.org"
+check_dns() {
+  local name
+  for name in $DNS_NAMES; do
+    timeout 5 getent ahosts "$name" >/dev/null && return 0
+  done
+  problem "DNS сервера не отвечает: не разрешается ни одно из имён Let's Encrypt, Docker Hub, Telegram — встанут apt, выкладка, сертификаты и уведомления" \
+    "Не разрешаются: $DNS_NAMES. Проверить: resolvectl status; хостер не пропускает публичные DNS — dns_servers в server.yml (ADMIN.md, «Остальное»)"
+}
+
 # SSH открыт мимо белого списка: разрешение в ufw на порт 22 (или на все порты) без пометки белого
 # списка (ansible-wl) или ссылки доступа (infra-access) — например, ufw allow OpenSSH из образа
 # хостера. Движок такие правила не трогает (удаляет только свои), а белый список с ними ничего не закрывает
@@ -498,6 +512,7 @@ check_cpu
 check_free_memory
 check_memory
 check_failed_units
+check_dns
 check_ssh_open
 check_rootless
 # Контейнеры — в общем Docker и в Docker каждого проекта без root (rootless: true)

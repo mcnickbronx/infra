@@ -29,6 +29,9 @@ traefik_image: traefik:v3.7
 # Обязательные (здесь их нет): server_name, admin_keys, admin_ips, acme_email — server.yml.example
 admin_user: admin   # логин администратора на сервере: вход только по ключу, sudo без пароля
 timezone: Europe/Moscow   # сервер и контейнеры (через base.yml)
+# Свои DNS сервера — когда хостер не пропускает публичные (apt, pip, выкладка встают). Пусто — как дал
+# хостер, своего файла нет; адреса — списком (server.yml.example, «DNS сервера»)
+dns_servers: []
 projects: {}        # проекты сервера; все ключи проекта — server.yml.example
 people: {}          # люди сервера: SSH-ключ и IP
 docker_users: []    # кто запускает контейнеры (группа docker = root на сервере)

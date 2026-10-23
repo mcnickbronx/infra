@@ -92,6 +92,12 @@ projects:
 # access_link_host: access.example.ru   # свой адрес вместо <IP>.sslip.io (A-запись на сервер)
 # access_link_hours: 24           # на сколько открывать, 1..72
 
+# --- DNS сервера (ADMIN.md, «Остальное»)
+# Когда хостер не пропускает публичные DNS (apt, pip, выкладка — «Temporary failure in name
+# resolution»): публичные DNS, которые он пропускает (у Яндекса, Quad9 — адреса на их сайтах).
+# Только адреса, IPv4 и IPv6; не задано — DNS от хостера, как есть
+# dns_servers: [192.0.2.53, 198.51.100.53]
+
 # --- Любое умолчание движка (group_vars/all/main.yml)
 # Можно поменять здесь, тем же ключом — например, лимиты запросов Traefik:
 # traefik_ratelimit_average: 300
