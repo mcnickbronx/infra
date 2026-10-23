@@ -225,7 +225,7 @@ Ansible работает на самом сервере (`-c local`): коман
 |---|---|---|
 | `preflight` | проверки описания (`server.yml`, ключи в `secrets.yml`) до любых изменений: ошибка останавливает плейбук с объяснением; сервер не спрашивает | — |
 | `secrets` | недостающие пароли (restic, администратор Postgres, база каждого проекта) — создать и дописать в `secrets.yml`; записанные не меняются. Пустые строки ключей администратора (`secrets.yml.example`) — дописать, если их нет | `/etc/infra/secrets.yml` |
-| `base` | пакеты, обновления безопасности Ubuntu, SSH только по ключу, файрвол с белым списком IP, журнал событий сервера | `/etc/ssh/sshd_config.d/10-hardening.conf`, `/usr/local/sbin/ufw-sync-whitelist`, `/etc/ufw/ansible-whitelist.json`, `/usr/local/sbin/infra-log`, `/var/log/infra.log` |
+| `base` | пакеты, обновления безопасности Ubuntu, SSH только по ключу, файрвол с белым списком IP, журнал событий сервера, свои DNS сервера (`dns_servers`) | `/etc/ssh/sshd_config.d/10-hardening.conf`, `/usr/local/sbin/ufw-sync-whitelist`, `/etc/ufw/ansible-whitelist.json`, `/usr/local/sbin/infra-log`, `/var/log/infra.log`, `/etc/systemd/resolved.conf.d/60-infra-dns.conf` |
 | `docker` | Docker с userns-remap и `no-new-privileges`, сеть на проект, общий `base.yml` для compose, очистка образов | `/etc/docker/daemon.json`, `/srv/infra/compose/base.yml`, `docker-cleanup.timer` |
 | `postgres` | Postgres из PGDG, база и пользователь на проект, лимиты подключений и времени запроса, журнал медленных запросов | `/etc/postgresql/<версия>/main/`: `conf.d/90-ansible.conf`, `pg_hba.conf` (+ свои строки админа в `pg_hba.d/`) |
 | `traefik` | SSL сам, заголовки безопасности, лимиты запросов с одного IP, сжатие текста (br, gzip) | `/srv/infra/traefik/` |
