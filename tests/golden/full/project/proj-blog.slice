@@ -5,4 +5,5 @@ Description=Project blog
 
 [Slice]
 MemoryMax=512M
+MemorySwapMax=0
 CPUQuota=50%

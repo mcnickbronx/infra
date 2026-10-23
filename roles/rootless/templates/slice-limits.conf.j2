@@ -5,6 +5,8 @@
 [Slice]
 MemoryMax={{ members | map('extract', projects) | map(attribute='memory', default=project_default_memory)
               | map('upper') | map('human_to_bytes') | sum }}
+{# Без MemorySwapMax=0 на сервере со swap лимит мягкий: проекты группы уходят в swap, OOM и уведомления нет #}
+MemorySwapMax=0
 CPUQuota={{ (members | map('extract', projects) | map(attribute='cpus', default=project_default_cpus)
              | map('float') | sum * 100) | round | int }}%
 TasksMax=8192

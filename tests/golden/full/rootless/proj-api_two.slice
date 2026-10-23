@@ -5,4 +5,5 @@ Description=Project api_two
 
 [Slice]
 MemoryMax=512M
+MemorySwapMax=0
 CPUQuota=50%

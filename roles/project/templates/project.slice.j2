@@ -5,4 +5,6 @@ Description=Project {{ item.key }}
 
 [Slice]
 MemoryMax={{ (item.value.memory | default(project_default_memory)) | upper }}
+{# Без MemorySwapMax=0 на сервере со swap лимит мягкий: проект уходит в swap, OOM и уведомления нет #}
+MemorySwapMax=0
 CPUQuota={{ ((item.value.cpus | default(project_default_cpus)) | float * 100) | round | int }}%

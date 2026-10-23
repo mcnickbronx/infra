@@ -5,4 +5,5 @@ Description=Project static
 
 [Slice]
 MemoryMax=2G
+MemorySwapMax=0
 CPUQuota=200%

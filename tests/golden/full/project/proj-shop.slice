@@ -5,4 +5,5 @@ Description=Project shop
 
 [Slice]
 MemoryMax=4G
+MemorySwapMax=0
 CPUQuota=200%
