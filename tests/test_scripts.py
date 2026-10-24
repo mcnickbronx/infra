@@ -1506,6 +1506,47 @@ esac
         cache = self.web / "media" / "cache"
         self.assertTrue(cache.is_dir() and not cache.is_symlink())
         self.assertEqual(os.stat(cache).st_mode & 0o770, 0o770)   # запись для группы (setgid стенд Mac снимает)
+        self.assertEqual(os.stat(cache).st_mode & 0o5000, 0)       # без setuid и sticky (uutils 0.8 — v1.7.2)
+
+    def test_volume_dir_through_deeper_link_not_created(self):
+        # Ссылка не первой частью пути: web/x — папка, web/x/y — ссылка на чужую, том ./x/y/z/w
+        foreign = self.dir / "foreign"
+        foreign.mkdir()
+        (self.web / "x").mkdir()
+        (self.web / "x" / "y").symlink_to(foreign)
+        self.volume_source(f"{self.web}/x/y/z/w")
+        run, lines = self.deploy()
+        self.assertEqual(list(foreign.iterdir()), [], "root создал папку в чужой папке через ссылку web/x/y")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("идёт через ссылку", run.stderr)
+
+    def test_volume_dir_swapped_after_mkdir_untouched(self):
+        # Гонка: участник успел сразу после mkdir web/media подменить её ссылкой на чужую папку. chmod — на
+        # папку, в которой стоим после cd -P и сверки пути, а не по имени: режим чужой папки тот же, отказ
+        foreign = self.dir / "foreign"
+        foreign.mkdir()
+        foreign.chmod(0o755)
+        (self.bin / "mkdir").write_text(
+            '#!/bin/bash\n/bin/mkdir "$@" || exit\n'
+            f'if [ "${{!#}}" = media ]; then rmdir media && ln -s "{foreign}" media; fi\n')
+        (self.bin / "mkdir").chmod(0o755)
+        self.volume_source(f"{self.web}/media")
+        run, lines = self.deploy()
+        self.assertEqual(os.stat(foreign).st_mode & 0o7777, 0o755, "root сменил режим чужой папки по подменённой ссылке")
+        self.assertEqual(run.returncode, 1, run.stderr)
+
+    def test_volume_link_to_existing_dir_kept(self):
+        # Папка тома уже есть, пусть и ссылкой (web/media → store/media): создавать нечего — выкладка идёт,
+        # как прежде, ссылка и режим папки не меняются
+        store = self.dir / "store" / "media"
+        store.mkdir(parents=True)
+        store.chmod(0o750)
+        (self.web / "media").symlink_to(store)
+        self.volume_source(f"{self.web}/media")
+        run, lines = self.deploy()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue((self.web / "media").is_symlink())
+        self.assertEqual(os.stat(store).st_mode & 0o7777, 0o750)
 
 
 def open_fifo_writer(path):
