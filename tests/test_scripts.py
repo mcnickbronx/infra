@@ -1338,6 +1338,45 @@ esac
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("docker pull -q ghcr.io/example/other:main", lines)
 
+    def test_image_pin_compose_gets_checked_image(self):
+        # compose читает .env шире скрипта: строку export DEPLOY_IMAGE=<чужой> скрипт не берёт, compose — взял бы и скачал
+        # от root. Проверенный образ — в окружении вызова compose (оно у compose сильнее .env): заглушка пишет, что получила
+        (self.bin / "project-compose").write_text(
+            self.COMPOSE.replace("#!/bin/bash\n", '#!/bin/bash\necho "${DEPLOY_IMAGE-нет}" >> "$STUB_LOG.image"\n', 1))
+        self.pin()
+        own, foreign = f"{self.REPO}:main", "ghcr.io/example/other:main"
+        for args in ((), ("to", self.HASH), ("rollback",)):
+            with self.subTest(args=args):
+                for f in (self.log, self.dir / "log.image"):
+                    f.unlink(missing_ok=True)
+                (self.states / "shop.current").write_text(f"{self.REPO}@{self.OLD}\n")
+                (self.states / "shop.previous").write_text(f"{self.REPO}@{self.NEW}\n")
+                self.env.write_text(f"DEPLOY_IMAGE={own}\nexport DEPLOY_IMAGE={foreign}\n")
+                run, lines = self.deploy(*args, STUB_TAGS=f"{own}={self.NEW} {self.REPO}:{self.HASH}={self.NEW} {foreign}={self.NEW}")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertTrue(any(" up " in line for line in lines), lines)
+                self.assertNotIn("other", "\n".join(lines))
+                self.assertEqual(set((self.dir / "log.image").read_text().splitlines()), {own})
+
+    def test_image_pin_rollback_checks_previous(self):
+        # чужой образ, выложенный до image, откат не возвращает: прежняя версия сверяется с image, как образ из .env
+        self.pin()
+        for prev in (f"ghcr.io/example/other@{self.NEW}", f"ghcr.io/example/shop-evil@{self.NEW}"):
+            with self.subTest(prev=prev):
+                (self.states / "shop.previous").write_text(prev + "\n")
+                run, lines = self.deploy("rollback")
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn(f"прежняя версия {prev} — образ не этого проекта (image в server.yml: {self.REPO}); "
+                              "не скачиваю", run.stderr)
+                self.assertEqual(lines, [])                         # ни pull, ни tag, ни up
+                self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+                self.assertEqual(self.state("previous"), prev)
+        (self.states / "shop.previous").write_text(f"{self.REPO}@{self.NEW}\n")     # своя — откат идёт
+        run, lines = self.deploy("rollback")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f"docker pull -q {self.REPO}@{self.NEW}", lines)
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.NEW}")
+
 
 def open_fifo_writer(path):
     """Открыть FIFO на запись без ожидания и закрыть: читатель, который ждёт писателя, получает конец файла.

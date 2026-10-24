@@ -48,6 +48,18 @@ STATE=/var/lib/project-deploy/$NAME
 state() { cat "$STATE.$1" 2>/dev/null || true; }       # state current — версия или пусто
 set_state() { echo "$2" > "$STATE.$1"; }               # set_state current <версия>
 
+# image у проекта: образ $1 — только из этого репозитория, иначе root скачал бы своим входом в ghcr чужой приватный
+# образ, вписанный участником в .env. Репозиторий — без @дайджеста и без :тега (тег — после последнего /, как в to),
+# и равен строке целиком: shop-evil и shop/x — не shop. image не задан — любой. Отказ — с текстом: $2 — что проверяли
+own_image() {
+  local allowed repo=${1%%@*}
+  allowed=$(state image)
+  [ -n "$allowed" ] || return 0
+  [[ ${repo##*/} != *:* ]] || repo=${repo%:*}
+  [ "$repo" = "$allowed" ] ||
+    { echo "$NAME: $2 — образ не этого проекта (image в server.yml: $allowed); не скачиваю" >&2; return 1; }
+}
+
 # Версия для журнала событий: образ и начало дайджеста (repo@sha256:0123456789ab)
 short() { sed -E 's/(sha256:[0-9a-f]{12})[0-9a-f]*/\1/' <<<"${1:-—}"; }
 
@@ -172,6 +184,7 @@ rollback() {
   local prev cur
   prev=$(state previous)
   [ -n "$prev" ] || { echo "$NAME: прежней версии нет — откатывать нечего" >&2; exit 1; }
+  own_image "$prev" "прежняя версия $prev" || exit 1     # выложенную до image чужую откат не вернёт
   cur=$(state current)
   echo "$NAME: возвращаю $prev"
   if ! { switch_to "$prev" && make_dirs && up; }; then
@@ -257,16 +270,12 @@ IMAGE=$(dd if=.env iflag=nofollow,nonblock status=none 2>/dev/null | sed -n 's/^
 [ -n "$IMAGE" ] || [ ! -L .env ] ||                     # -L — только для текста: защищает nofollow
   { echo "$NAME: web/.env — ссылка: root по ссылке не читает, выкладка не идёт; замените ссылку файлом" >&2; exit 1; }
 [ -n "$IMAGE" ] || { echo "$NAME: нет DEPLOY_IMAGE в .env — автовыкладка не настроена" >&2; exit 1; }
-# image у проекта: образ из .env — только из этого репозитория, иначе root скачал бы своим входом в ghcr чужой
-# приватный образ, вписанный участником в .env. Репозиторий — без @дайджеста и без :тега (тег — после последнего /,
-# как в to), и равен строке целиком: shop-evil и shop/x — не shop. Так закрыты и deploy, и to, и rollback
-allowed=$(state image)
-if [ -n "$allowed" ]; then
-  repo=${IMAGE%%@*}
-  [[ ${repo##*/} != *:* ]] || repo=${repo%:*}
-  [ "$repo" = "$allowed" ] ||
-    { echo "$NAME: DEPLOY_IMAGE=$IMAGE — образ не этого проекта (image в server.yml: $allowed); не скачиваю" >&2; exit 1; }
-fi
+# Образ из .env — из репозитория image (own_image): так закрыты и deploy, и to (тот же репозиторий), и rollback
+own_image "$IMAGE" "DEPLOY_IMAGE=$IMAGE" || exit 1
+# compose выкладки — с проверенным образом (image: ${DEPLOY_IMAGE}) в окружении: оно у compose сильнее --env-file,
+# а .env compose читает шире, чем чтение IMAGE выше (export DEPLOY_IMAGE=…, пробел в начале, DEPLOY_IMAGE: …), — иначе
+# скрипт проверил бы и пометил свой образ, а up скачал бы от root чужой
+export DEPLOY_IMAGE=$IMAGE
 
 case $ACTION in
   deploy) deploy ;;
