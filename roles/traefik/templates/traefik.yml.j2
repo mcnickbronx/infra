@@ -53,6 +53,12 @@ certificatesResolvers:
 
 accessLog:
   filePath: /logs/access.log
+  # Имя пользователя из адреса запроса (http://имя@сайт/) Traefik пишет в журнал как есть, а %0a в нём —
+  # перевод строки: одним запросом аноним дописывал бы целые строки с любым IP, кодом и роутером. По журналу
+  # банит CrowdSec (на всех портах). basicAuth в infra нет — поле ничего не несёт, на его месте всегда «-».
+  fields:
+    names:
+      ClientUsername: drop
 
 log:
   level: INFO

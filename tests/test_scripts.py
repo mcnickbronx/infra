@@ -269,6 +269,22 @@ class RootlessFiles(unittest.TestCase):
             self.assertEqual(to_rf(to_rl(100000 + n)), 100000 + n)
 
 
+class TraefikAccessLog(unittest.TestCase):
+    """roles/traefik: traefik.yml (эталон tests/golden) — журнал запросов, по которому банит CrowdSec."""
+
+    def test_client_username_dropped(self):
+        # Имя пользователя из адреса Traefik пишет как есть, %0a в нём — перевод строки: без drop запрос
+        # GET http://a%0a<строка журнала>%0ab@сайт/ дописывает в access.log строку с любым IP, кодом и роутером
+        lines = (ROOT / "tests/golden/full/traefik/traefik.yml").read_text().split("\n")
+        block = []
+        for line in lines[lines.index("accessLog:") + 1:]:
+            if line and not line.startswith(" "):
+                break
+            if line.strip() and not line.lstrip().startswith("#"):
+                block.append(line)
+        self.assertIn("  fields:\n    names:\n      ClientUsername: drop", "\n".join(block))
+
+
 class HealthCheckContainers(unittest.TestCase):
     """roles/monitoring: health-check.sh (эталон tests/golden) — проверки контейнеров по заглушке docker
     и уведомления: о новом — один раз, о прошедшем — один раз."""
