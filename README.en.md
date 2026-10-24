@@ -34,7 +34,7 @@ and YAML instead of buttons.
   snapshots every 1–60 minutes straight to S3; three levels — server, your computer, S3 with Object Lock.
 - **Deploys:** push → CI builds an image in ghcr.io → the server picks it up within 15 seconds, runs
   migrations, waits for the health check, rolls back on failure.
-- **Monitoring:** a health check every 10 minutes, Telegram alerts only for new and resolved problems,
+- **Monitoring:** a health check every 10 minutes, Telegram alerts for new and resolved problems and for each deployed version,
   a morning summary, an audit log in `/var/log/infra.log`.
 - **Management:** one `server.yml` per server, generated passwords, `infra edit` with a diff and
   «Apply?», a terminal menu, weekly `infra update`, `infra upgrade` to a new engine version (only

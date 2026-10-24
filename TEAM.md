@@ -100,6 +100,7 @@ jobs:
         with:
           push: true
           tags: ghcr.io/<владелец>/<образ>:${{ github.ref_name }}   # имя — строчными буквами
+          labels: org.opencontainers.image.revision=${{ github.sha }}   # коммит — в сообщение о выкладке
 ```
 
 Push в эту ветку — это root на сервере: compose из образа запускается от root. Право push в неё —

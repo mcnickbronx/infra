@@ -247,7 +247,7 @@ people:
 | Проект | в `projects:` — `net` (обязательно), `db: postgres`, `devs` |
 | Лимиты проекта | `memory: 4g`, `cpus: 2` (по умолчанию 2g и половина CPU сервера) |
 | База проекта | `db_conn_limit` (50), `db_statement_timeout` (60s) |
-| Автовыкладка | `autodeploy: true` у проекта, `ghcr_user` и `ghcr_token` в `secrets.yml` (ADMIN.md) |
+| Автовыкладка | `autodeploy: true` у проекта, `ghcr_user` и `ghcr_token` в `secrets.yml` (ADMIN.md); `image: ghcr.io/<владелец>/<образ>` — выкладывать только этот образ |
 | Частые бэкапы | `backup_hourly: db` или `all` у проекта, `backup_every`: 1, 5, 15, 30 или 60 минут |
 | Копия в S3 | `restic_s3_repository_base`, ключи `s3_access_key`, `s3_secret_key` (шаг 6) |
 | Telegram | `telegram_bot_token`, `telegram_chat_id`, `telegram_proxy` в `secrets.yml` (шаг 7) |
