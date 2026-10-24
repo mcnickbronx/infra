@@ -62,7 +62,7 @@
 | Traefik | свои файлы в `/srv/infra/traefik/dynamic/` (middlewares, роутеры) — Traefik подхватит сам | `traefik.yml`, `compose.yml`, `dynamic/middlewares.yml` |
 | Файрвол | свои правила ufw — без комментария `ansible-wl` | правила с `ansible-wl` (белый список SSH) |
 | SSH | `/etc/ssh/sshd_config.d/20-<имя>.conf`: добавить настройку — да, переопределить движковую — нет (у sshd побеждает первое значение). Блоков `Match` там не ставить — они «съедают» все общие настройки после себя | `10-hardening.conf`, блок `ANSIBLE DEVS` в `sshd_config` |
-| CrowdSec | свои белые списки, коллекции, источники (`cscli ...`, свои файлы) | `acquis.d/traefik.yaml`, `parsers/s02-enrich/ansible-admin-whitelist.yaml` |
+| CrowdSec | свои белые списки, коллекции, источники (`cscli ...`, свои файлы); свои адреса — в свой allowlist (`sudo cscli allowlists create <имя> -d <описание>`, затем `add`) | `acquis.d/traefik.yaml`, `parsers/s02-enrich/ansible-admin-whitelist.yaml`, allowlist `infra` (`sudo cscli allowlists inspect infra`; добавленное в него руками `apply` удалит) |
 | Docker | — | `/etc/docker/daemon.json`, `/srv/infra/compose/base.yml`, сети `proj-*` |
 | Бэкапы | — (что входит в бэкап, решает проект: его папка, тома, база) | `/etc/restic/*`, `backup.sh`, `project-backup`, `project-restore` |
 | Логи | свои файлы в `/etc/logrotate.d/` | `logrotate.d/infra`, `logrotate.d/traefik` |
@@ -616,7 +616,7 @@ sudo grep 'shop' /var/log/infra.log     # всё про проект shop
 | нагрузка, память, диски за прошлые дни (sysstat: снимок раз в 10 минут, хранится 28 дней) | `sar -q -s 02:30:00 -e 03:30:00` — нагрузка сегодня с 02:30 до 03:30, `sar -r` — память, `sar -d -p` — чтение и запись дисков (не место на них); вчера — `sar -q -1`, другой день — `sar -q -f /var/log/sysstat/sa<ДД>`; старше 10 дней файл сжат: `xz -dc /var/log/sysstat/sa<ДД>.xz > /tmp/sa<ДД>`, затем `-f /tmp/sa<ДД>` |
 | пакеты: `update` и обновления безопасности | `/var/log/apt/history.log`, `/var/log/unattended-upgrades/` |
 | входы по SSH | `sudo journalctl -u ssh` |
-| баны CrowdSec | `sudo cscli alerts list`, `sudo cscli decisions list` |
+| баны CrowdSec | `sudo cscli alerts list`, `sudo cscli decisions list`; кого CrowdSec не банит (ваши IP, участников, сервера) — `sudo cscli allowlists inspect infra` |
 | сайты (запросы) | `/srv/infra/traefik/logs/access.log` |
 | медленные запросы Postgres | `/var/log/postgresql/postgresql-17-main.log` |
 | контейнеры проекта | `sudo project-compose <проект> logs --tail 100` |
