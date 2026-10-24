@@ -158,6 +158,31 @@
         fail_msg: "IPv4 сервера: {{ server_ips }}, в белом списке CrowdSec: {{ listed }}"
         quiet: true
 
+    # Белый список парсера не защищает от общего списка сообщества — от него защищает allowlist infra
+    - name: Allowlist CrowdSec infra
+      ansible.builtin.command: cscli allowlists inspect infra -o raw
+      register: cs_allowlist
+      changed_when: false
+
+    # Сравнение — как адресов (ipaddress), а не строк: 203.0.113.5/32 в server.yml — то же, что 203.0.113.5
+    - name: В allowlist CrowdSec — все IP белого списка SSH и IPv4 сервера
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -I
+          - -c
+          - |
+            import csv, ipaddress, json, sys
+            have = {ipaddress.ip_network(r["value"], strict=False) for r in csv.DictReader(sys.stdin)}
+            for a in json.loads(sys.argv[1]):
+                if ipaddress.ip_network(a, strict=False) not in have:
+                    print(a)
+          - "{{ (ssh_allowed_ips + server_ips) | to_json }}"
+        stdin: "{{ cs_allowlist.stdout }}"
+      register: cs_allowlist_missing
+      changed_when: false
+      failed_when: cs_allowlist_missing.rc != 0 or cs_allowlist_missing.stdout != ''
+
     # Только GET: страница показывает форму и ничего не открывает
     - name: Страница ссылки доступа
       ansible.builtin.shell: |

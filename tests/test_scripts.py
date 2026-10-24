@@ -3,10 +3,12 @@
 import hashlib
 import importlib.machinery
 import importlib.util
+import json
 import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -121,6 +123,183 @@ ufw allow from 2001:db8::10 to any port 22 proto tcp comment 'ansible-wl'
     def test_empty_whitelist_removes_all_ours(self):
         _, to_delete = wl.plan(set(), wl.existing_rules(self.ADDED))
         self.assertEqual(len(to_delete), 3)
+
+
+class CrowdsecAllowlist(unittest.TestCase):
+    """roles/crowdsec/files/crowdsec-sync-allowlist: allowlist CrowdSec infra. Стенд — заглушка cscli с базой
+    в JSON: вывод -o raw и поведение create/add/remove — как в cscli v1.8.1 (cmd/crowdsec-cli/cliallowlists/
+    allowlists.go), флаги до «--» разбирает как cobra: неизвестный — ошибка, «-d» — описание."""
+
+    DESC = "infra: admin_ips, people ips, server ips (roles/crowdsec)"
+    INSPECT = ("name,description,value,comment,expiration,created_at,console_managed\n"
+               f"infra,\"{DESC}\",203.0.113.5,,never,2026-10-24T03:00:00Z,false\n"
+               f"infra,\"{DESC}\",198.51.100.0/29,,never,2026-10-24T03:00:00Z,false\n"
+               f"infra,\"{DESC}\",203.0.113.9/32,руками,never,2026-10-24T03:00:00Z,false\n")
+    CSCLI = """#!/usr/bin/env python3
+import csv, json, os, sys
+args = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\\n")
+state = json.load(open(os.environ["STUB_STATE"]))
+known = {"create": ("-o", "-d"), "add": ("-o", "-d", "-e")}.get(args[1] if len(args) > 1 else "", ("-o",))
+pos, flags, rest = [], {}, iter(args)
+for a in rest:
+    if a == "--":
+        pos += list(rest)
+    elif a.startswith("-") and len(a) > 1:
+        if a not in known:
+            sys.exit(f"Error: unknown shorthand flag: {a!r}")
+        flags[a] = next(rest, "")
+    else:
+        pos.append(a)
+assert pos[0] == "allowlists", pos
+cmd, name, values = pos[1], (pos[2:3] or [None])[0], pos[3:]
+out = csv.writer(sys.stdout, lineterminator="\\n")
+if cmd == "list":
+    out.writerow(["name", "description", "created_at", "updated_at", "console_managed", "size"])
+    for n, a in state.items():
+        out.writerow([n, a["description"], "2026-10-24T03:00:00Z", "2026-10-24T03:00:00Z", "false", len(a["items"])])
+elif name not in state and cmd != "create":
+    sys.exit(f"Error: allowlist {name} not found")
+elif cmd == "inspect":
+    out.writerow(["name", "description", "value", "comment", "expiration", "created_at", "console_managed"])
+    for v in state[name]["items"]:
+        out.writerow([name, state[name]["description"], v, "", "never", "2026-10-24T03:00:00Z", "false"])
+elif cmd == "create":
+    if name in state or "-d" not in flags:
+        sys.exit("Error: create")
+    state[name] = {"description": flags["-d"], "items": []}
+elif cmd in ("add", "remove"):
+    if not values:
+        sys.exit("Error: requires at least 2 arg(s)")
+    items = state[name]["items"]
+    if cmd == "add":
+        new = [v for v in values if v not in items]
+        items += new
+        print(f"added {len(new)} values to allowlist {name}" if new else "no new values for allowlist")
+    else:
+        state[name]["items"] = [v for v in items if v not in values]
+else:
+    sys.exit(f"Error: {cmd}")
+json.dump(state, open(os.environ["STUB_STATE"], "w"))
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        # здесь, а не на уровне файла: нет скрипта — падает только этот класс
+        cls.m = load("crowdsec_sync_allowlist", "roles/crowdsec/files/crowdsec-sync-allowlist")
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        (self.dir / "bin").mkdir()
+        stub = self.dir / "bin/cscli"
+        stub.write_text(self.CSCLI)
+        stub.chmod(0o755)
+        self.log, self.state_file, self.json = self.dir / "log", self.dir / "state.json", self.dir / "allowlist.json"
+        self.mark = self.dir / "executed"
+        self.env = {**os.environ, "PATH": f"{self.dir / 'bin'}:{os.environ['PATH']}",
+                    "STUB_LOG": str(self.log), "STUB_STATE": str(self.state_file)}
+
+    def sync(self, ips, state, *opts):
+        self.json.write_text(json.dumps(ips))
+        if state is not None:
+            self.state_file.write_text(json.dumps(state))
+        self.log.unlink(missing_ok=True)
+        run = subprocess.run([sys.executable, "-I", str(ROOT / "roles/crowdsec/files/crowdsec-sync-allowlist"),
+                              *opts, str(self.json)], env=self.env, cwd=self.dir, capture_output=True, text=True)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return run, calls, json.loads(self.state_file.read_text())
+
+    def test_norm(self):
+        self.assertEqual(self.m.norm("203.0.113.5/32"), "203.0.113.5")
+        self.assertEqual(self.m.norm("198.51.100.7/29"), "198.51.100.0/29")
+        self.assertEqual(self.m.norm("2001:DB8::10/128"), "2001:db8::10")
+
+    def test_existing_keeps_stored_value(self):
+        # remove в cscli ищет запись точным совпадением строки — удалять надо тем, что хранится
+        self.assertEqual(self.m.existing(self.INSPECT), [
+            ("203.0.113.5", "203.0.113.5"), ("198.51.100.0/29", "198.51.100.0/29"), ("203.0.113.9", "203.0.113.9/32")])
+        self.assertEqual(self.m.lists("name,description,created_at,updated_at,console_managed,size\n"
+                                      "infra,x,2026-10-24T03:00:00Z,2026-10-24T03:00:00Z,false,3\n"), {"infra"})
+
+    def test_plan(self):
+        found = self.m.existing(self.INSPECT)
+        desired = {self.m.norm(a) for a in ["203.0.113.5/32", "198.51.100.7/29", "203.0.113.9"]}
+        self.assertEqual(self.m.plan(desired, found), ([], []))
+        desired = {"203.0.113.5", "192.0.2.1"}
+        self.assertEqual(self.m.plan(desired, found), (["192.0.2.1"], ["198.51.100.0/29", "203.0.113.9/32"]))
+        # тот же адрес второй записью — лишний; значение с запятой и переводом строки CSV не ломает
+        self.assertEqual(self.m.existing('name,description,value,comment,expiration,created_at,console_managed\n'
+                                         'infra,"a, b","x\ny",,never,2026-10-24T03:00:00Z,false\n'), [("x\ny", "x\ny")])
+        self.assertEqual(self.m.plan({"203.0.113.5"}, found + [("203.0.113.5", "203.0.113.5/32")]),
+                         ([], ["198.51.100.0/29", "203.0.113.5/32", "203.0.113.9/32"]))
+
+    def test_creates_then_nothing_to_do_and_own_allowlist_untouched(self):
+        mine = {"description": "своё", "items": ["192.0.2.200", "203.0.113.5"]}
+        ips = ["192.0.2.10", "198.51.100.7/29", "2001:db8::10", "192.0.2.1"]
+        run, calls, state = self.sync(ips, {"mine": mine})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.splitlines()[-1], "CHANGED")
+        self.assertEqual(calls, [["allowlists", "list", "-o", "raw"],
+                                 ["allowlists", "create", "infra", "-d", self.DESC],
+                                 ["allowlists", "add", "infra", "--",
+                                  "192.0.2.1", "192.0.2.10", "198.51.100.0/29", "2001:db8::10"]])
+        run, calls, state2 = self.sync(ips, None)
+        self.assertEqual((run.returncode, run.stdout), (0, "OK\n"), run.stderr)
+        self.assertEqual([c[1] for c in calls], ["list", "inspect"])
+        self.assertEqual(state2, state)
+        self.assertEqual(state["mine"], mine)
+
+    def test_extra_removed_by_stored_value_missing_added(self):
+        state = {"infra": {"description": self.DESC, "items": ["203.0.113.5", "203.0.113.9/32", "198.51.100.0/29"]},
+                 "mine": {"description": "своё", "items": ["203.0.113.9"]}}
+        run, calls, state = self.sync(["203.0.113.5", "192.0.2.1", "198.51.100.0/29"], state)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "+ 192.0.2.1\n- 203.0.113.9/32\nCHANGED\n")
+        self.assertEqual(calls[2:], [["allowlists", "add", "infra", "--", "192.0.2.1"],
+                                     ["allowlists", "remove", "infra", "--", "203.0.113.9/32"]])
+        self.assertEqual(state["infra"]["items"], ["203.0.113.5", "198.51.100.0/29", "192.0.2.1"])
+        self.assertEqual(state["mine"]["items"], ["203.0.113.9"])
+
+    def test_check_changes_nothing(self):
+        before = {"infra": {"description": self.DESC, "items": ["203.0.113.5", "203.0.113.9"]}}
+        run, calls, state = self.sync(["203.0.113.5", "192.0.2.1"], before, "--check")
+        self.assertEqual((run.returncode, run.stdout), (1, "+ 192.0.2.1\n- 203.0.113.9\nCHANGED\n"), run.stderr)
+        self.assertEqual([c[1] for c in calls], ["list", "inspect"])
+        self.assertEqual(state, before)
+        run, calls, state = self.sync(["203.0.113.5"], {}, "--check")       # списка нет — не создаёт
+        self.assertEqual((run.returncode, run.stdout), (1, "+ allowlist infra\n+ 203.0.113.5\nCHANGED\n"))
+        self.assertEqual((calls, state), ([["allowlists", "list", "-o", "raw"]], {}))
+
+    def test_hostile_address_in_json_never_reaches_cscli(self):
+        # адреса из server.yml идут в команды root: не адрес — ошибка до первого вызова cscli
+        for bad in (f"192.0.2.1; touch {self.mark}", f"$(touch {self.mark})", "192.0.2.1 192.0.2.2",
+                    f"192.0.2.1\ntouch {self.mark}", "-d", "--help", "192.0.2.1/33"):
+            with self.subTest(bad=bad):
+                before = {"infra": {"description": self.DESC, "items": ["203.0.113.5"]}}
+                run, calls, state = self.sync(["203.0.113.5", bad], before)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("ValueError", run.stderr)
+                self.assertEqual((calls, state), ([], before))
+                self.assertFalse(self.mark.exists())
+
+    def test_hostile_value_in_allowlist_removed_as_value(self):
+        # запись, добавленная в infra руками, с «-флагом», $(…), «;» и переводом строки — значение, а не флаг
+        # и не команда: без «--» заглушка, как cobra, приняла бы «-e» за флаг
+        bad = ["-e", f"$(touch {self.mark})", "203.0.113.7;id", "x\ny"]
+        self.state_file.write_text(json.dumps({"infra": {"description": self.DESC, "items": ["203.0.113.5", *bad]}}))
+        no_dash = subprocess.run([str(self.dir / "bin/cscli"), "allowlists", "remove", "infra", "-e"],
+                                 env=self.env, capture_output=True, text=True)
+        self.assertIn("unknown shorthand flag: '-e'", no_dash.stderr)
+        run, calls, state = self.sync(["203.0.113.5"], None)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(calls[-1], ["allowlists", "remove", "infra", "--", *sorted(bad)])
+        self.assertEqual(state["infra"]["items"], ["203.0.113.5"])
+        self.assertIn("- 'x\\ny'\n", run.stdout)
+        self.assertFalse(self.mark.exists())
+        run, _, _ = self.sync(["203.0.113.5"], None)
+        self.assertEqual(run.stdout, "OK\n")
 
 
 acc = load("infra_access", "roles/access/files/infra-access")

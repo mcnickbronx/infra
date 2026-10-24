@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+# Управляется Ansible.
+# Приводит allowlist CrowdSec с именем infra к списку IP и подсетей из JSON-файла:
+# создаёт список, если его нет, добавляет недостающие, удаляет лишние.
+# Другие allowlist (например, свой, созданный руками) не читает и не трогает.
+#   crowdsec-sync-allowlist <файл.json>          — привести allowlist к списку
+#   crowdsec-sync-allowlist --check <файл.json>  — только показать расхождения (код 1, если есть)
+# Команды cscli — без shell; адреса из JSON сначала проходят ipaddress (иначе — ошибка до cscli).
+# Логика — в функциях, их проверяет tests/test_scripts.py.
+import csv
+import io
+import ipaddress
+import json
+import subprocess
+import sys
+
+NAME = "infra"
+DESCRIPTION = "infra: admin_ips, people ips, server ips (roles/crowdsec)"
+
+
+def norm(addr):
+    """Адрес одной записью: подсеть без битов хоста, одиночный IP без /32 и /128.
+    Иначе 203.0.113.5/32 из инвентаря не совпал бы с 203.0.113.5 в allowlist,
+    и адрес удалялся бы и добавлялся при каждом запуске."""
+    net = ipaddress.ip_network(addr, strict=False)
+    return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+
+
+def lists(raw):
+    """Имена allowlist из `cscli allowlists list -o raw` (CSV, столбец name)."""
+    return {row["name"] for row in csv.DictReader(io.StringIO(raw))}
+
+
+def existing(raw):
+    """Записи нашего allowlist из `cscli allowlists inspect infra -o raw`: [(как сравнивать, как хранится)].
+    remove в cscli ищет запись точным совпадением строки, поэтому храним и исходное значение;
+    запись, которую ipaddress не понимает (добавлена руками), сравнивается как есть — и уйдёт как лишняя."""
+    found = []
+    for row in csv.DictReader(io.StringIO(raw)):
+        value = row["value"]
+        try:
+            found.append((norm(value), value))
+        except ValueError:
+            found.append((value, value))
+    return found
+
+
+def plan(desired, found):
+    """Что добавить и что удалить — в постоянном порядке. Повтор того же адреса
+    в другой записи (203.0.113.5 и 203.0.113.5/32) — лишний."""
+    kept, to_remove = set(), []
+    for key, value in sorted(found):
+        if key in desired and key not in kept:
+            kept.add(key)
+        else:
+            to_remove.append(value)
+    return sorted(desired - kept), sorted(to_remove)
+
+
+def cscli(*args):
+    """Вызов cscli allowlists без shell; ошибка — исключение (код не 0, Ansible покажет)."""
+    return subprocess.run(["cscli", "allowlists", *args], check=True, capture_output=True, text=True).stdout
+
+
+def main(path, check=False):
+    with open(path) as f:
+        desired = {norm(ip) for ip in json.load(f)}
+    create = NAME not in lists(cscli("list", "-o", "raw"))
+    found = [] if create else existing(cscli("inspect", NAME, "-o", "raw"))
+    to_add, to_remove = plan(desired, found)
+    if not check:
+        if create:
+            cscli("create", NAME, "-d", DESCRIPTION)
+        # «--»: дальше только значения — запись, начинающаяся с «-», не станет флагом cscli
+        if to_add:      # раньше, чем удалить: свои не остаются без защиты ни на один вызов
+            cscli("add", NAME, "--", *to_add)
+        if to_remove:
+            cscli("remove", NAME, "--", *to_remove)
+    if create:
+        print(f"+ allowlist {NAME}")
+    for ip in to_add:
+        print(f"+ {ip}")
+    for value in to_remove:
+        print("-", value if value.isprintable() else repr(value))
+    changed = create or to_add or to_remove
+    print("CHANGED" if changed else "OK")
+    return 1 if check and changed else 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "--check":
+        sys.exit(main(sys.argv[2], check=True))
+    sys.exit(main(sys.argv[1]))

@@ -79,6 +79,33 @@
 - name: Применить настройки CrowdSec
   ansible.builtin.meta: flush_handlers
 
+# Белый список парсера (выше) отбрасывает только события из логов этого сервера. Общий список
+# сообщества (баны с центрального API CrowdSec) идёт мимо парсеров — от него защищает allowlist:
+# адрес из него не попадает в базу банов, а уже стоящий бан снимается (cscli allowlists add).
+# Парсер остаётся — он работает и без LAPI. Адреса — те же, что у парсера (и подсети); свои allowlist
+# (другое имя) скрипт не трогает. Адреса ссылки доступа — временные, сюда не входят.
+- name: Скрипт сверки allowlist CrowdSec
+  ansible.builtin.copy:
+    src: crowdsec-sync-allowlist
+    dest: /usr/local/sbin/crowdsec-sync-allowlist
+    mode: "0755"
+
+- name: Адреса для allowlist CrowdSec
+  ansible.builtin.template:
+    src: allowlist.json.j2
+    dest: /etc/crowdsec/infra-allowlist.json
+    mode: "0644"
+
+# cscli allowlists list/inspect идут через LAPI: сразу после перезапуска crowdsec он
+# поднимается несколько секунд — отсюда повторы
+- name: Ваши IP, IP участников и самого сервера — и в allowlist CrowdSec (общий список сообщества их не банит)
+  ansible.builtin.command: /usr/local/sbin/crowdsec-sync-allowlist /etc/crowdsec/infra-allowlist.json
+  register: cs_allowlist_sync
+  changed_when: "'CHANGED' in cs_allowlist_sync.stdout"
+  retries: 5
+  delay: 3
+  until: cs_allowlist_sync is succeeded
+
 # Баны применяет только firewall-bouncer: блокирует IP в nftables на всех портах,
 # и SSH, и сайты (Traefik в сети хоста). Не запущен — баны не действуют вовсе.
 # Ключ к CrowdSec пакет получает при установке, но на новом сервере CrowdSec в этот
