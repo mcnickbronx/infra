@@ -227,6 +227,13 @@
     image=""; [ ! -f "$w/.env" ] ||
       image=$(dd if="$w/.env" iflag=nofollow,nonblock status=none | sed -n 's/^DEPLOY_IMAGE=//p' | tail -1 | tr -d "\"'") ||
       { echo "$p: web/.env — ссылка (root по ссылке не читает) или не читается — перевод не начат; замените ссылку файлом" >&2; exit 1; }
+    {% if projects[item.key].image is defined %}
+    # image у проекта — только из этого репозитория, как в project-deploy: без @дайджеста и :тега, строка целиком
+    allowed={{ projects[item.key].image | quote }} repo=${image%%@*}
+    [[ ${repo##*/} != *:* ]] || repo=${repo%:*}
+    [ -z "$image" ] || [ "$repo" = "$allowed" ] ||
+      { echo "$p: DEPLOY_IMAGE=$image — образ не этого проекта (image в server.yml: $allowed); не скачиваю — перевод не начат" >&2; exit 1; }
+    {% endif %}
     [ -z "$image" ] || DOCKER_HOST={{ item.value.sock | quote }} docker pull -q "$image" >/dev/null
     if [ -z "$was" ]; then
       env -u DOCKER_HOST docker compose -p "$p" down 2>&1 | tail -n 3

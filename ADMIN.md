@@ -239,7 +239,8 @@ Push в ветку → CI собирает образ в ghcr.io → серве�
    ghcr_user: "<логин на GitHub>"
    ghcr_token: "<токен>"
    ```
-2. В `.env` проекта — `DEPLOY_IMAGE=ghcr.io/<владелец>/<образ>:<ветка>`.
+2. В `.env` проекта — `DEPLOY_IMAGE=ghcr.io/<владелец>/<образ>:<ветка>`. У проекта без root — и `image: ghcr.io/<владелец>/<образ>`
+   в его блоке `server.yml`: автовыкладка и `to` тянут только этот образ, чужой из `.env` — отказ (README, «Проекты без root»).
 3. `autodeploy: true` в блоке проекта в `server.yml`, `sudo infra apply`. Участники проекта —
    только из `docker_users`: compose из образа запускается от root (DECISIONS.md, «Автовыкладка»).
 4. Первая выкладка — в течение минуты: `sudo journalctl -u project-deploy@<проект> -f`.

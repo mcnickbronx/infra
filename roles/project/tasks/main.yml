@@ -114,6 +114,34 @@
     state: directory
     mode: "0755"
 
+# image у проекта — репозиторий, из которого project-deploy и перевод в Docker без root скачивают образ из .env
+# (README, «Проекты без root»). Файл — в папке состояния: её пишет только root, участник ключ не подменит.
+# В --check на новом сервере папки ещё нет — copy только показывает изменение, не падает (проверено, ansible-core 2.21)
+- name: Репозиторий образа проекта — /var/lib/project-deploy/<проект>.image
+  ansible.builtin.copy:
+    content: "{{ item.value.image }}\n"
+    dest: "/var/lib/project-deploy/{{ item.key }}.image"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ projects | dict2items | selectattr('value.image', 'defined') }}"
+  loop_control:
+    label: "{{ item.key }}: {{ item.value.image }}"
+
+# У проекта, которому убрали image (или убрали его из server.yml), файл иначе остался бы и держал прежний репозиторий
+- name: Файлы репозитория образа на сервере
+  ansible.builtin.find:
+    paths: /var/lib/project-deploy
+    patterns: "*.image"
+  register: deploy_images
+
+- name: Файлы репозитория образа убраны у проектов без image
+  ansible.builtin.file:
+    path: "/var/lib/project-deploy/{{ item }}.image"
+    state: absent
+  loop: "{{ deploy_images.files | map(attribute='path') | map('basename') | map('regex_replace', '[.]image$', '')
+            | difference(projects | dict2items | selectattr('value.image', 'defined') | map(attribute='key')) }}"
+
 # Образы проектов приватные: скачивает их root (таймер), вход — токеном только на чтение
 - name: Вход в реестр образов ghcr.io
   community.docker.docker_login:

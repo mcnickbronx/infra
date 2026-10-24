@@ -15,6 +15,7 @@ projects:
     db: postgres
     db_conn_limit: 100
     autodeploy: true              # участники проекта с автовыкладкой — только из docker_users
+    image: ghcr.io/example/shop   # автовыкладка тянет только этот репозиторий
     backup_hourly: all
     memory: 4g
     cpus: 2
@@ -39,6 +40,7 @@ projects:
     db: postgres
     rootless: true                # без root: своя группа — свой пользователь и Docker
     autodeploy: true              # участникам проекта без root docker_users не нужен
+    image: ghcr.io/example/lab
     devs: [kira]
   api_one:                        # группа back: один Docker без root на два проекта
     net: 31

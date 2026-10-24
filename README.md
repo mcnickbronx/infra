@@ -280,7 +280,7 @@ Ansible работает на самом сервере (`-c local`): коман
 | пароли: `secrets.yml` → `secrets` (`group_vars/all/main.yml`) → `db_passwords`, `restic_password`... | роль secrets | роли postgres, backup, project; `tests/verify.yml` |
 | имя compose-проекта (`name:` в `compose.yml`) = имя проекта | compose проекта (TEAM.md) | `base.yml` (slice `proj-${COMPOSE_PROJECT_NAME}`), `project-backup` (тома по метке), health-check |
 | `/etc/restic/projects.json` — проекты сервера и их базы | роль backup | `backup.sh`, `project-backup`, `project-restore`, `tests/verify.yml` |
-| `/var/lib/project-deploy/<проект>.*` — состояние автовыкладки | `project-deploy` | health-check (`*.failed`); роль project убирает `*.failed` проектов без автовыкладки |
+| `/var/lib/project-deploy/<проект>.*` — состояние автовыкладки | `project-deploy`; `<проект>.image` — роль project (ключ `image`) | health-check (`*.failed`); роль project убирает `*.failed` проектов без автовыкладки; `project-deploy` — `*.image` |
 | `/var/lib/update-last-run` — отметка «update.yml выполнен» | `update.yml` (создаёт роль monitoring) | health-check |
 | `/var/lib/health-check/problems` — о чём уже сообщили в Telegram (проблема без цифр — её ключ) | `health-check.sh --notify` | он же: сообщает только новое и прошедшее |
 | журнал событий `/var/log/infra.log` — что, когда и кто: `infra-log "<событие>"` | роль base (скрипт и ротация) | `infra`, `backup.sh`, `project-backup`, `project-restore`, `project-deploy`; бэкап `system`; строки `apply:` и `бэкап:` читают health-check и `infra status` |
@@ -550,7 +550,9 @@ Ubuntu 26.04 — на всех серверах (поддержка до апр�
 - **диск:** образы и тома у каждого проекта свои (`/home/<проект>-run/.local/share/docker`) —
   один образ у прода и dev хранится дважды;
 - приватный образ скачивает root (автовыкладка, вход в ghcr — у root); `project-compose up`
-  участника сам его не скачает;
+  участника сам его не скачает. Поэтому проекту без root с автовыкладкой задайте `image: ghcr.io/<владелец>/<образ>`
+  в `server.yml`: без него участник может вписать в `.env` чужой приватный образ владельца, и root скачает его
+  своим входом. С ним автовыкладка, `to` и перевод в Docker без root берут образ только из этого репозитория;
 - маршруты Traefik — только http из labels (tcp и udp нет), до 20 портов на проект;
 - после возврата в общий Docker пользователь `<проект>-run` и его образы остаются (Docker остановлен) —
   удалить: `sudo userdel -r <проект>-run`;

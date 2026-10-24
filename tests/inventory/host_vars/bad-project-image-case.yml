@@ -1,0 +1,3 @@
+expect_error: "Проект 'shop': image — репозиторий образа без тега и дайджеста, строчными"
+projects:
+  shop: {net: 5, image: ghcr.io/Example/shop, devs: [ivan]}

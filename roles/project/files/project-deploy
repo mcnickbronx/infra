@@ -26,6 +26,7 @@
 #   failed       когда и на каком шаге не удалось, что работает теперь — по нему health-check
 #                шлёт уведомление
 #   lock         одна выкладка проекта за раз
+#   image        репозиторий, из которого можно скачивать образ (image у проекта в server.yml; пишет роль project)
 #
 # Порядок в файле: состояние, шаги выкладки, deploy, rollback и to, запуск — в самом конце.
 set -Eeuo pipefail
@@ -256,6 +257,16 @@ IMAGE=$(dd if=.env iflag=nofollow,nonblock status=none 2>/dev/null | sed -n 's/^
 [ -n "$IMAGE" ] || [ ! -L .env ] ||                     # -L — только для текста: защищает nofollow
   { echo "$NAME: web/.env — ссылка: root по ссылке не читает, выкладка не идёт; замените ссылку файлом" >&2; exit 1; }
 [ -n "$IMAGE" ] || { echo "$NAME: нет DEPLOY_IMAGE в .env — автовыкладка не настроена" >&2; exit 1; }
+# image у проекта: образ из .env — только из этого репозитория, иначе root скачал бы своим входом в ghcr чужой
+# приватный образ, вписанный участником в .env. Репозиторий — без @дайджеста и без :тега (тег — после последнего /,
+# как в to), и равен строке целиком: shop-evil и shop/x — не shop. Так закрыты и deploy, и to, и rollback
+allowed=$(state image)
+if [ -n "$allowed" ]; then
+  repo=${IMAGE%%@*}
+  [[ ${repo##*/} != *:* ]] || repo=${repo%:*}
+  [ "$repo" = "$allowed" ] ||
+    { echo "$NAME: DEPLOY_IMAGE=$IMAGE — образ не этого проекта (image в server.yml: $allowed); не скачиваю" >&2; exit 1; }
+fi
 
 case $ACTION in
   deploy) deploy ;;

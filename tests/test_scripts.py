@@ -1269,6 +1269,75 @@ esac
         self.assertEqual(lines, [])
         self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
 
+    # image у проекта (роль project пишет его в <проект>.image): образ из .env — только из этого репозитория.
+    # Участник вписал в свой .env образ соседа — root не скачивает его своим входом в ghcr
+    def pin(self, repo=REPO):
+        (self.states / "shop.image").write_text(repo + "\n")
+
+    def test_image_pin_own_image_rolls_out(self):
+        self.pin()
+        run, lines = self.deploy(STUB_TAGS=f"{self.REPO}:main={self.NEW}")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f"docker pull -q {self.REPO}:main", lines)
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.NEW}")
+
+    def test_image_pin_foreign_image_not_pulled(self):
+        self.pin()
+        before = self.env.read_bytes().replace(b"shop:main", b"other:main")
+        self.env.write_bytes(before)
+        for args in ((), ("to", self.HASH), ("rollback",)):
+            with self.subTest(args=args):
+                (self.states / "shop.previous").write_text(f"{self.REPO}@{self.NEW}\n")
+                run, lines = self.deploy(*args, STUB_TAGS=f"ghcr.io/example/other:main={self.NEW} "
+                                                          f"ghcr.io/example/other:{self.HASH}={self.NEW}")
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn("DEPLOY_IMAGE=ghcr.io/example/other:main — образ не этого проекта "
+                              f"(image в server.yml: {self.REPO}); не скачиваю", run.stderr)
+                self.assertEqual(lines, [])                         # ни pull, ни tag, ни up
+                self.assertEqual(self.env.read_bytes(), before)
+                self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+                self.assertEqual(self.leftovers(), [])
+
+    def test_image_pin_is_whole_repository(self):
+        # похожее имя — не тот репозиторий: сравнение строкой целиком, не по началу и не по концу
+        self.pin()
+        for image in ("ghcr.io/example/shop-evil:main", "ghcr.io/example/shop/x:main", "ghcr.io/example/sho:main",
+                      "ghcr.io/example/shopx", "evil.io/ghcr.io/example/shop:main", "ghcr.io/example/shop:main/x",
+                      "ghcr.io/example/shop.evil@sha256:" + "2" * 64, "GHCR.IO/example/shop:main"):
+            with self.subTest(image=image):
+                self.log.unlink(missing_ok=True)
+                self.env.write_text(f"DEPLOY_IMAGE={image}\n")
+                run, lines = self.deploy(STUB_TAGS=f"{image}={self.NEW}")
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn("образ не этого проекта", run.stderr)
+                self.assertEqual(lines, [])
+
+    def test_image_pin_tag_and_digest_forms(self):
+        # тег, дайджест, тег с дайджестом, без тега; «:» в адресе реестра — порт, а не тег
+        digest = "sha256:" + "2" * 64
+        for repo, image in ((self.REPO, f"{self.REPO}@{digest}"), (self.REPO, f"{self.REPO}:main@{digest}"),
+                            (self.REPO, self.REPO), ("registry.example.com:5000/shop", "registry.example.com:5000/shop:v1"),
+                            ("registry.example.com:5000/shop", "registry.example.com:5000/shop")):
+            with self.subTest(image=image):
+                self.log.unlink(missing_ok=True)
+                self.pin(repo)
+                self.env.write_text(f"DEPLOY_IMAGE={image}\n")
+                run, lines = self.deploy(STUB_TAGS=f"{image}={self.OLD}")
+                self.assertNotIn("не этого проекта", run.stderr)
+                self.assertIn(f"docker pull -q {image}", lines)
+        self.log.unlink()
+        self.env.write_text("DEPLOY_IMAGE=registry.example.com:5001/shop:v1\n")    # другой порт — другой реестр
+        run, lines = self.deploy()
+        self.assertIn("образ не этого проекта", run.stderr)
+        self.assertEqual(lines, [])
+
+    def test_no_image_pin_pulls_as_before(self):
+        # image не задан — как раньше: образ из .env скачивается, какой бы ни был (README, «Проекты без root»)
+        self.env.write_text("DEPLOY_IMAGE=ghcr.io/example/other:main\n")
+        run, lines = self.deploy(STUB_TAGS=f"ghcr.io/example/other:main={self.NEW}")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("docker pull -q ghcr.io/example/other:main", lines)
+
 
 def open_fifo_writer(path):
     """Открыть FIFO на запись без ожидания и закрыть: читатель, который ждёт писателя, получает конец файла.

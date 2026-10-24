@@ -99,7 +99,7 @@
 # Все ключи с пояснениями — server.yml.example
 - name: У проектов только известные ключи
   vars:
-    known: [net, domains, db, db_conn_limit, db_statement_timeout, memory, cpus, autodeploy, backup_hourly, backup_every, devs, rootless]
+    known: [net, domains, db, db_conn_limit, db_statement_timeout, memory, cpus, autodeploy, backup_hourly, backup_every, devs, rootless, image]
   ansible.builtin.assert:
     that: item.value.keys() | difference(known) | length == 0
     fail_msg: >-
@@ -191,6 +191,23 @@
     fail_msg: >-
       Проект '{{ item.key }}': rootless — true, false или имя группы (строчные латинские буквы,
       цифры и _, до 28 символов)
+    quiet: true
+  loop: "{{ projects | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# image — репозиторий образа проекта: автовыкладка, to и перевод в Docker без root скачивают образ из .env
+# (DEPLOY_IMAGE), только если он из этого репозитория. Сравнение — строкой: с тегом, дайджестом или заглавными
+# (в имени образа Docker их не принимает) ключ не совпал бы ни с одним образом. Ключ попадает в скрипты root — \Z, а не $
+- name: У проекта image — репозиторий образа без тега, строчными
+  vars:
+    image_re: '^[a-z0-9][a-z0-9.-]*(:[0-9]+)?(/[a-z0-9][a-z0-9._-]*)+\Z'
+  ansible.builtin.assert:
+    that:
+      - item.value.image is not defined or (item.value.image is string and item.value.image is match(image_re))
+    fail_msg: >-
+      Проект '{{ item.key }}': image — репозиторий образа без тега и дайджеста, строчными:
+      ghcr.io/<владелец>/<образ>
     quiet: true
   loop: "{{ projects | dict2items }}"
   loop_control:
