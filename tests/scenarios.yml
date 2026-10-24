@@ -17,7 +17,8 @@
 #      Telegram — повтор через час; уведомления — в файл (INFRA_NOTIFY_DRY).
 #   4. Автовыкладка (project-deploy) с локальным реестром: выкладка, отказ подготовки
 #      с возвратом прежней версии (и при первой выкладке — запущенной руками), откат вручную.
-#      Откат при идущей выкладке — отказ, а не молчаливый выход.
+#      Откат при идущей выкладке — отказ, а не молчаливый выход. to <тег>: тега нет в реестре — отказ,
+#      .env тот же; есть — выложено, в .env заменена одна строка DEPLOY_IMAGE.
 #   5. Команда infra: edit сохраняет правку, ошибку в ключе ловит проверка (и правку можно
 #      вернуть), сломанный YAML и ключ дважды не сохраняет; edit secrets называет изменённый ключ,
 #      но не показывает и не пишет в журнал значение; init задаёт вопросы, переспрашивает
@@ -436,7 +437,9 @@
     # хорошие, у v2 и v4 падает подготовка (сервис deploy). Проверяется: v0 запущен руками,
     # первая автовыкладка (v2) не удалась — работает v0; выкладка v1 с папкой данных, которую
     # создаёт project-deploy; отказ v4 с возвратом v1, v4 не пробуется снова; v3; откат при
-    # идущей выкладке отказывает; откат вручную без уведомления; откаченная версия не выкладывается.
+    # идущей выкладке отказывает; откат вручную без уведомления; откаченная версия не выкладывается;
+    # to v9 (тега нет в реестре) — отказ, .env тот же; to v0 — выложено, в .env заменена одна строка,
+    # событие в журнале.
     # Уведомления «выложена новая версия» — в файл (INFRA_NOTIFY_DRY; у таймера — drop-in в /run, как в сценарии 8):
     # их два — v1 и v3; сбои, откат и «нового нет» — без них.
     - name: "4. Реестр образов и пять версий проекта"
@@ -525,6 +528,48 @@
           - r.after_rollback == '0:v1'
           - r.logged == '2:2:1'                 # в журнале событий: v1 и v3, отказы v2 и v4, откат
           - r.notified == '2'                   # «выложена новая версия» — v1 и v3
+        fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
+        quiet: true
+
+    # Работает v1, в .env — DEPLOY_IMAGE=localhost:5000/verify:test, в реестре — только тег test
+    - name: "4. to <тег>: тега нет — .env тот же; есть — выкладка и одна строка"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        cd {{ web }}
+        log_start=$(wc -l < /var/log/infra.log)
+        notify=/tmp/verify-deploy-notify; rm -f "$notify"; export INFRA_NOTIFY_DRY="$notify"   # to — без сообщения
+        page() { project-compose shop exec -T web wget -q -O- http://127.0.0.1:8080/ 2>&1; }
+        # Тег по правилам Docker, но в реестре его нет: отказ на docker pull, .env побайтно тот же
+        sum0=$(sha256sum < .env)
+        out=$(project-deploy shop to v9 2>&1)
+        echo "missing=$?:$(page):$([ "$(sha256sum < .env)" = "$sum0" ] && echo same || echo changed)"
+        echo "missing_why=$(grep -c 'localhost:5000/verify:v9 не скачать' <<<"$out")"
+        # Тег есть: выложено, в .env заменена одна строка DEPLOY_IMAGE, событие в журнале
+        cp .env /tmp/verify-env-before
+        docker push -q localhost:5000/verify:v0 >/dev/null
+        project-deploy shop to v0 >/dev/null 2>&1; echo "to=$?:$(page)"
+        echo "diff=$(diff /tmp/verify-env-before .env | grep -c '^[<>]')"
+        echo "line=$(grep '^DEPLOY_IMAGE=' .env)"
+        echo "logged=$(tail -n +$((log_start + 1)) /var/log/infra.log | grep -c 'выкладка shop: DEPLOY_IMAGE verify:test → verify:v0')"
+        echo "notified=$(cat "$notify" 2>/dev/null | grep -c '^---$')"
+        rm -f /tmp/verify-env-before "$notify"
+      args:
+        executable: /bin/bash
+      register: deploy_to
+      changed_when: true
+
+    - name: "4. to: без тега — отказ и .env тот же; с тегом — выложено, заменена одна строка DEPLOY_IMAGE"
+      vars:
+        r: "{{ dict(deploy_to.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.missing == '1:v1:same'            # работает прежняя v1, .env не тронут
+          - r.missing_why == '1'                # отказ — «не скачать», а не другая проверка до docker pull
+          - r.to == '0:v0'
+          - r.diff == '2'                       # в .env — одна строка убрана, одна добавлена
+          - r.line == 'DEPLOY_IMAGE=localhost:5000/verify:v0'
+          - r.logged == '1'
+          - r.notified == '0'                   # to — без строки в Telegram (её шлёт только автовыкладка)
         fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
         quiet: true
 
