@@ -58,8 +58,11 @@ def plan(desired, found):
 
 
 def cscli(*args):
-    """Вызов cscli allowlists без shell; ошибка — исключение (код не 0, Ansible покажет)."""
-    return subprocess.run(["cscli", "allowlists", *args], check=True, capture_output=True, text=True).stdout
+    """Вызов cscli allowlists без shell. Ошибка — выход с кодом 1 и сообщением cscli (Ansible покажет)."""
+    run = subprocess.run(["cscli", "allowlists", *args], capture_output=True, text=True)
+    if run.returncode != 0:
+        sys.exit(f"cscli allowlists {args[0]}: код {run.returncode}: {run.stderr.strip()}")
+    return run.stdout
 
 
 def main(path, check=False):

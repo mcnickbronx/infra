@@ -154,6 +154,8 @@ for a in rest:
         pos.append(a)
 assert pos[0] == "allowlists", pos
 cmd, name, values = pos[1], (pos[2:3] or [None])[0], pos[3:]
+if cmd == os.environ.get("STUB_FAIL"):
+    sys.exit("Error: LAPI is not reachable")
 out = csv.writer(sys.stdout, lineterminator="\\n")
 if cmd == "list":
     out.writerow(["name", "description", "created_at", "updated_at", "console_managed", "size"])
@@ -271,6 +273,15 @@ json.dump(state, open(os.environ["STUB_STATE"], "w"))
         run, calls, state = self.sync(["203.0.113.5"], {}, "--check")       # списка нет — не создаёт
         self.assertEqual((run.returncode, run.stdout), (1, "+ allowlist infra\n+ 203.0.113.5\nCHANGED\n"))
         self.assertEqual((calls, state), ([["allowlists", "list", "-o", "raw"]], {}))
+
+    def test_cscli_error_stops_with_its_message(self):
+        # LAPI ещё не поднялся (inspect и list идут через него) — код 1 и сообщение cscli, ничего не меняется
+        before = {"infra": {"description": self.DESC, "items": ["203.0.113.9"]}}
+        self.env["STUB_FAIL"] = "inspect"
+        run, calls, state = self.sync(["203.0.113.5"], before)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("cscli allowlists inspect: код 1: Error: LAPI is not reachable", run.stderr)
+        self.assertEqual(([c[1] for c in calls], state), (["list", "inspect"], before))
 
     def test_hostile_address_in_json_never_reaches_cscli(self):
         # адреса из server.yml идут в команды root: не адрес — ошибка до первого вызова cscli
