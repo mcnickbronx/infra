@@ -594,6 +594,106 @@ exit 2
         self.assertEqual(len(self.curls()), 20)
         self.assertIn("\ncheck_sites\ncheck_watch_sites\n", self.SCRIPT.read_text())   # в списке проверок, после check_dns
 
+    # ---------- Ошибки сайтов за сутки (--summary): журнал запросов Traefik ----------
+    # Роутеры сервера — из labels: luk-app и med-www у здоровых контейнеров, med-api — у больного (его ошибки тоже видны)
+    ROUTER_LABELS = ("traefik.enable=true,traefik.http.routers.luk-app.rule=Host(`luk.example.com`),"
+                     "traefik.http.routers.luk-app.entrypoints=websecure\n"
+                     "traefik.http.routers.med-www.rule=Host(`med.example.com`)\n")
+    SICK_ROUTER_LABELS = "traefik.http.routers.med-api.rule=Host(`back.med.example.com`)\n"
+    T = "24/Oct/2026:08:00:00"
+    # summary на Маке: GNU date -d, df --output и nproc — заглушки; остальные date — настоящие
+    DATE = """#!/bin/bash
+if [ "$*" = "-u -d 24 hours ago +%Y%m%d%H%M%S" ]; then echo 20261024000000; else exec /bin/date "$@"; fi
+"""
+
+    @staticmethod
+    def access(when, code, router, request="GET /a HTTP/1.1"):
+        """Строка журнала, как пишет Traefik 3.7.15 (общий формат без fields: Referer и User-Agent — "-")."""
+        return f'192.0.2.7 - - [{when} +0000] "{request}" {code} 11 "-" "-" 7 "{router}" "http://172.18.0.5:80" 0ms\n'
+
+    def site_errors(self, old=None, new=None, call="site_errors 20261024000000 || echo absent", **stubs):
+        """access.log.1 (old) и access.log (new) — в новой папке журнала; None — файла нет."""
+        logs = pathlib.Path(tempfile.mkdtemp(dir=self.dir))
+        for name, text in (("access.log.1", old), ("access.log", new)):
+            if text is not None:
+                (logs / name).write_bytes(text if isinstance(text, bytes) else text.encode())
+        for name, text in (("date", self.DATE), ("df", "#!/bin/bash\necho Mounted Use%; echo / 42%\n"),
+                           ("nproc", "#!/bin/bash\necho 2\n")):
+            (self.dir / name).write_text(text)
+            (self.dir / name).chmod(0o755)
+        stubs = {"STUB_LABELS": self.ROUTER_LABELS, "STUB_SICK_LABELS": self.SICK_ROUTER_LABELS, **stubs}
+        return self.run_checks("", call, HEALTH_TRAEFIK_LOGS=str(logs), **stubs)
+
+    def test_site_errors_counted_by_own_router(self):
+        a = self.access
+        old = (a("23/Oct/2026:23:59:59", 502, "luk-app@docker")              # раньше отсечки — мимо
+               + a("24/Oct/2026:00:00:00", 502, "luk-app@docker")
+               + a("24/Oct/2026:01:10:00", 500, "med-api@file")               # больной контейнер, проект без root
+               + a("24/Oct/2026:01:10:01", 200, "med-www@docker"))
+        new = (a("24/Oct/2026:08:00:00", 502, "luk-app@docker")
+               + a("24/Oct/2026:08:00:01", 504, "luk-app@docker")
+               + a("24/Oct/2026:08:00:02", 500, "med-api@file")
+               + a("24/Oct/2026:08:00:03", 404, "med-www@docker")
+               + a("24/Oct/2026:08:00:04", 404, "-")                          # запрос без роутера
+               # путь от посетителя (HTTP/2 — с пробелами): подделка кода и роутера в нём — мимо, хвост Traefik — luk-app 502
+               + a("24/Oct/2026:08:00:05", 502, "luk-app@docker", 'GET /a?q=" 503 1 "-" "-" 1 "evil@docker" "x" 0ms HTTP/2.0')
+               + a("24/Oct/2026:08:00:06", 500, "ghost@docker")               # роутера нет в labels сервера — мимо
+               + '192.0.2.7 - - [24/Oct/2026:08:00:07 +0000] "GET /x HTTP/1.1" 502 11 "-" "-" 9 "luk-a')   # обрезана
+        self.assertEqual(self.site_errors(old, new), "luk-app: 502 — 3, 504 — 1; med-api: 500 — 2\n")
+        self.assertEqual(self.site_errors(old), "luk-app: 502 — 1; med-api: 500 — 1\n")      # только вчерашний файл
+
+    def test_site_errors_none_absent_or_unknown_format(self):
+        ok = self.access(self.T, 200, "luk-app@docker") + self.access(self.T, 404, "med-www@docker")
+        self.assertEqual(self.site_errors(new=ok), "нет\n")
+        self.assertEqual(self.site_errors("", ""), "нет\n")                                 # пустые файлы
+        self.assertEqual(self.site_errors(), "absent\n")                                    # журнала нет: пусто и код 1
+        self.assertEqual(self.site_errors(new=self.access(self.T, 502, "luk-app@docker"), STUB_LABELS="",
+                                          STUB_SICK_LABELS=""), "нет\n")                    # Docker пуст: своих роутеров нет
+        json = '{"RouterName":"luk-app@docker","DownstreamStatus":502,"StartUTC":"2026-10-24T08:00:00Z"}\n'
+        self.assertRegex(self.site_errors(new=json * 3), r"^журнал не разобран \(сменился формат Traefik\?\) — "
+                                                         r"sudo tail .*/access\.log\n$")
+
+    def test_site_errors_top_five(self):
+        labels = "".join(f"traefik.http.routers.r{i}.rule=Host(`r{i}.example.com`)\n" for i in range(1, 7))
+        new = "".join(self.access(self.T, 500 + i % 2 * 3, f"r{i}@docker") * i for i in range(1, 7))
+        self.assertEqual(self.site_errors(new=new, STUB_LABELS=labels),
+                         "r6: 500 — 6; r5: 503 — 5; r4: 500 — 4; r3: 503 — 3; r2: 500 — 2\n")
+
+    def test_site_errors_hostile_journal(self):
+        # Журнал пишет Traefik по запросам посетителей: кавычки, $(…), обратные кавычки, перевод строки, огромная строка,
+        # байты не UTF-8 и битый JSON не исполняются и не ломают счёт; в сообщение — только имена своих роутеров и числа
+        a, mark = self.access, self.dir / "pwned"
+        cmd = f"$(touch {mark})`touch {mark}`;touch {mark}"
+        journal = (a(self.T, 502, "luk-app@docker", f'GET /{cmd}"\'$IFS HTTP/1.1').encode()     # свой роутер — в счёт
+                   + a(self.T, 502, f"{cmd}@docker").encode()                                  # не свой — мимо
+                   + a(self.T, 500, "evil.example.com@docker").encode()
+                   + b'garbage "quoted" [24/Oct/2026:08:00:00 +0000] "\n'
+                   + b'{"RouterName":"luk-app@docker","DownstreamStatus":502,\n'                 # битый JSON
+                   + a(self.T, 502, "luk-app@docker", "GET /" + "A" * 3_000_000 + " HTTP/1.1").encode()   # 3 МБ
+                   + b'192.0.2.7 - - [24/Oct/2026:08:00:00 +0000] "GET /a\n'                     # строка, разорванная
+                   + b'b HTTP/1.1" 502 11 "-" "-" 7 "luk-app@docker" "http://172.18.0.5:80" 0ms\n'   # переводом строки
+                   + b"\xff\xfe\x00\x1b[31m" + a(self.T, 502, "med-www@docker").encode()       # мусор в начале — мимо
+                   + a(self.T, 503, "med-www@docker", "GET /\xff\xfe‮ HTTP/1.1").encode("utf-8", "surrogateescape")
+                   + b"\x00" * 1000 + b"\n")
+        start = time.monotonic()
+        self.assertEqual(self.site_errors(new=journal), "luk-app: 502 — 2; med-www: 503 — 1\n")
+        self.site_errors(new=journal, call="summary")
+        self.assertLess(time.monotonic() - start, 20)
+        self.assertFalse(mark.exists())
+        [msg] = self.messages()
+        self.assertIn("\nНагрузка: ", msg)
+        self.assertRegex(msg, r"\nНагрузка: [^\n]*\nОшибки сайтов за сутки \(5xx\): luk-app: 502 — 2; med-www: 503 — 1\n"
+                              r"Бэкап: ")
+        for bad in ("touch", "pwned", "evil", "192.0.2.7", "AAAA", "GET", "/a", "http", "@", '"', "$", "`"):
+            self.assertNotIn(bad, msg)
+
+    def test_summary_without_journal_has_no_errors_line(self):
+        self.site_errors(call="summary")
+        [msg] = self.messages()
+        self.assertNotIn("Ошибки сайтов", msg)
+        self.assertRegex(msg, r"\nНагрузка: [^\n]*\nБэкап: ")
+        self.assertIn("\n  collect_sites\n  collect_routers\ndone\n", self.SCRIPT.read_text())   # роутеры — с каждого Docker
+
 
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class SignedUpgrade(unittest.TestCase):

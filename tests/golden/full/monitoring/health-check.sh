@@ -6,7 +6,8 @@
 #   health-check.sh --notify   — каждые 10 минут (health-check.timer): в Telegram (infra-notify) —
 #                                только что появилось и что прошло; пинг monitor_healthcheck_url
 #   health-check.sh --summary  — раз в день (health-check-summary.timer): сводка в Telegram —
-#                                всё в порядке или список проблем; диски, нагрузка, память, бэкап.
+#                                всё в порядке или список проблем; диски, нагрузка, память,
+#                                ошибки сайтов за сутки, бэкап.
 #                                Нет утренней сводки — сервер лежит
 # Та же проблема с другими числами (диск 85% → 86%) — не новая: сравнивается «что» без цифр.
 # Выросла до критичной — новая: в тексте появляется «КРИТИЧНО».
@@ -21,6 +22,7 @@ DISK_CRITICAL=90    # с этого заполнения ночной бэкап
 MEM_LIMIT=10
 BACKUP_REPO=/var/backups/restic
 ACME=/srv/infra/traefik/acme/acme.json
+TRAEFIK_LOGS=${HEALTH_TRAEFIK_LOGS:-/srv/infra/traefik/logs}   # журнал запросов Traefik: ошибки сайтов за сутки (--summary)
 PROJECTS=" api_one api_two blog crm lab shop static "     # проекты сервера; пробелы по краям — для поиска " имя "
 UPDATE_CMD="sudo infra update"
 EVENTS=/var/log/infra.log                      # журнал событий: итог ночного бэкапа
@@ -350,6 +352,14 @@ collect_sites() {
     grep -o 'Host([^)]*)' | grep -o '`[^`]*`' | tr -d '`' | sort -u)$'\n'
 }
 
+# Имена роутеров Traefik из labels работающих контейнеров, и больных тоже: только их ошибки — в сводке (site_errors).
+# Имя — буквы, цифры, «-» и «_»: другое в сводку не попадает
+SITE_ROUTERS=""
+collect_routers() {
+  SITE_ROUTERS+=$(docker ps --filter status=running --format '{{.Labels}}' 2>/dev/null |
+    grep -o 'traefik\.http\.routers\.[A-Za-z0-9_-]*\.' | cut -d. -f4 | sort -u)$'\n'
+}
+
 # Сбой — повтор через 10 с: выкладка контейнера без healthcheck — не тревога. Сначала домены общего
 # Docker, потом проектов без root: сверх SITES_MAX — не проверены, строкой в подробностях
 check_sites() {
@@ -530,18 +540,70 @@ ping_healthchecks() {
   fi
 }
 
-# --summary: раз в день — всё в порядке или проблемы; диски, нагрузка, память, последний бэкап
+# Ошибки сайтов с <ГГГГММДДччммсс UTC> (--summary): ответы 5xx по роутерам Traefik из журнала запросов — access.log.1
+# (вчерашний, не сжат: delaycompress) и access.log; ротация чаще раза в сутки (maxsize) — число меньше настоящего.
+# Строку журнала пишет Traefik по запросу посетителя — путь в ней чужой. Берутся время (UTC, +0000) и хвост, который
+# пишет только Traefik: код, размер, "-" "-" (Referer и User-Agent не пишутся: accessLog без fields), номер запроса,
+# роутер, адрес бэкенда, время ответа. Роутер — только из labels контейнеров сервера (SITE_ROUTERS), иначе мимо;
+# адреса, пути и посетители в вывод не попадают. Вывод — до пяти сайтов с наибольшим числом:
+# «luk-app: 502 — 3, 504 — 1; med-api: 500 — 2»; 5xx нет — «нет»; ни одной строки не разобрать — «журнал не разобран…»;
+# нет файлов журнала — пусто и код 1. Только POSIX awk: на сервере mawk
+site_errors() {
+  local files=() f out
+  for f in "$TRAEFIK_LOGS/access.log.1" "$TRAEFIK_LOGS/access.log"; do [ -f "$f" ] && files+=("$f"); done
+  [ ${#files[@]} -gt 0 ] || return 1
+  out=$(LC_ALL=C awk -v cutoff="$1" -v routers="${SITE_ROUTERS//$'\n'/ }" '
+    BEGIN {
+      split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", m, " ")
+      for (i = 1; i <= 12; i++) mon[m[i]] = sprintf("%02d", i)
+      k = split(routers, r, " "); for (i = 1; i <= k; i++) if (r[i] ~ /^[A-Za-z0-9_-]+$/) own[r[i]] = 1
+    }
+    # 127.0.0.1 - - [24/Oct/2026:08:30:58 +0000] "GET /a HTTP/1.1" 502 11 "-" "-" 13 "luk-app@docker" "http://172.18.0.5:80" 0ms
+    !match($0, /^[^[]*\[[0-3][0-9]\/[A-Z][a-z][a-z]\/[0-9][0-9][0-9][0-9]:[0-2][0-9]:[0-5][0-9]:[0-6][0-9] \+0000\] "/) { next }
+    {
+      t = substr($0, RSTART + RLENGTH - 29, 20)                 # 24/Oct/2026:08:30:58 → 20261024083058
+      if (!(substr(t, 4, 3) in mon)) next
+      ts = substr(t, 8, 4) mon[substr(t, 4, 3)] substr(t, 1, 2) substr(t, 13, 2) substr(t, 16, 2) substr(t, 19, 2)
+    }
+    !match($0, /" [1-5][0-9][0-9] [0-9]+ "-" "-" [0-9]+ "[^"]*" "[^"]*" [0-9]+ms$/) { next }
+    {
+      ok++
+      code = substr($0, RSTART + 2, 3)
+      if (ts < cutoff || code < 500) next
+      s = substr($0, RSTART); match(s, /"[^"]*" "[^"]*" [0-9]+ms$/)
+      name = substr(s, RSTART + 1); name = substr(name, 1, index(name, "\"") - 1); sub(/@[a-z]+$/, "", name)
+      if (!(name in own)) next
+      n[name]++; c[name, code]++
+    }
+    END {
+      if (NR && !ok) { print "?"; exit }
+      for (name in n) {
+        s = ""
+        for (k = 500; k <= 599; k++) if ((name, k) in c) s = s (s == "" ? "" : ", ") k " — " c[name, k]
+        printf "%d\t%s: %s\n", n[name], name, s
+      }
+    }' "${files[@]}" 2>/dev/null | sort -t "$(printf '\t')" -k1,1nr -k2,2 | head -5 | cut -f2)
+  case $out in
+    "") echo "нет" ;;
+    "?") echo "журнал не разобран (сменился формат Traefik?) — sudo tail $TRAEFIK_LOGS/access.log" ;;
+    *) printf '%s\n' "$out" | paste -sd ';' - | sed 's/;/; /g' ;;
+  esac
+}
+
+# --summary: раз в день — всё в порядке или проблемы; диски, нагрузка, память, ошибки сайтов, последний бэкап
 summary() {
-  local head disks load15 mem backup
+  local head disks load15 mem errors backup
   if [ -z "$PROBLEMS" ]; then head="✅ $SERVER: всё в порядке"; else head="⚠️ $SERVER: проблемы"; fi
   disks=$(df --output=target,pcent -x tmpfs -x devtmpfs -x overlay -x squashfs | tail -n +2 | awk '{printf "%s %s, ", $1, $2}')
   read -r _ _ load15 _ < /proc/loadavg
   mem=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%.1f из %.1f ГБ", a / 1048576, t / 1048576 }' /proc/meminfo)
+  errors=$(site_errors "$(date -u -d '24 hours ago' +%Y%m%d%H%M%S)") && errors="
+Ошибки сайтов за сутки (5xx): $errors"
   backup=$(grep ' бэкап: ' "$EVENTS" 2>/dev/null | tail -1 \
            | awk '{ t = $1 " " substr($2, 1, 5); $1 = $2 = $3 = ""; sub(/^ +/, ""); print $0 " (" t ")" }')
   infra-notify "$head
 Диски: ${disks%, }
-Нагрузка: $load15 при $(nproc) CPU · свободно памяти $mem
+Нагрузка: $load15 при $(nproc) CPU · свободно памяти $mem$errors
 Бэкап: ${backup:-записей ещё нет}${PROBLEMS:+
 $(render "$PROBLEMS")}"
 }
@@ -568,6 +630,7 @@ for DOCKER_HOST in "" $(jq -r '[.[].sock] | unique[]' /usr/local/etc/infra-rootl
   check_orphan_volumes
   check_certificates
   collect_sites
+  collect_routers
 done
 unset DOCKER_HOST
 check_sites
