@@ -540,11 +540,15 @@ ping_healthchecks() {
   fi
 }
 
-# Ошибки сайтов с <ГГГГММДДччммсс UTC> (--summary): ответы 5xx по роутерам Traefik из журнала запросов — access.log.1
-# (вчерашний, не сжат: delaycompress) и access.log; ротация чаще раза в сутки (maxsize) — число меньше настоящего.
-# Строку журнала пишет Traefik по запросу посетителя — путь в ней чужой. Берутся время (UTC, +0000) и хвост, который
-# пишет только Traefik: код, размер, "-" "-" (Referer и User-Agent не пишутся: accessLog без fields), номер запроса,
-# роутер, адрес бэкенда, время ответа. Роутер — только из labels контейнеров сервера (SITE_ROUTERS), иначе мимо;
+# Ошибки сайтов с <ГГГГММДДччммсс UTC> до <ГГГГММДДччммсс UTC> (--summary): ответы 5xx по роутерам Traefik из журнала
+# запросов — access.log.1 (вчерашний, не сжат: delaycompress) и access.log; ротация чаще раза в сутки (maxsize) — число
+# меньше настоящего. Строку журнала пишет Traefik по запросу посетителя — путь в ней чужой. Берутся время (UTC, +0000)
+# и хвост, который пишет только Traefik: код, размер, "-" "-" (Referer и User-Agent не пишутся: заголовков в accessLog
+# нет), номер запроса, роутер, адрес бэкенда, время ответа. Целую строку посетитель дописал бы именем пользователя
+# из адреса (http://a%0a<строка>%0ab@сайт/ — Traefik пишет его как есть, %0a — перевод строки): его Traefik не пишет
+# (accessLog.fields.names.ClientUsername: drop, роль traefik) — счёт держится на этой настройке. Строки позже второй
+# границы (дата из будущего считалась бы в каждой сводке до ротации) — мимо; без неё — без верхней границы.
+# Роутер — только из labels контейнеров сервера (SITE_ROUTERS), иначе мимо;
 # адреса, пути и посетители в вывод не попадают. Вывод — до пяти сайтов с наибольшим числом:
 # «luk-app: 502 — 3, 504 — 1; med-api: 500 — 2»; 5xx нет — «нет»; ни одной строки не разобрать — «журнал не разобран…»;
 # нет файлов журнала — пусто и код 1. Только POSIX awk: на сервере mawk
@@ -552,7 +556,7 @@ site_errors() {
   local files=() f out
   for f in "$TRAEFIK_LOGS/access.log.1" "$TRAEFIK_LOGS/access.log"; do [ -f "$f" ] && files+=("$f"); done
   [ ${#files[@]} -gt 0 ] || return 1
-  out=$(LC_ALL=C awk -v cutoff="$1" -v routers="${SITE_ROUTERS//$'\n'/ }" '
+  out=$(LC_ALL=C awk -v cutoff="$1" -v until="${2:-99991231235959}" -v routers="${SITE_ROUTERS//$'\n'/ }" '
     BEGIN {
       split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", m, " ")
       for (i = 1; i <= 12; i++) mon[m[i]] = sprintf("%02d", i)
@@ -569,7 +573,7 @@ site_errors() {
     {
       ok++
       code = substr($0, RSTART + 2, 3)
-      if (ts < cutoff || code < 500) next
+      if (ts < cutoff || ts > until || code < 500) next
       s = substr($0, RSTART); match(s, /"[^"]*" "[^"]*" [0-9]+ms$/)
       name = substr(s, RSTART + 1); name = substr(name, 1, index(name, "\"") - 1); sub(/@[a-z]+$/, "", name)
       if (!(name in own)) next
@@ -597,7 +601,7 @@ summary() {
   disks=$(df --output=target,pcent -x tmpfs -x devtmpfs -x overlay -x squashfs | tail -n +2 | awk '{printf "%s %s, ", $1, $2}')
   read -r _ _ load15 _ < /proc/loadavg
   mem=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%.1f из %.1f ГБ", a / 1048576, t / 1048576 }' /proc/meminfo)
-  errors=$(site_errors "$(date -u -d '24 hours ago' +%Y%m%d%H%M%S)") && errors="
+  errors=$(site_errors "$(date -u -d '24 hours ago' +%Y%m%d%H%M%S)" "$(date -u -d '5 minutes' +%Y%m%d%H%M%S)") && errors="
 Ошибки сайтов за сутки (5xx): $errors"
   backup=$(grep ' бэкап: ' "$EVENTS" 2>/dev/null | tail -1 \
            | awk '{ t = $1 " " substr($2, 1, 5); $1 = $2 = $3 = ""; sub(/^ +/, ""); print $0 " (" t ")" }')

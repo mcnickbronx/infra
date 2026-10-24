@@ -659,6 +659,26 @@ if [ "$*" = "-u -d 24 hours ago +%Y%m%d%H%M%S" ]; then echo 20261024000000; else
         self.assertEqual(self.site_errors(new=new, STUB_LABELS=labels),
                          "r6: 500 — 6; r5: 503 — 5; r4: 500 — 4; r3: 503 — 3; r2: 500 — 2\n")
 
+    def test_site_errors_future_lines_skipped(self):
+        # Строка со временем из будущего (своя или чужая) считалась бы в каждой сводке, пока файл не уйдёт ротацией:
+        # до верхней границы — в счёт, позже — мимо; сводка ставит границу «сейчас + 5 минут»
+        a = self.access
+        new = (a("24/Oct/2026:09:05:00", 502, "luk-app@docker")              # ровно граница — в счёт
+               + a("24/Oct/2026:09:05:01", 504, "luk-app@docker")            # на секунду позже — мимо
+               + a("01/Jan/2099:00:00:00", 500, "med-www@docker") * 3)
+        self.assertEqual(self.site_errors(new=new, call="site_errors 20261024000000 20261024090500"),
+                         "luk-app: 502 — 1\n")
+        self.DATE = """#!/bin/bash
+case "$*" in
+  "-u -d 24 hours ago +%Y%m%d%H%M%S") echo 20261024000000 ;;
+  "-u -d 5 minutes +%Y%m%d%H%M%S") echo 20261024090500 ;;
+  *) exec /bin/date "$@" ;;
+esac
+"""
+        self.site_errors(new=new, call="summary")
+        [msg] = self.messages()
+        self.assertIn("\nОшибки сайтов за сутки (5xx): luk-app: 502 — 1\nБэкап: ", msg)
+
     def test_site_errors_hostile_journal(self):
         # Журнал пишет Traefik по запросам посетителей: кавычки, $(…), обратные кавычки, перевод строки, огромная строка,
         # байты не UTF-8 и битый JSON не исполняются и не ломают счёт; в сообщение — только имена своих роутеров и числа
