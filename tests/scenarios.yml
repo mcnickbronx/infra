@@ -11,6 +11,7 @@
 #      Том со своим name: — бэкап громко не удаётся.
 #   3. Проект в Docker: сеть, доступ к базе из .env, вход в свою базу и отказ в чужую, лимиты;
 #      приложение (uid 1000) пишет в папку, которую участник создал, как автовыкладка;
+#      восстановление поверх запущенного проекта — отказ, не начато;
 #      health-check замечает compose без extends, том со своим name:, web/ в контейнере на запись,
 #      нездоровый контейнер (и infra status) и SSH мимо белого списка (правило ufw без пометки), уведомление (--notify) —
 #      только о новом и прошедшем (прошедшее — спустя 30 минут), сводка (--summary), при недоступном
@@ -305,6 +306,30 @@
           - r.memory | int > 0
           - r.write == 'ok'
           - "'bind:/files' in r.mounts"
+        fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
+        quiet: true
+
+    # shop запущен: project-restore отказывает с командой остановки, восстановление не начато
+    - name: "3. Восстановление поверх запущенного проекта"
+      ansible.builtin.shell: |
+        set -uo pipefail
+        n0=$(wc -l < /var/log/infra.log)
+        out=$(project-restore shop 2>&1); echo "rc=$?"
+        echo "said=$(grep -c 'project-compose shop down' <<<"$out")"
+        echo "started=$(tail -n +$((n0 + 1)) /var/log/infra.log | grep -c 'восстановление shop: начато')"
+      args:
+        executable: /bin/bash
+      register: restore_running
+      changed_when: false
+
+    - name: "3. Запущенный проект не восстанавливается поверх — отказ"
+      vars:
+        r: "{{ dict(restore_running.stdout_lines | map('split', '=', 1)) }}"
+      ansible.builtin.assert:
+        that:
+          - r.rc == '1'
+          - r.said == '1'
+          - r.started == '0'
         fail_msg: "{{ r | to_json(ensure_ascii=false) }}"
         quiet: true
 

@@ -1864,6 +1864,114 @@ class ProjectDbEnv(unittest.TestCase):
         self.assertEqual(self.leftovers(), [])
 
 
+@unittest.skipUnless(shutil.which("jq"), "нужен jq")
+class ProjectRestoreGuard(unittest.TestCase):
+    """project-restore не идёт поверх запущенного проекта и не пересекается с автовыкладкой: сначала замок выкладки
+    (/var/lib/project-deploy/<проект>.lock, ждёт до 30 с), потом контейнеры проекта в его Docker; замок не дождался,
+    контейнеры запущены, Docker не ответил — отказ до restic. Стенд: скрипт со списком проектов и папкой замков
+    во временной папке, env restic — пустой файл стенда; flock, docker, project-docker-host, infra-log, restic —
+    заглушки, пишут строку в журнал стенда. restic отдаёт пустой список снимков: дальше скрипт останавливается
+    сам («Снимок не найден»; в bash 3.2 на Mac — раньше, на mapfile) — это уже не проверка остановки."""
+
+    STUBS = {
+        # flock <ключи> <дескриптор>: код — STUB_LOCK_RC (1 — замок не дождались)
+        "flock": '#!/bin/sh\necho "flock $*" >> "$STUB_LOG"\nexit "${STUB_LOCK_RC:-0}"\n',
+        # docker ps …: печатает STUB_RUNNING (контейнеры проекта), код — STUB_DOCKER_RC (1 — Docker не ответил);
+        # в журнал — и DOCKER_HOST, с которым его позвали (unset — не задан)
+        "docker": '#!/bin/sh\necho "docker $* DOCKER_HOST=${DOCKER_HOST-unset}" >> "$STUB_LOG"\n'
+                  '[ -z "${STUB_RUNNING:-}" ] || printf "%s\\n" "$STUB_RUNNING"\nexit "${STUB_DOCKER_RC:-0}"\n',
+        # Docker проекта: STUB_SOCK — сокет Docker проекта без root, пусто — общий
+        "project-docker-host": '#!/bin/sh\necho "${STUB_SOCK:-}"\n',
+        "infra-log": '#!/bin/sh\necho "infra-log $*" >> "$STUB_LOG"\n',
+        "restic": '#!/bin/sh\necho "restic $*" >> "$STUB_LOG"\necho "[]"\n',
+    }
+    PS = "docker ps -q --filter label=com.docker.compose.project=shop"
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.bin, self.locks = self.dir / "bin", self.dir / "locks"
+        for d in (self.bin, self.locks):
+            d.mkdir()
+        for name, text in self.STUBS.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        projects = self.dir / "projects.json"
+        projects.write_text('[{"name":"shop","db":"postgres"}]\n')
+        script = (ROOT / "roles/backup/files/project-restore").read_text()
+        for old, new in (("/etc/restic/projects.json", f'"{projects}"'), ("/var/lib/project-deploy", f'"{self.locks}"')):
+            if old not in script:
+                raise AssertionError(f"в project-restore нет «{old}» — стенду нечего подменить")
+            script = script.replace(old, new)
+        self.script = self.dir / "project-restore"
+        self.script.write_text(script)
+        self.restic_env = self.dir / "env"
+        self.restic_env.write_text("")
+        self.log = self.dir / "log"
+
+    def restore(self, name="shop", **stubs):
+        env = {k: v for k, v in os.environ.items() if k != "DOCKER_HOST"}
+        env.update(PATH=f"{self.bin}:{os.environ['PATH']}", STUB_LOG=str(self.log), **stubs)
+        run = subprocess.run(["bash", str(self.script), name, str(self.restic_env)], env=env, cwd=self.dir,
+                             capture_output=True, text=True)
+        lines = self.log.read_text().splitlines() if self.log.exists() else []
+        return run, [x for x in lines if not x.startswith("infra-log ")], lines
+
+    def assertRefused(self, run, lines, text):
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn(text, run.stderr)
+        self.assertIn("ничего не менял", run.stderr)
+        self.assertFalse([x for x in lines if x.startswith("restic ")], lines)
+
+    def test_running_project_refused(self):
+        run, calls, lines = self.restore(STUB_RUNNING="abc123")
+        self.assertRefused(run, calls, "Проект shop запущен — остановите: sudo project-compose shop down")
+        self.assertEqual(calls, ["flock -w 30 9", f"{self.PS} DOCKER_HOST=unset"])   # замок — первым, Docker — общий
+        self.assertFalse([x for x in lines if "начато" in x], lines)
+        self.assertTrue((self.locks / "shop.lock").exists())
+
+    def test_deploy_lock_busy_refused_before_docker(self):
+        run, calls, _ = self.restore(STUB_LOCK_RC="1")
+        self.assertRefused(run, calls, "shop: идёт выкладка")
+        self.assertEqual(calls, ["flock -w 30 9"])
+
+    def test_rootless_project_checked_in_its_docker(self):
+        sock = "unix:///run/user/1001/docker.sock"
+        run, calls, _ = self.restore(STUB_SOCK=sock, STUB_RUNNING="abc123")
+        self.assertRefused(run, calls, "project-compose shop down")
+        self.assertIn(f"{self.PS} DOCKER_HOST={sock}", calls)
+        # Docker проекта без root ведёт его пользователь — ответ для root только данные: ничего не исполняется
+        run, calls, _ = self.restore(STUB_SOCK=sock, STUB_RUNNING="$(touch pwned)\n`touch pwned`\n../../etc/passwd")
+        self.assertRefused(run, calls, "project-compose shop down")
+        self.assertFalse((self.dir / "pwned").exists())
+
+    def test_docker_silent_refused(self):
+        run, calls, _ = self.restore(STUB_DOCKER_RC="1")
+        self.assertRefused(run, calls, "Docker не ответил — не могу проверить, что проект shop остановлен")
+
+    def test_stopped_project_goes_on_under_lock(self):
+        run, calls, _ = self.restore()
+        self.assertNotIn("ничего не менял", run.stderr)
+        self.assertEqual(calls[:2], ["flock -w 30 9", f"{self.PS} DOCKER_HOST=unset"])
+        self.assertTrue(calls[2].startswith("restic snapshots --json --tag project:shop"), calls)
+        self.assertTrue((self.locks / "shop.lock").exists())
+
+    def test_no_deploy_dir_no_lock(self):
+        self.locks.rmdir()                                        # нет автовыкладки на сервере — нет и замка
+        run, calls, _ = self.restore(STUB_RUNNING="abc123")
+        self.assertRefused(run, calls, "project-compose shop down")
+        self.assertEqual(calls, [f"{self.PS} DOCKER_HOST=unset"])
+        self.assertFalse(self.locks.exists())
+
+    def test_unknown_project_refused_before_lock(self):
+        run, calls, _ = self.restore("../x")                      # имя — путь: замок по нему не создаётся
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("не описан на этом сервере", run.stderr)
+        self.assertEqual(calls, [])
+        self.assertEqual(list(self.locks.iterdir()), [])
+        self.assertFalse((self.dir / "x.lock").exists())
+
+
 class SettingsDiffMasked(unittest.TestCase):
     """infra: diff server.yml в журнале событий — полный apply (log_settings_change в run-unit) и infra edit
     (changes: экран и журнал). Значения ключей с token, password, secret… — ***, остальное и открытые ключи
