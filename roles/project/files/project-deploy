@@ -117,16 +117,48 @@ restore() {
 }
 
 # Папки проекта, которые монтирует compose: нет — создать с записью для группы, как web/
-# (иначе их создаст Docker от root, и приложение не сможет туда писать). install -d, а не mkdir:
-# mkdir из uutils 0.8 (Ubuntu 26.04) в папке с setgid создаёт 7775 — setuid и sticky,
-# и chmod 2770 setuid у папки не снимает Сервисы — и запущенные,
-# и deploy: --profile в команде заменяет профили из .env, поэтому два прохода
+# (иначе их создаст Docker от root, и приложение не сможет туда писать).
+# web/ пишут участники: часть пути тома может быть ссылкой (web/a → чужая папка, том ./a/b) —
+# install -d/mkdir -p прошли бы по ней и создали папку в ЧУЖОЙ папке от root. Поэтому путь тома
+# создаём по одной части от $WEB вниз (make_dir_nofollow): любая часть — ссылка → отказ и выход 1
+# (выкладка не идёт, сообщение называет путь), а не переход по ней.
+# Сервисы — и запущенные, и deploy: --profile в команде заменяет профили из .env, поэтому два прохода
 make_dirs() {
   { compose config --format json; compose --profile deploy config --format json; } |
     jq -r '.services[].volumes[]? | select(.type == "bind") | .source' |
     sort -u | while read -r d; do
-      case $d in "$WEB"/*) [ -e "$d" ] || install -d -m 2770 "$d" || exit 1 ;; esac
+      case $d in "$WEB"/*) make_dir_nofollow "$d" || exit 1 ;; esac
     done
+}
+
+# Создать папку тома $1 (она под $WEB), не идя по ссылке в web/. Путь разбираем на части
+# и спускаемся от $WEB: каждую недостающую часть — отдельным mkdir (он не идёт по ссылке на самой
+# создаваемой части, в отличие от install -d/mkdir -p по всему пути). Любая часть пути — ссылка
+# или не папка → отказ. Режим 2770 — только у созданной конечной папки, как было у install -d -m:
+# mkdir ставит режим по umask и setgid родителя, chmod 2770 доводит до 2770 (setuid у свежей папки
+# нет — правило chmod о сохранении setuid/setgid на папках его не внесёт)
+make_dir_nofollow() {
+  local d=$1 cur=$WEB part rel
+  rel=${d#"$WEB"/}
+  while [ -n "$rel" ]; do
+    part=${rel%%/*}
+    case $rel in */*) rel=${rel#*/} ;; *) rel= ;; esac   # rel опустел → part был последней частью
+    case $part in
+      '' | .) continue ;;
+      ..) echo "$NAME: путь тома «${d}» содержит .. — папку не создаю" >&2; return 1 ;;
+    esac
+    cur=$cur/$part
+    if [ -L "$cur" ]; then
+      echo "$NAME: путь тома $d идёт через ссылку $cur — папку не создаю (web/ пишут участники; замените ссылку папкой)" >&2
+      return 1
+    fi
+    if [ -e "$cur" ]; then
+      [ -d "$cur" ] || { echo "$NAME: $cur — не папка" >&2; return 1; }
+    else
+      mkdir "$cur" || return 1
+      [ -n "$rel" ] || chmod 2770 "$cur"                 # конечную часть создали мы — режим на ней
+    fi
+  done
 }
 
 up() { compose up -d --wait --wait-timeout 180 --remove-orphans; }

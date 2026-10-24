@@ -1471,6 +1471,42 @@ esac
         self.assertIn(f"docker pull -q {self.REPO}@{self.NEW}", lines)
         self.assertEqual(self.state("current"), f"{self.REPO}@{self.NEW}")
 
+    # --- Папки томов (make_dirs): root не создаёт их по ссылке в web/ (web/ пишут участники) ---
+    def volume_source(self, source):
+        """project-compose config --format json отдаёт один bind-том с источником source — так его
+        видит make_dirs; current стираем, чтобы выкладка новой версии дошла до roll_out → make_dirs"""
+        (self.bin / "project-compose").write_text(
+            '#!/bin/bash\necho "project-compose $*" >> "$STUB_LOG"\n'
+            'case "$*" in\n'
+            f'  *"config --format json") printf \'{{"services":{{"a":{{"volumes":[{{"type":"bind","source":"%s"}}]}}}}}}\' "{source}" ;;\n'
+            '  *"config --services") echo api ;;\n'
+            'esac\n')
+        (self.bin / "project-compose").chmod(0o755)
+        (self.states / "shop.current").unlink()
+
+    def test_volume_dir_through_link_not_created(self):
+        # Участник кладёт в web/ ссылку web/a на чужую папку, в compose — том ./a/b. make_dirs не
+        # должен создать b в чужой папке: промежуточная часть пути тома — ссылка. На main install -d
+        # идёт по ней и создаёт foreign/b (красный); с заплаткой — отказ и выкладка не идёт
+        foreign = self.dir / "foreign"
+        foreign.mkdir()
+        (self.web / "a").symlink_to(foreign)
+        self.volume_source(f"{self.web}/a/b")
+        run, lines = self.deploy()
+        self.assertFalse((foreign / "b").exists(), "root создал папку в чужой папке через ссылку web/a")
+        self.assertTrue((self.web / "a").is_symlink())            # ссылку не тронул
+        self.assertEqual(run.returncode, 1, run.stderr)           # выкладка остановлена
+        self.assertIn("идёт через ссылку", run.stderr)
+
+    def test_volume_dirs_created_normally(self):
+        # Обычный вложенный том ./media/cache (без ссылок) создаётся как прежде, выкладка идёт
+        self.volume_source(f"{self.web}/media/cache")
+        run, lines = self.deploy()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        cache = self.web / "media" / "cache"
+        self.assertTrue(cache.is_dir() and not cache.is_symlink())
+        self.assertEqual(os.stat(cache).st_mode & 0o770, 0o770)   # запись для группы (setgid стенд Mac снимает)
+
 
 def open_fifo_writer(path):
     """Открыть FIFO на запись без ожидания и закрыть: читатель, который ждёт писателя, получает конец файла.
