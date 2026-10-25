@@ -7,7 +7,7 @@
 #                                только что появилось и что прошло; пинг monitor_healthcheck_url
 #   health-check.sh --summary  — раз в день (health-check-summary.timer): сводка в Telegram —
 #                                всё в порядке или список проблем; диски, нагрузка, память,
-#                                ошибки сайтов за сутки, бэкап.
+#                                ошибки сайтов и баны CrowdSec за сутки, бэкап.
 #                                Нет утренней сводки — сервер лежит
 # Та же проблема с другими числами (диск 85% → 86%) — не новая: сравнивается «что» без цифр.
 # Выросла до критичной — новая: в тексте появляется «КРИТИЧНО».
@@ -594,20 +594,52 @@ site_errors() {
   esac
 }
 
-# --summary: раз в день — всё в порядке или проблемы; диски, нагрузка, память, ошибки сайтов, последний бэкап
+# Баны CrowdSec за сутки (--summary): сколько разных адресов забанил сам сервер — всего и по сценариям. cscli alerts list
+# без -a — только свои тревоги, без списков сообщества; -l 0 — все (по умолчанию — не больше 50). В счёт — тревоги
+# с решением ban, кроме simulated; адрес, забаненный несколько раз, — один (бан на 4 часа даёт за сутки несколько тревог).
+# Сценарий — без «crowdsecurity/»; имя не из [A-Za-z0-9_./-] (ручной бан cscli decisions add — «manual 'ban' from '…'»
+# или своя причина) — «другие». Четыре самых частых и http-crawl-non_statics пятым, если был и не вошёл: набирают ли
+# его посетители кабинетов из одного офиса. Адреса посетителей в Telegram (чужой сервис) не уходят — только имена
+# сценариев и числа:
+# «108 адресов — http-probing 67, http-sensitive-files 53, …»; банов нет — «нет»; нет cscli, ошибка, нет ответа
+# за 20 с (LAPI) или ответ не разобран — пусто и код 1
+crowdsec_bans() {
+  local json out
+  command -v cscli >/dev/null || return 1
+  json=$(timeout 20 cscli alerts list --since 24h -l 0 -o json 2>/dev/null) || return 1
+  out=$(jq -r '
+    def addr: if . % 10 == 1 and . % 100 != 11 then "адрес"
+              elif . % 10 >= 2 and . % 10 <= 4 and (. % 100 < 12 or . % 100 > 14) then "адреса" else "адресов" end;
+    map(select(.simulated != true and ((.decisions // []) | any(.type == "ban")))
+        | {ip: .source.value, s: (.scenario // "" | tostring | ltrimstr("crowdsecurity/")
+                                  | if test("^[A-Za-z0-9_./-]+$") then . else "другие" end)})
+    | (map(.ip) | unique | length) as $all
+    | if $all == 0 then "нет" else
+        (group_by(.s) | map({s: .[0].s, n: (map(.ip) | unique | length)}) | sort_by(-.n, .s)) as $by
+        | "\($all) \($all | addr) — " + ($by[:4] + [$by[4:][] | select(.s == "http-crawl-non_statics")]
+                                         | map("\(.s) \(.n)") | join(", "))
+      end' <<<"$json" 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+# --summary: раз в день — всё в порядке или проблемы; диски, нагрузка, память, ошибки сайтов, баны CrowdSec,
+# последний бэкап
 summary() {
-  local head disks load15 mem errors backup
+  local head disks load15 mem errors bans backup
   if [ -z "$PROBLEMS" ]; then head="✅ $SERVER: всё в порядке"; else head="⚠️ $SERVER: проблемы"; fi
   disks=$(df --output=target,pcent -x tmpfs -x devtmpfs -x overlay -x squashfs | tail -n +2 | awk '{printf "%s %s, ", $1, $2}')
   read -r _ _ load15 _ < /proc/loadavg
   mem=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%.1f из %.1f ГБ", a / 1048576, t / 1048576 }' /proc/meminfo)
   errors=$(site_errors "$(date -u -d '24 hours ago' +%Y%m%d%H%M%S)" "$(date -u -d '5 minutes' +%Y%m%d%H%M%S)") && errors="
 Ошибки сайтов за сутки (5xx): $errors"
+  bans=$(crowdsec_bans) && bans="
+Баны CrowdSec за сутки: $bans"
   backup=$(grep ' бэкап: ' "$EVENTS" 2>/dev/null | tail -1 \
            | awk '{ t = $1 " " substr($2, 1, 5); $1 = $2 = $3 = ""; sub(/^ +/, ""); print $0 " (" t ")" }')
   infra-notify "$head
 Диски: ${disks%, }
-Нагрузка: $load15 при $(nproc) CPU · свободно памяти $mem$errors
+Нагрузка: $load15 при $(nproc) CPU · свободно памяти $mem$errors$bans
 Бэкап: ${backup:-записей ещё нет}${PROBLEMS:+
 $(render "$PROBLEMS")}"
 }

@@ -904,6 +904,125 @@ esac
         self.assertRegex(msg, r"\nНагрузка: [^\n]*\nБэкап: ")
         self.assertIn("\n  collect_sites\n  collect_routers\ndone\n", self.SCRIPT.read_text())   # роутеры — с каждого Docker
 
+    # ---------- Баны CrowdSec за сутки (--summary): cscli alerts list -o json ----------
+    # cscli: аргументы — в STUB_CSCLI_LOG, ответ — файл STUB_ALERTS, код — STUB_CSCLI_RC; timeout (GNU timeout на Маке нет) —
+    # аргументы в STUB_TIMEOUT_LOG и команда без ограничения
+    CSCLI = '#!/bin/bash\nprintf "%s\\n" "$*" >> "$STUB_CSCLI_LOG"\ncat "$STUB_ALERTS"\nexit "$STUB_CSCLI_RC"\n'
+    CSCLI_TIMEOUT = '#!/bin/bash\nprintf "%s\\n" "$*" >> "$STUB_TIMEOUT_LOG"\nshift\nexec "$@"\n'
+    MANUAL = "manual 'ban' from 'localhost'"        # имя сценария у ручного бана: cscli decisions add --ip …
+
+    @staticmethod
+    def alert(ip, scenario="crowdsecurity/http-probing", decision="ban", simulated=False, events=1):
+        """Тревога, как в cscli alerts list -o json (CrowdSec v1.8.1, pkg/models/alert.go); decision=None — без решения."""
+        return {"id": 1, "scenario": scenario, "message": f"Ip {ip} performed '{scenario}'", "events_count": events,
+                "capacity": 5, "source": {"scope": "Ip", "value": ip, "ip": ip, "cn": "NL", "as_name": "EXAMPLE"},
+                "decisions": [] if decision is None else [
+                    {"duration": "3h59m", "origin": "crowdsec", "scenario": scenario, "scope": "Ip", "type": decision,
+                     "value": ip}],
+                "simulated": simulated, "created_at": "2026-10-24T06:00:00Z",
+                "events": [{"meta": [{"key": "http_path", "value": "/.env"}]}] * events}
+
+    def bans(self, alerts, rc=0, cscli=True, call="summary", journal=None):
+        """Сводка с заглушкой cscli: alerts — список тревог (в JSON) или ответ как есть; cscli=False — cscli нет.
+        Вернёт сообщение сводки (для другого call — его вывод)."""
+        answer = self.dir / "alerts.json"
+        answer.write_text(alerts if isinstance(alerts, str) else json.dumps(alerts))
+        for name, text in (("timeout", self.CSCLI_TIMEOUT), ("cscli", self.CSCLI)):
+            (self.dir / name).write_text(text)
+            (self.dir / name).chmod(0o755)
+        if not cscli:
+            (self.dir / "cscli").unlink()
+        self.sent.unlink(missing_ok=True)
+        out = self.site_errors(new=journal, call=call, STUB_ALERTS=str(answer), STUB_CSCLI_RC=str(rc),
+                               STUB_CSCLI_LOG=str(self.dir / "cscli.log"), STUB_TIMEOUT_LOG=str(self.dir / "timeout.log"))
+        if call != "summary":
+            return out
+        [msg] = self.messages()
+        return msg
+
+    def test_crowdsec_bans_counted_by_scenario(self):
+        a = self.alert
+        alerts = [a("198.51.100.10"), a("198.51.100.10"),                   # один адрес — две тревоги: один адрес
+                  a("198.51.100.11"),
+                  a("198.51.100.12", "crowdsecurity/http-sensitive-files", simulated=True),   # simulated — мимо
+                  a("198.51.100.13", "crowdsecurity/http-bad-user-agent", decision="captcha"),  # не бан — мимо
+                  a("198.51.100.14", self.MANUAL)]                          # ручной бан — «другие»
+        line = "Баны CrowdSec за сутки: 3 адреса — http-probing 2, другие 1"
+        msg = self.bans(alerts)
+        self.assertRegex(msg, r"\nНагрузка: [^\n]*\n" + line + "\nБэкап: ")
+        msg = self.bans(alerts, journal=self.access(self.T, 502, "luk-app@docker"))
+        self.assertIn("\nОшибки сайтов за сутки (5xx): luk-app: 502 — 1\n" + line + "\nБэкап: ", msg)
+        for bad in ("198.51.100", "crowdsecurity", "manual", "localhost", "'", "sensitive", "bad-user-agent"):
+            self.assertNotIn(bad, msg)
+
+    def test_crowdsec_no_bans(self):
+        self.assertIn("\nБаны CrowdSec за сутки: нет\nБэкап: ", self.bans([]))
+        only_skipped = [self.alert("198.51.100.1", simulated=True), self.alert("198.51.100.2", decision="captcha"),
+                        self.alert("198.51.100.3", decision=None)]
+        self.assertIn("\nБаны CrowdSec за сутки: нет\nБэкап: ", self.bans(only_skipped))
+
+    def test_crowdsec_failed_no_line(self):
+        def rest(msg):          # сводка без строки «Нагрузка» (память и нагрузка меняются между прогонами)
+            return "\n".join(s for s in msg.split("\n") if not s.startswith("Нагрузка: "))
+        journal = self.access(self.T, 502, "luk-app@docker")
+        good = self.bans([self.alert("198.51.100.1")], journal=journal)
+        self.assertIn("\nБаны CrowdSec за сутки: 1 адрес — http-probing 1\n", good)
+        expected = rest(good).replace("\nБаны CrowdSec за сутки: 1 адрес — http-probing 1", "")
+        for case, kwargs in (("код 1", {"alerts": [self.alert("198.51.100.1")], "rc": 1}),
+                             ("не JSON", {"alerts": "level=fatal msg=\"unable to list alerts\"\n"}),
+                             ("пустой ответ", {"alerts": ""}),
+                             ("не список", {"alerts": '{"message": "no alerts"}'}),
+                             ("нет cscli", {"alerts": [], "cscli": False})):    # заглушки нет: на Маке и в CI cscli нет
+            with self.subTest(case):
+                msg = self.bans(journal=journal, **kwargs)
+                self.assertNotIn("CrowdSec", msg)
+                self.assertEqual(rest(msg), expected)
+
+    def test_crowdsec_bans_call(self):
+        self.bans([])
+        self.assertEqual((self.dir / "timeout.log").read_text(), "20 cscli alerts list --since 24h -l 0 -o json\n")
+        self.assertEqual((self.dir / "cscli.log").read_text(), "alerts list --since 24h -l 0 -o json\n")   # без -a
+        # каждые 10 минут (--notify) cscli не зовётся: crowdsec_bans — только объявлена и вызвана в summary
+        script = self.SCRIPT.read_text()
+        self.assertEqual(script.count("crowdsec_bans"), 2)
+        self.assertIn("\ncrowdsec_bans() {\n", script)
+        self.assertIn("\n  bans=$(crowdsec_bans) && ", script.partition("\nsummary() {")[2].partition("\n}\n")[0])
+
+    def test_crowdsec_top_four_and_crawl(self):
+        a, n, mark = self.alert, iter(range(1, 255)), self.dir / "pwned"
+        def many(scenario, count):
+            return [a(f"198.51.100.{next(n)}", f"crowdsecurity/{scenario}") for _ in range(count)]
+        alerts = (many("http-probing", 6) + many("http-sensitive-files", 5) + many("http-bad-user-agent", 4)
+                  + many("ssh-bf", 3) + many("ssh-slow-bf", 2) + many("http-crawl-non_statics", 1)
+                  + [a("198.51.100.1", "crowdsecurity/ssh-bf")])       # адрес из http-probing: в общем числе — один раз
+        self.assertIn("\nБаны CrowdSec за сутки: 21 адрес — http-probing 6, http-sensitive-files 5, http-bad-user-agent 4, "
+                      "ssh-bf 4, http-crawl-non_statics 1\n", self.bans(alerts))    # ssh-slow-bf 2 — шестой, не виден
+        # http-crawl-non_statics среди четырёх — не повторяется; разные ручные причины, имя с $(…) и переводом строки, имени нет —
+        # одни «другие»; адрес с $(…) — один из адресов, не исполняется
+        alerts = (many("http-crawl-non_statics", 3) + many("http-probing", 2) + many("ssh-bf", 1)
+                  + [a("203.0.113.1", self.MANUAL), a("203.0.113.2", "manual 'ban' from 'admin'"),
+                     a("203.0.113.3", f"crowdsecurity/x\n$(touch {mark})`touch {mark}`;"), a(f"$(touch {mark})", None),
+                     a("203.0.113.5", "LePresidente/http-generic-401-bf")])          # чужой автор — с его именем
+        self.assertEqual(self.bans(alerts, call="crowdsec_bans"),
+                         "11 адресов — другие 4, http-crawl-non_statics 3, http-probing 2, LePresidente/http-generic-401-bf 1\n")
+        self.assertFalse(mark.exists())
+        for count, word in ((1, "адрес"), (2, "адреса"), (5, "адресов"), (11, "адресов"), (12, "адресов"), (21, "адрес"),
+                            (22, "адреса")):
+            with self.subTest(count):
+                self.assertEqual(self.bans([a(f"192.0.2.{i}") for i in range(count)], call="crowdsec_bans"),
+                                 f"{count} {word} — http-probing {count}\n")
+
+    def test_crowdsec_300_alerts_fast(self):
+        # по образцу ответа на 300 тревог (CrowdSec v1.8.1): у каждой 10 событий, каждая 50-я — simulated без решения
+        names = ["http-probing", "http-sensitive-files", "http-bad-user-agent", "http-crawl-non_statics", "ssh-bf"]
+        alerts = [self.alert(f"198.51.100.{i % 120}", f"crowdsecurity/{names[i % 5]}", events=10,
+                             **({"decision": None, "simulated": True} if i % 50 == 0 else {})) for i in range(300)]
+        total = len({x["source"]["value"] for x in alerts if not x["simulated"]})
+        start = time.monotonic()
+        msg = self.bans(alerts)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertIn(f"\nБаны CrowdSec за сутки: {total} адресов — ", msg)
+
 
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class SignedUpgrade(unittest.TestCase):
