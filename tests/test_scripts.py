@@ -1648,9 +1648,10 @@ esac
         "chown": PYTHON + "who, path = args\n"
                  "if who.startswith('--reference='): ref = os.stat(who.split('=', 1)[1]); who = f'{ref.st_uid}:{ref.st_gid}'\n"
                  "os.chown(path, *map(int, who.split(':')))\n"
-                 # STUB_RESTORE_ENV — крючок «после чтения, до сверки stat»: участник возвращает прежний .env (тот же inode)
-                 # с <.env>.held на место ссылки — сверка stat подмены не видит, защищает только nofollow у dd
-                 "if os.environ.get('STUB_RESTORE_ENV'):\n"
+                 # STUB_RESTORE_ENV — крючок «после чтения, до сверки stat» (chown временного .env, не compose.yml): участник
+                 # возвращает прежний .env (тот же inode) с <.env>.held на место ссылки — сверка stat подмены не видит,
+                 # защищает только nofollow у dd
+                 "if os.environ.get('STUB_RESTORE_ENV') and '/.env.' in path:\n"
                  "    os.replace(os.environ['STUB_RESTORE_ENV'] + '.held', os.environ['STUB_RESTORE_ENV'])\n",
         "chmod": PYTHON + "how, path = args\n"
                  "os.chmod(path, stat.S_IMODE(os.stat(how.split('=', 1)[1]).st_mode) if how.startswith('--reference=') else int(how, 8))\n",
@@ -1923,7 +1924,7 @@ esac
 
     def test_env_swapped_after_check(self):
         # подменили уже после проверки, перед чтением, — dd с nofollow ссылку не открывает
-        self.swap_env("mktemp", "*", shutil.which("mktemp"))
+        self.swap_env("mktemp", "*/.env.*", shutil.which("mktemp"))       # временный .env, не compose.yml
 
     def test_env_swapped_after_check_and_back_refused(self):
         # подменили ссылкой на чужой файл перед чтением, а прежний .env вернули до сверки stat (тот же inode —
@@ -1935,7 +1936,7 @@ esac
         self.assertIn(f"работает {self.REPO}:{self.HASH}, но .env не записан", run.stderr)
         self.assertEqual((victim.read_text(), victim.stat().st_mode & 0o777), ("victim\n", 0o600))
         self.assertEqual(files_with(self.proj, "victim"), [])
-        self.assertEqual(self.fs("mv"), ["mv compose.yml.new compose.yml"])     # .env не трогали
+        self.assertEqual([x.split()[-1] for x in self.fs("mv")], ["compose.yml"])   # .env не трогали
         self.assertFalse([p.name for p in self.proj.iterdir() if p.name.startswith(".env")])
         held = self.web / ".env.held"
         self.assertEqual((self.env if not self.env.is_symlink() else held).read_text(), self.ENV)
@@ -1972,7 +1973,7 @@ esac
         self.assertIn(f"\nDEPLOY_IMAGE={self.REPO}:{self.HASH}\n", self.env.read_text())
         self.assertEqual(self.env.stat().st_mode & 0o777, 0o640)
         self.assertEqual(self.leftovers(), ["compose.yml"])
-        tmp = self.fs("mktemp")[0].split()[1]
+        [tmp] = [x.split()[1] for x in self.fs("mktemp") if "/.env." in x]
         self.assertEqual(os.path.dirname(tmp), str(self.proj))
         # владелец, ACL и права — с .env на временный файл, затем ещё раз stat .env и mv
         st = self.env.stat()
@@ -1990,7 +1991,7 @@ esac
         self.assertTrue(self.env.is_symlink())
         self.assertEqual(self.leftovers(), ["compose.yml"])
         self.assertEqual(files_with(self.proj, "victim"), [])
-        self.assertEqual(self.fs("mv"), ["mv compose.yml.new compose.yml"])     # .env не трогали
+        self.assertEqual([x.split()[-1] for x in self.fs("mv")], ["compose.yml"])   # .env не трогали
 
     def test_open_project_dir_refused(self):
         # в папку проекта пишет группа: временный .env туда не кладётся — отказ до выкладки, ничего не менял
@@ -2003,6 +2004,90 @@ esac
         self.assertEqual(self.env.read_bytes(), before)
         self.assertEqual(self.leftovers(), [])
         self.assertEqual(lines, [])
+
+    # --- compose.yml из образа (switch_to): во временный файл в папке проекта и на место одним mv ---
+    def plant_compose_new(self, target):
+        """Пока root скачивает образ (крючок в docker pull), участник кладёт в web/ ссылку compose.yml.new на target:
+        это имя root открывал на запись с noclobber, а bash с noclobber отказывает только обычному файлу"""
+        (self.bin / "docker").rename(self.bin / "docker.real")
+        (self.bin / "docker").write_text(f'#!/bin/bash\ncase "$*" in pull*) rm -f compose.yml.new && '
+                                         f'ln -s "{target}" compose.yml.new ;; esac\nexec "{self.bin}/docker.real" "$@"\n')
+        (self.bin / "docker").chmod(0o755)
+
+    def test_compose_new_fifo_link_not_written(self):
+        # ссылка на FIFO — как на устройство (/dev/vda: compose лёг бы в начало диска): читатель FIFO ничего не получает,
+        # compose.yml — обычный файл с compose из образа
+        other = self.dir / "other"
+        other.mkdir(mode=0o700)
+        fifo = other / "fifo"
+        os.mkfifo(fifo)
+        got = []
+        reader = threading.Thread(target=lambda: got.append(fifo.read_bytes()), daemon=True)
+        reader.start()
+        self.plant_compose_new(fifo)
+        run, _ = self.timer()
+        open_fifo_writer(fifo)                                     # никто не писал — читатель получает конец файла
+        reader.join(5)
+        self.assertEqual(b"".join(got), b"", "root записал compose по ссылке compose.yml.new")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        compose = self.web / "compose.yml"
+        self.assertFalse(compose.is_symlink())
+        self.assertIn("image: ${DEPLOY_IMAGE}", compose.read_text())
+        self.assertTrue((self.web / "compose.yml.new").is_symlink())   # ссылку участника root не трогал
+
+    def test_compose_new_link_to_file_untouched(self):
+        # ссылка на чужой обычный файл: его root не переписывал и с noclobber — страховка, чтобы так и осталось
+        victim = victim_file(self.dir)
+        self.plant_compose_new(victim)
+        self.timer()
+        self.assertEqual((victim.read_text(), victim.stat().st_mode & 0o777), ("victim\n", 0o600))
+        self.assertFalse((self.web / "compose.yml").is_symlink())
+
+    def log_mktemp(self):
+        """mktemp — настоящий, в журнал файловых команд: аргументы и созданный файл"""
+        (self.bin / "mktemp").write_text(f'#!/bin/bash\nf=$({shutil.which("mktemp")} "$@") || exit\n'
+                                         'echo "mktemp $* $f" >> "$STUB_FSLOG"\necho "$f"\n')
+        (self.bin / "mktemp").chmod(0o755)
+
+    def test_compose_tmp_in_project_dir(self):
+        # временный файл — mktemp <папка проекта>/compose.yml.XXXXXX, без ключей (так же у .env; mktemp в Ubuntu 26.04 —
+        # uutils); группа — как у web/, права 660 (читают участники и пользователь проекта без root), на место — mv
+        self.log_mktemp()
+        run, _ = self.timer()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        [(_, template, tmp)] = [x.split() for x in self.fs("mktemp")]
+        self.assertEqual(template, f"{self.proj}/compose.yml.XXXXXX")
+        st = self.web.stat()
+        self.assertEqual(self.fs("chown", "chmod", "mv"),
+                         [f"chown {st.st_uid}:{st.st_gid} {tmp}", f"chmod 660 {tmp}", f"mv {tmp} compose.yml"])
+        self.assertEqual((self.web / "compose.yml").stat().st_mode & 0o777, 0o660)
+        self.assertEqual(self.leftovers(), ["compose.yml"])
+
+    def test_compose_tmp_removed_on_failure(self):
+        # docker run не отдал compose (нет /deploy/compose.yml в образе): отказ на шаге «compose.yml из образа»,
+        # временного файла в папке проекта нет, compose.yml прежний
+        (self.web / "compose.yml").write_text("services: {}\n")
+        self.log_mktemp()
+        (self.bin / "docker").write_text(self.DOCKER.replace("  run) printf", "  run) exit 1; printf"))
+        run, _ = self.timer()
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("не удалось на шаге «compose.yml из образа»", run.stderr)
+        [(_, _, tmp)] = [x.split() for x in self.fs("mktemp")]
+        self.assertFalse(os.path.exists(tmp))
+        self.assertEqual(sorted(p.name for p in self.proj.iterdir()), ["web"])
+        self.assertEqual((self.web / "compose.yml").read_text(), "services: {}\n")
+
+    def test_open_project_dir_refused_on_deploy(self):
+        # таймер: в папку проекта пишет группа — временный compose.yml туда не кладётся: отказ на шаге
+        # «compose.yml из образа» до скачивания версии, работает прежняя
+        self.proj.chmod(0o770)
+        run, lines = self.timer()
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn(f"в папку {self.proj} пишет не только root — временный compose.yml туда не кладу", run.stderr)
+        self.assertIn("не удалось на шаге «compose.yml из образа»", run.stderr)
+        self.assertNotIn(f"docker pull -q {self.REPO}@{self.NEW}", lines)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
 
     def test_failed_to_marked_manual(self):
         # сбой ручного to — с пометкой в .failed (по ней health-check не отсылает к журналу таймера), сбой таймера — без
@@ -2346,17 +2431,19 @@ def victim_file(root):
 
 def participant_mktemp(bin_dir, web, victim, swap):
     """mktemp с участником проекта, которому web/ открыта на запись: настоящий mktemp, путь — в журнал файловых
-    команд; затем участник подменяет ссылкой на victim временный файл, если он создан в web/ (swap="tmp"),
-    или сам .env (swap="env"); swap="env-back" — .env откладывает в .env.held, на его место ссылку (вернуть прежний
-    файл до сверки stat — крючок STUB_RESTORE_ENV в chown)"""
+    команд; затем, если это временный .env (.env.XXXXXX; у compose.yml из образа — свой), участник подменяет ссылкой
+    на victim временный файл, если он создан в web/ (swap="tmp"), или сам .env (swap="env"); swap="env-back" — .env
+    откладывает в .env.held, на его место ссылку (вернуть прежний файл до сверки stat — крючок STUB_RESTORE_ENV в chown)"""
     real = os.path.realpath(web)
     (bin_dir / "mktemp").write_text(f"""#!/bin/bash
 f=$({shutil.which("mktemp")} "$@") || exit
 echo "mktemp $f" >> "$STUB_FSLOG"
-case {swap} in
-  tmp) [ "$(cd "$(dirname "$f")" && pwd -P)" != "{real}" ] || {{ rm -f "$f" && ln -s "{victim}" "$f"; }} ;;
-  env) rm -f "{web}/.env" && ln -s "{victim}" "{web}/.env" ;;
-  env-back) {shutil.which("mv")} "{web}/.env" "{web}/.env.held" && ln -s "{victim}" "{web}/.env" ;;
+case $f in */.env.*)
+  case {swap} in
+    tmp) [ "$(cd "$(dirname "$f")" && pwd -P)" != "{real}" ] || {{ rm -f "$f" && ln -s "{victim}" "$f"; }} ;;
+    env) rm -f "{web}/.env" && ln -s "{victim}" "{web}/.env" ;;
+    env-back) {shutil.which("mv")} "{web}/.env" "{web}/.env.held" && ln -s "{victim}" "{web}/.env" ;;
+  esac ;;
 esac
 echo "$f"
 """)
