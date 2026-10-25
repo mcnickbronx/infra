@@ -2179,6 +2179,28 @@ esac
         self.assertEqual(sorted(p.name for p in self.proj.iterdir()), ["web"])
         self.assertEqual((self.web / "compose.yml").read_text(), "services: {}\n")
 
+    def test_compose_tmp_removed_when_killed(self):
+        # выкладку остановили (systemctl stop, Ctrl+C) между mktemp и mv: временного compose.yml.XXXXXX в папке проекта
+        # не остаётся — его убирает trap EXIT, как временный .env у to
+        (self.web / "compose.yml").write_text("services: {}\n")
+        (self.bin / "docker").write_text(self.DOCKER.replace("  run) printf", "  run) kill -TERM $PPID; printf"))
+        run, _ = self.timer()
+        self.assertNotEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(sorted(p.name for p in self.proj.iterdir()), ["web"])
+        self.assertEqual((self.web / "compose.yml").read_text(), "services: {}\n")
+
+    def test_failed_start_restores_previous_compose(self):
+        # обычный откат: запуск не прошёл — compose.yml прежний побайтно (restore возвращает жёсткую ссылку
+        # compose.yml.prev), compose.yml.prev не остаётся; web/compose.yml.new — остаток версий до v2.1.0 — убран
+        before = b"services:\n  api:\n    image: ${DEPLOY_IMAGE}\n    command: old\n"
+        (self.web / "compose.yml").write_bytes(before)
+        (self.web / "compose.yml.new").write_text("services: {stale: {}}\n")
+        run, _ = self.timer(STUB_FAIL_UP="1")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("не удалось на шаге «запуск»", run.stderr)
+        self.assertEqual((self.web / "compose.yml").read_bytes(), before)
+        self.assertEqual(self.leftovers(), ["compose.yml"])
+
     def test_open_project_dir_refused_on_deploy(self):
         # таймер: в папку проекта пишет группа — временный compose.yml туда не кладётся: отказ на шаге
         # «compose.yml из образа» до скачивания версии, работает прежняя
