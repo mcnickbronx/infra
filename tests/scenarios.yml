@@ -464,7 +464,7 @@
     # создаёт project-deploy; отказ v4 с возвратом v1, v4 не пробуется снова; v3; откат при
     # идущей выкладке отказывает; откат вручную без уведомления; откаченная версия не выкладывается;
     # to v9 (тега нет в реестре) — отказ, .env тот же; to v0 — выложено, в .env заменена одна строка,
-    # событие в журнале.
+    # событие в журнале; to v3 --wait — тег v3 появляется в реестре через 25 с: дождался и выложил.
     # Уведомления «выложена новая версия» — в файл (INFRA_NOTIFY_DRY; у таймера — drop-in в /run, как в сценарии 8):
     # их два — v1 и v3; сбои, откат и «нового нет» — без них.
     - name: "4. Реестр образов и пять версий проекта"
@@ -557,12 +557,16 @@
         quiet: true
 
     # Работает v1, в .env — DEPLOY_IMAGE=localhost:5000/verify:test, в реестре — только тег test
-    - name: "4. to <тег>: тега нет — .env тот же; есть — выкладка и одна строка"
+    - name: "4. to <тег>: тега нет — .env тот же; есть — выкладка и одна строка; --wait — дождался тега"
       ansible.builtin.shell: |
         set -uo pipefail
         cd {{ web }}
         log_start=$(wc -l < /var/log/infra.log)
         notify=/tmp/verify-deploy-notify; rm -f "$notify"; export INFRA_NOTIFY_DRY="$notify"   # to — без сообщения
+        # таймер проекта в этом шаге — тоже в файл, не в настоящий Telegram (как в «Выкладки и откат»)
+        install -d /run/systemd/system/project-deploy@shop.service.d
+        printf '[Service]\nEnvironment=INFRA_NOTIFY_DRY=%s\n' "$notify" > /run/systemd/system/project-deploy@shop.service.d/dry.conf
+        systemctl daemon-reload
         page() { project-compose shop exec -T web wget -q -O- http://127.0.0.1:8080/ 2>&1; }
         # Тег по правилам Docker, но в реестре его нет: отказ на docker pull, .env побайтно тот же
         sum0=$(sha256sum < .env)
@@ -577,13 +581,20 @@
         echo "line=$(grep '^DEPLOY_IMAGE=' .env)"
         echo "logged=$(tail -n +$((log_start + 1)) /var/log/infra.log | grep -c 'выкладка shop: DEPLOY_IMAGE verify:test → verify:v0')"
         echo "notified=$(cat "$notify" 2>/dev/null | grep -c '^---$')"
+        # --wait: тега v3 в реестре ещё нет, CI «соберёт» его через 25 с — ждёт, потом выкладывает
+        ( sleep 25; docker push -q localhost:5000/verify:v3 >/dev/null ) &
+        out=$(project-deploy shop to v3 --wait 2>&1); echo "wait=$?:$(page)"
+        echo "wait_line=$(grep '^DEPLOY_IMAGE=' .env)"
+        echo "waited=$(grep -c 'в реестре ещё нет — жду' <<<"$out")"
+        wait
         rm -f /tmp/verify-env-before "$notify"
+        rm -rf /run/systemd/system/project-deploy@shop.service.d; systemctl daemon-reload
       args:
         executable: /bin/bash
       register: deploy_to
       changed_when: true
 
-    - name: "4. to: без тега — отказ и .env тот же; с тегом — выложено, заменена одна строка DEPLOY_IMAGE"
+    - name: "4. to: без тега — отказ и .env тот же; с тегом — выложено, заменена одна строка DEPLOY_IMAGE; --wait — дождался"
       vars:
         r: "{{ dict(deploy_to.stdout_lines | map('split', '=', 1)) }}"
       ansible.builtin.assert:
@@ -595,6 +606,9 @@
           - r.line == 'DEPLOY_IMAGE=localhost:5000/verify:v0'
           - r.logged == '1'
           - r.notified == '0'                   # to — без строки в Telegram (её шлёт только автовыкладка)
+          - r.wait == '0:v3'                    # to v3 --wait: дождался тега и выложил
+          - r.wait_line == 'DEPLOY_IMAGE=localhost:5000/verify:v3'
+          - r.waited == '1'                     # сначала тега не было — ждал
         fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
         quiet: true
 

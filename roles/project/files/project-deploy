@@ -6,6 +6,8 @@
 #   project-deploy <проект> rollback   — вернуть версию, которая стояла до последней выкладки
 #   project-deploy <проект> to <тег>   — выложить тот же образ с другим тегом (у сайтов web-start —
 #                                        полный хеш коммита) и записать его в DEPLOY_IMAGE в .env
+#   project-deploy <проект> to <тег> --wait — то же, но сначала ждать, пока CI соберёт образ с этим тегом
+#                                        (до 15 минут, раз в 20 с; не дождался — ничего не менял): сразу после push
 #
 # Договорённость с проектом (TEAM.md, «Автовыкладка»):
 #   - в .env проекта DEPLOY_IMAGE=ghcr.io/<владелец>/<образ>:<ветка> — его собирает CI;
@@ -32,12 +34,17 @@
 # Порядок в файле: состояние, шаги выкладки, deploy, rollback и to, запуск — в самом конце.
 set -Eeuo pipefail
 
-NAME=${1:?Использование: project-deploy <проект> [rollback | to <тег>]}
+NAME=${1:?Использование: project-deploy <проект> [rollback | to <тег> [--wait]]}
 ACTION=${2:-deploy}
 TAG=${3:-}
+WAIT=${4:-}
 [[ $NAME =~ ^[a-z][a-z0-9_]*$ ]] || { echo "Недопустимое имя проекта: $NAME" >&2; exit 1; }
 [[ $ACTION =~ ^(deploy|rollback|to)$ ]] ||
-  { echo "Неизвестное действие «${ACTION}»: project-deploy <проект> [rollback | to <тег>]" >&2; exit 1; }
+  { echo "Неизвестное действие «${ACTION}»: project-deploy <проект> [rollback | to <тег> [--wait]]" >&2; exit 1; }
+# После действия — только тег у to и за ним --wait. Лишнее — отказ, а не тихий пропуск: с опечаткой (--wiat)
+# или с --wait не у to выкладка пошла бы сразу, без ожидания
+if [ "$ACTION" = to ]; then extra=${*:4}; [ "$extra" != --wait ] || extra=; else extra=${*:3}; fi
+[ -z "$extra" ] || { echo "Лишнее «${extra}»: project-deploy <проект> [rollback | to <тег> [--wait]]" >&2; exit 1; }
 # Тег — по правилам Docker: так он не выходит за строку DEPLOY_IMAGE в .env
 [ "$ACTION" != to ] || [[ $TAG =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
   { echo "Тег образа — латиница, цифры, _ . - (до 128 знаков, первый — не . и не -): project-deploy $NAME to <тег>" >&2; exit 1; }
@@ -321,7 +328,35 @@ to() {
   infra-log "выкладка $NAME: DEPLOY_IMAGE ${IMAGE##*/} → ${TO##*/}"
 }
 
+# to <тег> --wait — сразу после push: ждать, пока CI соберёт образ, до 45 попыток docker pull раз в 20 с (~15 минут).
+# Зовётся до замка: таймер проекта тем временем выкладывает как обычно, .env и состояние не тронуты, Ctrl+C — ничего
+# не меняется. До первого pull от root — те же проверки, что у to: .env без перехода по ссылке, образ из репозитория
+# image, отказы без реестра (tag_ref) — сразу, а не через 15 минут. Образ есть — дальше обычный to: замок, .env
+# читается заново, все проверки, выкладка (его pull уже быстрый). Не дождался — отказ и последняя строка ошибки
+# docker pull; в журнал событий не пишем, как и отказ to «нет тега»
+wait_for_tag() {
+  local try err
+  cd "$WEB"
+  read_image
+  own_image "$IMAGE" "DEPLOY_IMAGE=$IMAGE" || exit 1
+  tag_ref
+  for ((try = 1; try <= 45; try++)); do
+    err=$(docker pull -q "$TO" 2>&1 >/dev/null) && { echo "$NAME: образ $TO есть — выкладываю"; return 0; }
+    if ((try == 1)); then
+      echo "$NAME: $TO в реестре ещё нет — жду, пока CI соберёт (до 15 минут; Ctrl+C — прервать, ничего не изменится)"
+    elif (( (try - 1) % 3 == 0 )); then
+      echo "$NAME: $TO ещё нет — жду ($(( (try - 1) / 3 )) мин)"
+    fi
+    ((try == 45)) || sleep 20
+  done
+  echo "$NAME: за 15 минут $TO в реестре не появился — ничего не менял (CI упал? тег верный?)" >&2
+  echo "docker pull: ${err##*$'\n'}" >&2
+  exit 1
+}
+
 # ---------- Запуск ----------
+# to --wait: образ ждём до замка (wait_for_tag)
+[ "$WAIT" != --wait ] || wait_for_tag
 mkdir -p /var/lib/project-deploy
 exec 9>"$STATE.lock"
 if [ "$ACTION" = deploy ]; then

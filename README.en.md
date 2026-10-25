@@ -77,7 +77,7 @@ above its output; you can type the same by hand.
 | `sudo infra upgrade <version>` | another engine version (a git tag signed by a key in `SIGNERS`), then `apply`; `--check` or «no» keeps the engine as it was |
 | `sudo project-compose <project> ps` | `docker compose` of a project, from its folder with its `.env` |
 | `sudo project-deploy <project> rollback` | roll back the last autodeploy |
-| `sudo project-deploy <project> to <tag>` | deploy the image with this tag and write it to `.env`; not in the registry — nothing changes |
+| `sudo project-deploy <project> to <tag> [--wait]` | deploy the image with this tag and write it to `.env`; not in the registry — nothing changes; `--wait` — first wait for CI to build it (up to 15 minutes) |
 | `sudo project-backup <project>` | a project snapshot now; restore — `project-restore` |
 | `sudo infra-access link` | the access link: SSH from your current IP for 24 hours |
 

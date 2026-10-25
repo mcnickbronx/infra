@@ -1605,14 +1605,16 @@ class ProjectDeployTo(unittest.TestCase):
     ENV = ('DEBUG=False\n#DEPLOY_IMAGE=ghcr.io/example/shop:v0\nDEPLOY_IMAGE="ghcr.io/example/shop:main"\n'
            "SITE_NAME=Магазин\n")
     # docker: в реестре — только теги из STUB_TAGS («образ:тег=дайджест») и любые @sha256; ярлык коммита образа
-    # (org.opencontainers.image.revision) — STUB_REV
+    # (org.opencontainers.image.revision) — STUB_REV. STUB_TAG_AFTER «образ:тег=N» — этот тег скачивается только с N-й
+    # попытки pull (CI ещё собирает; счёт — по журналу стенда)
     DOCKER = """#!/bin/bash
 echo "docker $*" >> "$STUB_LOG"
 ref=${!#}
 [[ "$*" != *image.revision* ]] || { echo "${STUB_REV:-}"; exit 0; }
 digest=$(printf '%s\\n' $STUB_TAGS | awk -F= -v r="$ref" '$1 == r { print $2 }')
 case $1 in
-  pull) [ -n "$digest" ] || [[ $ref == *@sha256:* ]] || { echo "Error response from daemon: manifest unknown" >&2; exit 1; } ;;
+  pull) [ "$ref" != "${STUB_TAG_AFTER%=*}" ] || [ "$(grep -cxF "docker $*" "$STUB_LOG")" -ge "${STUB_TAG_AFTER##*=}" ] || digest=
+        [ -n "$digest" ] || [[ $ref == *@sha256:* ]] || { echo "Error response from daemon: manifest unknown" >&2; exit 1; } ;;
   image) [ -z "$digest" ] || echo "${ref%:*}@$digest" ;;
   run) printf 'services:\\n  api:\\n    image: ${DEPLOY_IMAGE}\\n' ;;
 esac
@@ -1633,6 +1635,8 @@ esac
         "project-compose": COMPOSE,
         "project-docker-host": "#!/bin/sh\n",
         "flock": "#!/bin/sh\n",
+        # sleep — строка в журнал, без сна (ожидание образа у to --wait)
+        "sleep": '#!/bin/sh\necho "sleep $*" >> "$STUB_LOG"\n',
         "infra-log": '#!/bin/sh\necho "infra-log $*" >> "$STUB_LOG"\n',
         # infra-notify: код — STUB_NOTIFY_RC (1 — Telegram не ответил)
         "infra-notify": '#!/bin/sh\necho "infra-notify $*" >> "$STUB_LOG"\nexit ${STUB_NOTIFY_RC:-0}\n',
@@ -2224,6 +2228,101 @@ esac
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertTrue((self.web / "media").is_symlink())
         self.assertEqual(os.stat(store).st_mode & 0o7777, 0o750)
+
+    # --- to <тег> --wait: ждать, пока CI соберёт образ, — до 45 попыток pull раз в 20 с, без замка выкладки ---
+    def loud_flock(self):
+        """flock — строкой в журнал стенда, в порядке с docker и sleep (общая заглушка молчит: старые тесты сверяют журнал
+        целиком, а замок берут все действия)"""
+        (self.bin / "flock").write_text('#!/bin/sh\necho "flock $*" >> "$STUB_LOG"\n')
+
+    def test_wait_tag_appears_then_rolls_out(self):
+        # образ появился к 3-й попытке: две неудачи и два sleep 20 — до замка, затем обычный to под замком
+        self.loud_flock()
+        pull = f"docker pull -q {self.REPO}:{self.HASH}"
+        run, lines = self.deploy("to", self.HASH, "--wait", STUB_TAG_AFTER=f"{self.REPO}:{self.HASH}=3")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([x for x in lines if x in (pull, "sleep 20") or x.startswith("flock")],
+                         [pull, "sleep 20", pull, "sleep 20", pull, "flock -w 30 9", pull])
+        self.assertIn("жду", run.stdout)
+        self.assertIn(f"образ {self.REPO}:{self.HASH} есть — выкладываю", run.stdout)
+        self.assertIn(f"\nDEPLOY_IMAGE={self.REPO}:{self.HASH}\n", self.env.read_text())
+        self.assertEqual((self.state("current"), self.state("previous")),
+                         (f"{self.REPO}@{self.NEW}", f"{self.REPO}@{self.OLD}"))
+        self.assertIn(f"infra-log выкладка shop: DEPLOY_IMAGE shop:main → shop:{self.HASH}", lines)
+
+    def test_wait_timeout_changes_nothing(self):
+        # образ так и не появился (CI упал, опечатка в теге): 45 попыток — отказ; замок не брали, .env и состояние те же
+        self.loud_flock()
+        before = self.env.read_bytes()
+        run, lines = self.deploy("to", "v9", "--wait")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("за 15 минут", run.stderr)
+        self.assertIn("ничего не менял", run.stderr)
+        self.assertIn("manifest unknown", run.stderr)               # последняя строка ошибки docker pull
+        self.assertEqual(lines.count(f"docker pull -q {self.REPO}:v9"), 45)
+        self.assertEqual(lines.count("sleep 20"), 44)
+        self.assertFalse([x for x in lines if not x.startswith(("docker pull ", "sleep "))], lines)   # ни flock, ни up, ни infra-log
+        self.assertEqual(self.env.read_bytes(), before)
+        self.assertEqual(sorted(p.name for p in self.states.iterdir()), ["shop.current"])        # ни замка, ни отметок
+        self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_wait_only_exact_and_only_for_to(self):
+        # --wait — только у to и только так: опечатка или --wait у rollback — отказ до docker, а не выкладка без ожидания
+        (self.states / "shop.previous").write_text(f"{self.REPO}@{self.NEW}\n")
+        for args in (("rollback", "--wait"), ("deploy", "--wait"), ("rollback", "x", "--wait"),
+                     ("to", self.HASH, "--wiat"), ("to", self.HASH, "wait"), ("to", self.HASH, "--wait", "--wait")):
+            with self.subTest(args=args):
+                self.log.unlink(missing_ok=True)
+                run, lines = self.deploy(*args)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn("project-deploy <проект> [rollback | to <тег> [--wait]]", run.stderr)
+                self.assertEqual(lines, [])
+        self.assertEqual(self.env.read_text(), self.ENV)
+        self.assertEqual((self.state("current"), self.state("previous")),
+                         (f"{self.REPO}@{self.OLD}", f"{self.REPO}@{self.NEW}"))
+
+    def test_wait_foreign_image_refused_before_pull(self):
+        # в .env — образ соседа: ожидание не скачивает его от root своим входом в ghcr — отказ до первого pull
+        self.pin()
+        before = self.env.read_bytes().replace(b"shop:main", b"other:main")
+        self.env.write_bytes(before)
+        run, lines = self.deploy("to", self.HASH, "--wait", STUB_TAGS=f"ghcr.io/example/other:{self.HASH}={self.NEW}")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("образ не этого проекта", run.stderr)
+        self.assertEqual(lines, [])
+        self.assertEqual(self.env.read_bytes(), before)
+
+    def test_wait_env_link_refused_before_pull(self):
+        # web/.env — ссылка на .env соседа: ожидание по ней не читает — отказ до первого pull
+        other = self.dir / "other"
+        other.mkdir(mode=0o700)
+        (other / ".env").write_text("DEPLOY_IMAGE=ghcr.io/example/other:main\ndb_password_other=s3cret\n")
+        self.env.unlink()
+        self.env.symlink_to(other / ".env")
+        run, lines = self.deploy("to", self.HASH, "--wait",
+                                 STUB_TAGS=f"ghcr.io/example/other:{self.HASH}={self.NEW} {self.REPO}:{self.HASH}={self.NEW}")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("web/.env — ссылка", run.stderr)
+        self.assertEqual(lines, [])
+        self.assertTrue(self.env.is_symlink())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_wait_refusals_without_registry_come_first(self):
+        # отказы to, которым реестр не нужен, — сразу, а не после 15 минут ожидания
+        for text, mode, error in (
+                ("DEPLOY_IMAGE=ghcr.io/example/shop:main\nDEPLOY_IMAGE=ghcr.io/example/shop:dev", 0o750, "несколько строк"),
+                ("DEPLOY_IMAGE=ghcr.io/example/shop@sha256:" + "1" * 64, 0o750, "не дайджест"),
+                ("DEPLOY_IMAGE=ghcr.io/example/shop:main", 0o770, "пишет не только root")):
+            with self.subTest(error=error):
+                self.log.unlink(missing_ok=True)
+                self.env.write_text(text + "\n")
+                self.proj.chmod(mode)
+                run, lines = self.deploy("to", self.HASH, "--wait")
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn(error, run.stderr)
+                self.assertEqual(lines, [])
+                self.assertEqual(self.env.read_text(), text + "\n")
 
 
 def open_fifo_writer(path):
