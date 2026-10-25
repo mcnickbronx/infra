@@ -124,16 +124,17 @@ proj_root_only() {
 # Проект — на версию $1: образ — под именем из .env, его compose.yml — в web/
 # (прежний — в compose.yml.prev, его возвращает restore). web/ открыта участникам на запись: файлы
 # там root не открывает на запись по имени — подложенная ссылка направила бы запись в чужой файл.
-# Прежний — жёсткой ссылкой (ln не идёт по ссылкам), новый — во временный файл в папке проекта (её пишет
+# Прежний — жёсткой ссылкой (ln -P не идёт по ссылке-источнику; -T — и по ссылке на месте нового имени: без -T
+# ссылка на папку значила бы «положить внутрь неё»), новый — во временный файл в папке проекта (её пишет
 # только root — proj_root_only) и на место одним mv, как .env у to: та же файловая система — mv переименовывает,
 # а ссылку на месте compose.yml заменяет, не идя по ней. noclobber (set -C) тут не защита: bash отказывает,
 # только если цель — обычный файл, а по ссылке на устройство или FIFO пишет. Группа и права — как у файла,
-# созданного в web/ (setgid и ACL группы): группа проекта, 660 — его читают участники и пользователь проекта
-# без root (project-compose)
+# созданного в web/ (setgid): группа проекта, 660 — его читают участники и пользователь проекта без root
+# (project-compose: <проект>-run — в группе проекта); ACL папки не переносятся — контейнерам файл не нужен
 switch_to() {
   local new
   rm -f compose.yml.prev
-  [ ! -f compose.yml ] || ln -P compose.yml compose.yml.prev 2>/dev/null || true
+  [ ! -f compose.yml ] || ln -PT compose.yml compose.yml.prev 2>/dev/null || true
   proj_root_only "временный compose.yml туда не кладу" && docker pull -q "$1" >/dev/null && docker tag "$1" "$IMAGE" &&
     new=$(mktemp "$PROJ/compose.yml.XXXXXX") || return 1
   docker run --rm --entrypoint cat "$IMAGE" /deploy/compose.yml > "$new" &&
@@ -142,9 +143,10 @@ switch_to() {
 }
 
 # Вернуть, как было до switch_to: прежний compose.yml и образ $1 (версия или Id) — и запустить.
-# Код ошибки — если возвращать нечего ($1 пуст) или проект не поднялся
+# Код ошибки — если возвращать нечего ($1 пуст) или проект не поднялся. mv — с -T: ссылку участника на папку
+# на месте compose.yml он заменяет, а не кладёт compose.yml.prev внутрь той папки
 restore() {
-  [ ! -f compose.yml.prev ] || mv compose.yml.prev compose.yml
+  [ ! -f compose.yml.prev ] || mv -fT compose.yml.prev compose.yml
   [ -n "$1" ] && docker tag "$1" "$IMAGE" && up
 }
 

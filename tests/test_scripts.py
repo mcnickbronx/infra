@@ -1669,7 +1669,20 @@ esac
                    "open(os.environ.get('STUB_FSLOG', os.devnull), 'a').write(f'acl {acl[0]}\\n')\n"
                    "if os.environ.get('STUB_SWAP_ENV'):\n"
                    "    os.remove(os.environ['STUB_SWAP_ENV']); os.symlink(os.environ['STUB_SWAP_TO'], os.environ['STUB_SWAP_ENV'])\n",
-        "mv": PYTHON + "os.replace(args[0], args[1])\n",
+        # mv [-f] [-T] <откуда> <куда>: без -T цель-папка (или ссылка на папку) — «положить внутрь неё», как GNU и uutils
+        "mv": PYTHON + "src, dst = args\n"
+              "if not {'-T', '-fT'} & set(sys.argv[1:]) and os.path.isdir(dst): dst = os.path.join(dst, os.path.basename(src))\n"
+              "os.replace(src, dst)\n",
+        # ln -P[T] <файл> <имя> — жёсткая ссылка, как GNU и uutils (у ln Мака нет -T): -P — не по ссылке-источнику; без -T
+        # имя-папка (или ссылка на папку) — «внутрь неё»; имя занято — отказ; ln -s — символьная (крючки участника).
+        # В журнал не пишет
+        "ln": "#!/usr/bin/env python3\nimport os, sys\nopts = ''.join(a for a in sys.argv[1:] if a.startswith('-'))\n"
+              "src, dst = [a for a in sys.argv[1:] if not a.startswith('-')]\n"
+              "if 's' in opts: os.symlink(src, dst); sys.exit()\n"
+              "if 'T' not in opts and os.path.isdir(dst):\n"
+              "    dst = os.path.join(dst, os.path.basename(src))\n"
+              "if os.path.lexists(dst): sys.exit(f'ln: {dst}: File exists')\n"
+              "os.link(src, dst, follow_symlinks=False)\n",
         # dd if=<файл> [iflag=nofollow[,nonblock]]: с nofollow ссылку не открывает (O_NOFOLLOW), с nonblock FIFO без
         # писателя не ждёт (O_NONBLOCK: пустое чтение), как GNU dd и uutils
         "dd": PYTHON + "opts = dict(a.split('=', 1) for a in args)\n"
@@ -2088,6 +2101,33 @@ esac
         self.assertNotIn(f"docker pull -q {self.REPO}@{self.NEW}", lines)
         self.assertEqual(self.leftovers(), [])
         self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+
+    def test_restore_not_into_linked_dir(self):
+        # откат: участник к запуску (up) ставит на место compose.yml ссылку на чужую папку и свой compose.yml.prev,
+        # запуск не проходит — restore возвращает compose.yml.prev на место ссылки (mv -T), а не кладёт его в ту папку
+        target = self.dir / "rootonly"
+        target.mkdir(mode=0o700)
+        (self.bin / "project-compose").write_text(self.COMPOSE.replace(
+            '  *" up "*)', '  *" up "*) [ "$(grep -c " up " "$STUB_LOG")" -gt 1 ] || { rm -f compose.yml compose.yml.prev; '
+            f'ln -s "{target}" compose.yml; echo planted > compose.yml.prev; }};'))
+        (self.web / "compose.yml").write_text("services: {}\n")
+        run, _ = self.timer(STUB_FAIL_UP="1")
+        self.assertEqual(os.listdir(target), [], "root перенёс файл участника в чужую папку")
+        self.assertFalse((self.web / "compose.yml").is_symlink())
+        self.assertEqual((self.web / "compose.yml").read_text(), "planted\n")
+
+    def test_prev_link_not_into_linked_dir(self):
+        # участник выиграл гонку «rm -f compose.yml.prev → ln»: на месте compose.yml.prev — ссылка на папку соседа;
+        # ln -PT отказывает (имя занято), жёсткой ссылки на compose.yml в чужой папке нет, выкладка идёт
+        other = self.dir / "otherweb"
+        other.mkdir(mode=0o700)
+        (self.bin / "rm").write_text(f'#!/bin/bash\n{shutil.which("rm")} "$@"; rc=$?\n'
+                                     f'[ "$*" != "-f compose.yml.prev" ] || ln -s "{other}" compose.yml.prev\nexit $rc\n')
+        (self.bin / "rm").chmod(0o755)
+        (self.web / "compose.yml").write_text("services: {evil: {}}\n")
+        run, _ = self.timer()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(os.listdir(other), [], "root положил жёсткую ссылку на compose.yml в чужую папку")
 
     def test_failed_to_marked_manual(self):
         # сбой ручного to — с пометкой в .failed (по ней health-check не отсылает к журналу таймера), сбой таймера — без
