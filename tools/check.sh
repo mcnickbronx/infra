@@ -49,7 +49,7 @@ shellcheck_files() { scripts | xargs shellcheck -S warning -e SC1090,SC1091; }
 # Изменение ожидаемое — посмотрите git diff tests/golden и добавьте: git add tests/golden
 golden() {
   ansible-playbook -i tests/inventory tests/render.yml >/dev/null || {
-    ansible-playbook -i tests/inventory tests/render.yml | grep -E 'fatal|msg' | head -20; return 1; }
+    ansible-playbook -i tests/inventory tests/render.yml | grep -E 'fatal|failed:|msg' | head -20; return 1; }
   local new
   new=$(git ls-files --others --exclude-standard -- tests/golden)
   if ! git diff --quiet -- tests/golden || [ -n "$new" ]; then
@@ -82,6 +82,7 @@ compose_check() {
   rm -rf "$d"
 }
 
+step "Настройки Ansible (ansible.cfg)" ansible-config validate -t all
 step "Синтаксис плейбуков" syntax
 step "ansible-lint (профиль production)" ansible-lint --offline -q
 step "shellcheck скриптов" shellcheck_files
