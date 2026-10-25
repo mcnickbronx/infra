@@ -473,6 +473,17 @@
       не уходят. id чата подскажет sudo infra-notify --find-chat (ADMIN.md, «Уведомления в Telegram»)
   when: secrets.telegram_bot_token | default('', true) != '' and secrets.telegram_chat_id | default('', true) | string == ''
 
+# Сервер следит за другим, а сообщить о нём в Telegram не может — проверка шла бы молча. Бот без чата —
+# уже задача выше; register — для tests/invalid.yml
+- name: Telegram — watch_sites задан, бота нет
+  ansible.builtin.debug:
+    msg: >-
+      В {{ infra_dir }}/server.yml задан watch_sites, а Telegram не настроен (нет telegram_bot_token
+      в {{ infra_dir }}/secrets.yml) — «Сайты другого сервера не отвечают» в Telegram не придёт
+      (ADMIN.md, «Уведомления в Telegram»)
+  when: watch_sites | length > 0 and secrets.telegram_bot_token | default('', true) == ''
+  register: preflight_watch_no_telegram
+
 # Заготовка в адресе уведомлений молча выключила бы мониторинг
 - name: Нет незаполненных заготовок («замените», example.com) в адресах, email и ключах S3
   vars:

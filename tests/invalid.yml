@@ -99,3 +99,52 @@
       ansible.builtin.file:
         path: "{{ stub.path }}"
         state: absent
+
+# Напоминание preflight — не отказ, первая игра его не видит. У full задан watch_sites, а Telegram
+# нет (fake-secrets.yml): напоминание есть; с ботом и чатом или без watch_sites — нет
+- name: watch_sites без Telegram — напоминание
+  hosts: fixture
+  gather_facts: false
+  tasks:
+    - name: Факты сервера
+      ansible.builtin.import_tasks: facts.yml
+
+    - name: Пароли сервера без Telegram — запомнить
+      ansible.builtin.set_fact:
+        no_telegram_secrets: "{{ secrets_file }}"
+
+    - name: Проверки инвентаря — watch_sites задан, Telegram нет
+      ansible.builtin.include_role:
+        name: preflight
+
+    - name: Напоминание напечатано
+      ansible.builtin.assert:
+        that:
+          - preflight_watch_no_telegram is defined and preflight_watch_no_telegram is not skipped
+          - "'watch_sites' in preflight_watch_no_telegram.msg"
+        fail_msg: "Ждали напоминание «watch_sites задан, а Telegram не настроен», а получили: {{ preflight_watch_no_telegram | default('нет задачи') }}"
+        quiet: true
+
+    - name: Проверки инвентаря — watch_sites задан, бот и чат тоже
+      ansible.builtin.include_role:
+        name: preflight
+      vars:
+        secrets_file: "{{ no_telegram_secrets | combine({'telegram_bot_token': '123456:fixture', 'telegram_chat_id': '-1001234567890'}) }}"
+
+    - name: С Telegram напоминания нет
+      ansible.builtin.assert:
+        that: preflight_watch_no_telegram is skipped
+        fail_msg: "Ждали без напоминания (бот и чат заданы), а получили: {{ preflight_watch_no_telegram }}"
+        quiet: true
+
+    - name: Проверки инвентаря — без watch_sites, Telegram нет
+      ansible.builtin.include_role:
+        name: preflight
+      vars:
+        watch_sites: []
+
+    - name: Без watch_sites напоминания нет
+      ansible.builtin.assert:
+        that: preflight_watch_no_telegram is skipped
+        fail_msg: "Ждали без напоминания (watch_sites пуст), а получили: {{ preflight_watch_no_telegram }}"
+        quiet: true
