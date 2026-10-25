@@ -22,7 +22,9 @@
 # версию, на рабочем это откат. Версии берутся с GitHub, как у рабочих: новая уже должна быть там
 # (git push origin main vX.Y.Z), копия отсюда не едет. Шаги:
 #   U0. движок тестового — git на прежней версии (--from; по умолчанию — тег перед новой в этом
-#       репозитории): тег с GitHub, checkout -f и clean (без -x: .venv и коллекции целы), install.sh;
+#       репозитории): тег должен быть подписан ключом из SIGNERS здесь (infra tag-signed, как у
+#       upgrade), с GitHub — тот же коммит, иначе стоп; checkout -f и clean (без -x: .venv
+#       и коллекции целы), install.sh;
 #   U1. infra apply -y — тестовый как рабочий до выпуска;
 #   U2. infra upgrade vX.Y.Z -y — подпись по SIGNERS прежней, install.sh, apply, tests/verify.yml;
 #   U3. infra apply -y ещё раз — изменений быть не должно.
@@ -32,7 +34,7 @@ cd "$(dirname "$0")/.." || exit 1
 USAGE="Использование: tools/rollout.sh <ssh-адрес> [--scenarios | --upgrade vX.Y.Z [--from vA.B.C]]"
 DEST=${1:?$USAGE}
 shift
-SCENARIOS="" NEW="" FROM=""
+SCENARIOS="" NEW="" FROM="" FROM_COMMIT=""
 while [ $# -gt 0 ]; do
   case $1 in
     --scenarios) SCENARIOS=1 ;;
@@ -56,6 +58,12 @@ if [ -n "$NEW$FROM" ]; then
   [ -n "$FROM" ] || FROM=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$NEW^" 2>/dev/null) ||
     { echo "Версию перед $NEW по тегам здесь не найти — задайте её: --from vA.B.C" >&2; exit 2; }
   version_ok "$FROM"
+  # Прежняя ставится от root, как и новая, — только подписанная (тот же infra tag-signed, что у upgrade
+  # и release.sh); на сервер едет её коммит: U0 сверяет с ним тег с GitHub. Сам git сервера подмену
+  # не заметит — его .git обычная раскатка убирает, и fetch в пустой репозиторий берёт что дадут
+  ./infra tag-signed "$FROM" 2>/dev/null ||
+    { echo "$FROM здесь нет или он не подписан ключом из SIGNERS — на сервер не ставлю" >&2; exit 2; }
+  FROM_COMMIT=$(git rev-parse "refs/tags/$FROM^{commit}")
 fi
 
 LOGS=$(mktemp -d "${TMPDIR:-/tmp}/rollout.XXXXXX")
@@ -112,7 +120,7 @@ if [ -n "$NEW" ]; then
     *) echo "!! $DEST: test_server не узнать (связь, /opt/infra/.venv, /etc/infra/server.yml) — --upgrade только на тестовом" >&2
        exit 1 ;;
   esac
-  run "U0. Движок $DEST — git на прежней $FROM, с GitHub" engine.log sudo bash -s -- "$FROM" "$NEW" <<'SH'
+  run "U0. Движок $DEST — git на прежней $FROM, с GitHub" engine.log sudo bash -s -- "$FROM" "$NEW" "$FROM_COMMIT" <<'SH'
 set -euo pipefail
 # Копия с Мака (rsync -a) оставляет владельцем пользователя Мака, а git от root в чужой папке
 # не работает («dubious ownership»); движок рабочих — клон от root
@@ -125,7 +133,9 @@ fi
 git fetch -q --tags origin
 git rev-parse -q --verify "refs/tags/$2" >/dev/null ||
   { echo "infra: на GitHub нет $2 — сначала git push origin main $2"; exit 1; }
-git -c advice.detachedHead=false checkout -q -f "refs/tags/$1"
+[ "$(git rev-parse -q --verify "refs/tags/$1^{commit}")" = "$3" ] ||
+  { echo "infra: $1 на GitHub — не тот коммит, что у подписанного тега там, откуда раскатка ($3): не ставлю"; exit 1; }
+git -c advice.detachedHead=false checkout -q -f "$3"
 git clean -q -fd
 SH
   ssh "$DEST" sudo /opt/infra/install.sh

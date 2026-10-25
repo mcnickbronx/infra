@@ -1058,11 +1058,12 @@ class ReleaseScript(unittest.TestCase):
         self.assertIn("tools/rollout.sh admin@<тестовый> --upgrade v1.0.1", result.stdout)
 
 
-@unittest.skipUnless(shutil.which("git"), "нужен git")
+@unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class RolloutUpgrade(unittest.TestCase):
     """tools/rollout.sh --upgrade: новая версия на тестовом сервере тем же infra upgrade, что на рабочих, — только
-    при test_server: true, версии проверены до первого ssh, шаги U0–U3 без копии rsync; обычная раскатка на тестовом
-    убирает .git. Стенд: репозиторий с тегами во временной папке, ssh и rsync — заглушки, пишут команду в журнал."""
+    при test_server: true, версии проверены до первого ssh, прежняя — только подписанная, на сервере — тот же коммит;
+    шаги U0–U3 без копии rsync; обычная раскатка на тестовом убирает .git. Стенд: репозиторий с подписанными тегами
+    во временной папке, ssh и rsync — заглушки, пишут команду в журнал."""
 
     SSH = r"""#!/bin/sh
 shift                                             # адрес сервера
@@ -1074,6 +1075,7 @@ case "$*" in
     printf '%s\n' "$input" | sed "s#/etc/infra/server.yml#$STUB_SERVER_YML#" | "$STUB_PYTHON" -
     exit ;;
   "sudo test -d /opt/infra/.git") exit "${STUB_GIT:-1}" ;;
+  "sudo bash -s -- "*) [ "${STUB_U0_RC:-0}" = 0 ] || { echo "infra: тег на GitHub подменён"; exit 1; } ;;
   "sudo infra upgrade "*) [ "${STUB_UPGRADE_RC:-0}" = 0 ] || { echo "fatal: сбой upgrade"; exit 1; } ;;
 esac
 case " $* " in
@@ -1081,7 +1083,7 @@ case " $* " in
 esac
 exit 0
 """
-    UPGRADE = ["ssh sudo /opt/infra/.venv/bin/python -", "ssh sudo bash -s -- v1.0.0 v1.1.0",
+    UPGRADE = ["ssh sudo /opt/infra/.venv/bin/python -", "ssh sudo bash -s -- v1.0.0 v1.1.0 {from_commit}",
                "ssh sudo /opt/infra/install.sh", "ssh sudo infra apply -y", "ssh sudo infra upgrade v1.1.0 -y",
                "ssh sudo infra apply -y"]
 
@@ -1092,6 +1094,13 @@ exit 0
         (self.repo / "tools").mkdir(parents=True)
         stubs.mkdir()
         shutil.copy(ROOT / "tools/rollout.sh", self.repo / "tools/rollout.sh")
+        shutil.copy(ROOT / "infra", self.repo / "infra")          # infra tag-signed — проверка подписи прежней
+        self.keys = {}
+        for who in ("author", "stranger"):
+            self.keys[who] = self.dir / who
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", who, "-f", self.keys[who]], check=True)
+        public = pathlib.Path(f"{self.keys['author']}.pub").read_text().split()
+        (self.repo / "SIGNERS").write_text(f'author namespaces="git" {public[0]} {public[1]}\n')
         for name, text in (("ssh", self.SSH), ("rsync", '#!/bin/sh\necho "rsync $*" >> "$STUB_LOG"\n')):
             (stubs / name).write_text(text)
             (stubs / name).chmod(0o755)
@@ -1104,10 +1113,13 @@ exit 0
             (self.repo / "VERSION").write_text(tag)
             self.git(self.repo, "add", ".")
             self.git(self.repo, "commit", "-q", "-m", tag)
-            self.git(self.repo, "tag", tag)
+            self.git(self.repo, "tag", *(["-s", "-m", tag] if tag.startswith("v") else []), tag)
+        self.from_commit = self.git(self.repo, "rev-parse", "v1.0.0^{commit}")
+        self.UPGRADE = [c.format(from_commit=self.from_commit) for c in self.UPGRADE]
 
     def git(self, cwd, *args):
-        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.org", *args], cwd=cwd,
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "gpg.format=ssh",
+                               "-c", f"user.signingkey={self.keys['author']}", *args], cwd=cwd,
                               env=self.env, check=True, capture_output=True, text=True).stdout.strip()
 
     def rollout(self, *args, **env):
@@ -1131,6 +1143,11 @@ exit 0
         self.assertIn("v1.0.0 → v1.1.0", result.stdout)
 
     def test_upgrade_failure_stops(self):
+        # U0 отказал (тег прежней на GitHub подменён) — ни install.sh, ни apply
+        result, calls = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0", STUB_U0_RC="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(calls, self.UPGRADE[:2])
+        self.assertIn("подменён", result.stdout)
         result, calls = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0", STUB_UPGRADE_RC="1")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(calls, self.UPGRADE[:-1])
@@ -1156,6 +1173,20 @@ exit 0
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn(why, result.stderr)
                 self.assertEqual(calls, [])
+
+    def test_from_signed_here(self):
+        # прежняя ставится от root — только подписанная ключом из SIGNERS; иначе — до первого ssh
+        for name, cmd in (("без подписи", ["tag", "-f", "-a", "-m", "v1.0.0"]), ("лёгкий", ["tag", "-f"]),
+                          ("чужой ключ", ["-c", f"user.signingkey={self.keys['stranger']}", "tag", "-f", "-s", "-m",
+                                          "v1.0.0"])):
+            with self.subTest(name):
+                self.git(self.repo, *cmd, "v1.0.0", "v1.0.0^{commit}")
+                result, calls = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("не подписан", result.stderr)
+                self.assertEqual(calls, [])
+        result, calls = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.5")      # такого тега здесь нет
+        self.assertEqual((result.returncode, calls), (2, []), result.stderr)
 
     def test_from_default(self):
         result, calls = self.rollout("--upgrade", "v1.1.0")
@@ -1220,9 +1251,20 @@ exit 0
             (engine / kept).parent.mkdir(parents=True)
             (engine / kept).write_text("сервер")
 
+        good = self.git(origin, "rev-parse", "v1.0.0^{commit}")      # коммит подписанного тега там, откуда раскатка
+
         def u0(new):
-            return subprocess.run(["bash", "-s", "--", "v1.0.0", new], input=script, env=self.env,
+            return subprocess.run(["bash", "-s", "--", "v1.0.0", new, good], input=script, env=self.env,
                                   capture_output=True, text=True)
+        # тег прежней на GitHub подменили, .git на сервере нет — fetch возьмёт любой: стоп до checkout и install.sh
+        evil = self.git(origin, "commit-tree", "-p", good, "-m", "evil", self.git(origin, "rev-parse", "v1.1.0^{tree}"))
+        self.git(origin, "tag", "-f", "-a", "-m", "v1.0.0", "v1.0.0", evil)
+        result = u0("v1.1.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("v1.0.0 на GitHub — не тот коммит", result.stdout)
+        self.assertEqual((engine / "infra").read_text(), "рабочая копия")   # до checkout не дошло
+        self.git(origin, "tag", "-f", "-a", "-m", "v1.0.0", "v1.0.0", good)  # тег вернули, движок — снова копия
+        shutil.rmtree(engine / ".git")
         result = u0("v9.9.9")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("на GitHub нет v9.9.9", result.stdout)
