@@ -1265,11 +1265,15 @@ exit 0
     def test_upgrade_shows_health_check(self):
         # вывод Ansible — YAML (ansible.cfg): строки списка health-check — в выводе раскатки, без кавычек YAML
         health = ("TASK [Что сейчас сообщает health-check] ****\\nok: [srv] => \\n    msg:\\n    - 'Диск: 91% занято'\\n"
-                  "    - 'Сервис web''s: упал'\\n\\nTASK [infra status] ****\\nok: [srv] => \\n    msg: не отсюда\\n")
+                  "    - 'Сервис web''s: упал'\\n    - 'DNS сервера не отвечает: не разрешается ни одно из имён Let''s Encrypt, Docker\\n"
+                  "        Hub, Telegram — встанут apt'\\n    - без кавычек тоже переносится на следующую строку при ширине больше\\n"
+                  "        восьмидесяти знаков\\n\\nTASK [infra status] ****\\nok: [srv] => \\n    msg: не отсюда\\n")
         result, _ = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0", STUB_HEALTH=health)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = [line.strip() for line in result.stdout.splitlines() if "health-check:" in line]
-        self.assertEqual(lines, ["health-check: Диск: 91% занято", "health-check: Сервис web's: упал"])
+        self.assertEqual(lines, ["health-check: Диск: 91% занято", "health-check: Сервис web's: упал",          # длинные — целиком
+                                 "health-check: DNS сервера не отвечает: не разрешается ни одно из имён Let's Encrypt, Docker Hub, Telegram — встанут apt",
+                                 "health-check: без кавычек тоже переносится на следующую строку при ширине больше восьмидесяти знаков"])
         result, _ = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0",
                                  STUB_HEALTH="TASK [Что сейчас сообщает health-check] ****\\nok: [srv] => \\n    msg: проблем нет\\n")
         self.assertIn("   health-check: проблем нет", result.stdout)

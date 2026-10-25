@@ -92,14 +92,21 @@ unchanged() {
   fi
 }
 # Что сообщает health-check (задача tests/verify.yml): вывод Ansible — YAML (ansible.cfg), строки списка «- '…'»
-# или одна «msg: проблем нет»; кавычки YAML снимаются
+# или одна «msg: проблем нет»; длинную строку YAML переносит — продолжение (отступ от 6) клеится к ней; кавычки YAML снимаются
 health() {
-  awk -v q="'" '/Что сейчас сообщает health-check/ { on = 1; next }
-    on && /^(TASK|PLAY)/ { exit }
-    on && sub(/^ +(- |msg: )/, "") {
-      if (length($0) > 1 && substr($0, 1, 1) == q && substr($0, length($0)) == q) { $0 = substr($0, 2, length($0) - 2); gsub(q q, q) }
-      print "   health-check: " $0
-    }' "$1" || true
+  awk -v q="'" '
+    function out() {
+      if (cur == "") return
+      if (length(cur) > 1 && substr(cur, 1, 1) == q && substr(cur, length(cur)) == q) { cur = substr(cur, 2, length(cur) - 2); gsub(q q, q, cur) }
+      print "   health-check: " cur; cur = ""
+    }
+    /Что сейчас сообщает health-check/ { on = 1; next }
+    !on { next }
+    /^(TASK|PLAY)/ { exit }
+    /^    (- |msg: )/ { out(); cur = $0; sub(/^    (- |msg: )/, "", cur); next }
+    /^      +[^ ]/ && cur != "" { sub(/^ +/, ""); cur = cur " " $0; next }
+    { out() }
+    END { out() }' "$1" || true
 }
 
 # Тестовый ли сервер: test_server: true в /etc/infra/server.yml (только код возврата, файл
