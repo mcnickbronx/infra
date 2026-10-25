@@ -6,8 +6,9 @@
 #   sudo project-db-copy --files shop shop_dev    # и папки media/ и private/ (web/ проекта)
 #   sudo project-db-copy -y ...                           # без вопроса (меню, скрипты)
 # По шагам:
-#   1. снимок проекта «куда» (только база; с --files — полный): передумали —
-#      project-restore <куда> /etc/restic/env <снимок> (номер — в выводе и журнале событий);
+#   1. снимок проекта «куда» (только база; с --files — полный): передумали — project-compose <куда> down
+#      && project-restore <куда> /etc/restic/env <снимок> && project-compose <куда> up -d
+#      (номер — в выводе и журнале событий);
 #   2. дамп «откуда» — на ходу, проект «откуда» не останавливается (pg_dump читает согласованный срез);
 #   3. «куда» останавливается, его база очищается целиком (схемы его роли): таблицы, которых
 #      в копии нет (новые миграции dev), не остаются со старыми данными;
@@ -54,7 +55,7 @@ finish() {
   local rc=$?
   rm -rf "$STAGE"
   if [ "$rc" != 0 ] && [ -n "$STARTED" ]; then
-    infra-log "копия базы $FROM → $TO: ошибка (код $rc); вернуть как было: project-restore $TO /etc/restic/env ${SNAP:-<снимок>}"
+    infra-log "копия базы $FROM → $TO: ошибка (код $rc); вернуть как было: project-compose $TO down && project-restore $TO /etc/restic/env ${SNAP:-<снимок>} && project-compose $TO up -d"
   fi
 }
 trap finish EXIT
@@ -126,7 +127,7 @@ STARTED=""                                         # дальше итог пи�
 if [ "$rc" != 0 ]; then
   infra-log "копия базы $FROM → $TO: скопировано, но миграции или запуск $TO не прошли (код $rc); снимок до замены — $SNAP"
   echo "!!! Скопировано, но миграции или запуск $TO не прошли — причина выше." \
-       "Вернуть как было: project-restore $TO /etc/restic/env $SNAP" >&2
+       "Вернуть как было: project-compose $TO down && project-restore $TO /etc/restic/env $SNAP && project-compose $TO up -d" >&2
   exit 2
 fi
 infra-log "копия базы $FROM → $TO${FILES:+ с файлами}: готово, снимок $TO до замены — $SNAP"

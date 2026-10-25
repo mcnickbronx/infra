@@ -19,7 +19,8 @@
       не желательно (README, «Ограничения»): тогда ubuntu_version: "24.04" в server.yml
     quiet: true
 
-# Без них движку не из чего строить сервер; значений по умолчанию у них нет
+# Без них движку не из чего строить сервер; значений по умолчанию у них нет. Текст — о том, что не так:
+# при всех ключах на месте «нет: —» сбивало с толку, поэтому тогда — само неподходящее имя сервера
 - name: В server.yml заданы server_name, admin_keys, admin_ips, acme_email
   vars:
     required: [server_name, admin_keys, admin_ips, acme_email]
@@ -29,8 +30,10 @@
       - missing | length == 0
       - missing | length > 0 or server_name is match('^[a-z0-9][a-z0-9-]{0,62}$')
     fail_msg: >-
-      В {{ infra_dir }}/server.yml нет: {{ missing | join(', ') or '—' }}; server_name — строчные латинские
-      буквы, цифры и - (пример всех настроек — server.yml.example)
+      {% if missing | length > 0 %}В {{ infra_dir }}/server.yml нет: {{ missing | join(', ') }}; server_name — строчные
+      латинские буквы, цифры и - (пример всех настроек — server.yml.example){% else %}В {{ infra_dir }}/server.yml
+      server_name «{{ server_name }}» не годится: server_name — строчные латинские буквы, цифры и - (до 63 знаков,
+      первая — не -){% endif %}
     quiet: true
 
 # Опечатка в ключе молча значила бы «настройки нет» — то есть умолчание движка, иногда

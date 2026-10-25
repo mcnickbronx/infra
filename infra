@@ -702,7 +702,7 @@ cmd_status() {
       hosts=$(awk -F'|' -v p="$p" '$1 == p' <<<"$containers" | grep -o 'Host(`[^`]*`)' | sed 's/^Host(`//; s/`)$//' | sort -u | paste -sd' ' - || true)
       deploy=""
       if systemctl is-enabled -q "project-deploy@$p.timer" 2>/dev/null; then
-        if [ -f "$d/$p.failed" ]; then deploy="автовыкладка не удалась: $(head -1 "$d/$p.failed")"
+        if [ -f "$d/$p.failed" ]; then deploy="выкладка не удалась: $(head -1 "$d/$p.failed")"
         elif [ -f "$d/$p.current" ]; then deploy="выложен $(date -r "$d/$p.current" '+%F %H:%M')"
         else deploy="автовыкладка ждёт первого образа"
         fi

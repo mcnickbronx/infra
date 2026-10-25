@@ -1,0 +1,3 @@
+# Все обязательные ключи на месте — текст называет само имя, а не «нет: —»
+expect_error: "server_name «Bad_Name»"
+server_name: Bad_Name

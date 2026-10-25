@@ -142,7 +142,7 @@ project_line() {
                                            END { print u + 0, n + 0, s + 0 }' <<<"$CONTAINERS")
   if [ "$total" = 0 ]; then line="не запущен"; else line="контейнеры $up из $total"; fi
   [ "$sick" = 0 ] || line+=", нездоровых $sick"
-  if [ -f "$DEPLOY/$1.failed" ]; then line+=" · автовыкладка не удалась"
+  if [ -f "$DEPLOY/$1.failed" ]; then line+=" · выкладка не удалась"
   elif autodeploy "$1"; then line+=" · автовыкладка"
   fi
   printf '%-22s %s' "$1" "$line"
