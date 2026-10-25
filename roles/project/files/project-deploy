@@ -132,12 +132,13 @@ proj_root_only() {
 # созданного в web/ (setgid): группа проекта, 660 — его читают участники и пользователь проекта без root
 # (project-compose: <проект>-run — в группе проекта); ACL папки не переносятся — контейнерам файл не нужен.
 # Остановили между mktemp и mv — временный файл убирает trap, как у .env в to; compose.yml.new — остаток версий
-# до v2.1.0 (rm ссылку удаляет, не идя по ней)
+# до v2.1.0 (rm ссылку удаляет, не идя по ней) — после proj_root_only: rm берёт имя там, куда ведёт web, а в открытой
+# папке проекта web может быть ссылкой на чужую web/
 switch_to() {
-  rm -f compose.yml.prev compose.yml.new
+  rm -f compose.yml.prev
   [ ! -f compose.yml ] || ln -PT compose.yml compose.yml.prev 2>/dev/null || true
-  proj_root_only "временный compose.yml туда не кладу" && docker pull -q "$1" >/dev/null && docker tag "$1" "$IMAGE" &&
-    COMPOSE_NEW=$(mktemp "$PROJ/compose.yml.XXXXXX") || return 1
+  proj_root_only "временный compose.yml туда не кладу" && rm -f compose.yml.new && docker pull -q "$1" >/dev/null &&
+    docker tag "$1" "$IMAGE" && COMPOSE_NEW=$(mktemp "$PROJ/compose.yml.XXXXXX") || return 1
   trap 'rm -f "$COMPOSE_NEW"' EXIT
   docker run --rm --entrypoint cat "$IMAGE" /deploy/compose.yml > "$COMPOSE_NEW" &&
     chown "$(stat -c %u:%g -- "$WEB")" "$COMPOSE_NEW" && chmod 660 "$COMPOSE_NEW" && mv -fT "$COMPOSE_NEW" compose.yml ||

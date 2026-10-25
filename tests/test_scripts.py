@@ -2213,6 +2213,24 @@ esac
         self.assertEqual(self.leftovers(), [])
         self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
 
+    def test_open_project_dir_other_compose_new_kept(self):
+        # папка проекта открыта группе, участник сделал web ссылкой на web/ другого проекта (у shop не задан image):
+        # таймер отказывает на шаге «compose.yml из образа», а compose.yml.new соседа цел — остаток версий до v2.1.0
+        # root удаляет только после proj_root_only (rm берёт имя в папке, куда ведёт web)
+        other = self.dir / "other-proj" / "web"
+        other.mkdir(parents=True)
+        (other / ".env").write_text("DEPLOY_IMAGE=ghcr.io/example/other:main\n")
+        (other / "compose.yml").write_text("services: {other: {}}\n")
+        (other / "compose.yml.new").write_text("other new\n")
+        shutil.rmtree(self.web)
+        self.web.symlink_to(other)
+        self.proj.chmod(0o770)
+        run, _ = self.deploy(STUB_TAGS=f"ghcr.io/example/other:main={self.NEW}")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("пишет не только root — временный compose.yml туда не кладу", run.stderr)
+        self.assertTrue((other / "compose.yml.new").is_file(), "root удалил compose.yml.new в чужой папке")
+        self.assertEqual((other / "compose.yml.new").read_text(), "other new\n")
+
     def test_restore_not_into_linked_dir(self):
         # откат: участник к запуску (up) ставит на место compose.yml ссылку на чужую папку и свой compose.yml.prev,
         # запуск не проходит — restore возвращает compose.yml.prev на место ссылки (mv -T), а не кладёт его в ту папку
