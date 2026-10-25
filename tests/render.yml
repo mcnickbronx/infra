@@ -47,6 +47,15 @@
       people_groups: "{{ people_groups }}"
       rootless_projects: "{{ rootless_projects }}"
       rootless_group_of: "{{ rootless_group_of }}"
+      # Умолчания, которые читают только задачи ролей (в шаблонах их нет): без этих строк пропажу
+      # или другое число в group_vars офлайн не видно, а apply на сервере падает или меняет владельцев файлов
+      docker_major_version: "{{ docker_major_version }}"
+      postgres_version: "{{ postgres_version }}"
+      docker_remap_base: "{{ docker_remap_base }}"
+      docker_remap_web_gids: "{{ docker_remap_web_gids }}"
+      rootless_port_base: "{{ rootless_port_base }}"
+      project_default_db_conn_limit: "{{ project_default_db_conn_limit }}"
+      project_default_db_statement_timeout: "{{ project_default_db_statement_timeout }}"
   tasks:
     # Факты из ansible_facts в инвентаре не задать (его заполняет сам Ansible) — только так
     - name: Факты сервера

@@ -27,6 +27,12 @@
   на месте `.env` — отказ за секунды, а не зависшая команда под замком выкладки (таймер проекта всё это время стоял).
 - **`project-deploy`: выкладка, остановленная посреди замены `compose.yml` (`systemctl stop`, Ctrl+C), не оставляет
   временного `compose.yml.XXXXXX` в папке проекта**, а `web/compose.yml.new`, оставшийся от версий до v2.1.0, убирается.
+- **Офлайн-проверки видят пропавшую роль в `site.yml` и тронутые умолчания, которые читают только задачи ролей.**
+  Без строки `- role: crowdsec` или `- role: access` в `site.yml` `make check` был зелёным — теперь красный тест
+  `tests/test_site_roles.py`: в `site.yml` все роли из `roles/`, в порядке из его комментариев. Семь умолчаний
+  `group_vars` без шаблонов (`docker_remap_base`, `postgres_version`, `docker_major_version`, `docker_remap_web_gids`,
+  `rootless_port_base`, лимиты базы проекта) — в эталоне `derived.json`: пропало — красный, другое число — строка
+  в `git diff tests/golden`. Движок не меняется.
 
 ## v2.1.0 — 2026-10-25 — выкладка с ожиданием сборки, upgrade на тестовом, баны CrowdSec в сводке, заплатка root в выкладке, ошибки Ansible в YAML
 

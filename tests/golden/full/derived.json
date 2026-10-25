@@ -11,6 +11,13 @@
         "lab",
         "api_one"
     ],
+    "docker_major_version": 29,
+    "docker_remap_base": 100000,
+    "docker_remap_web_gids": [
+        0,
+        33,
+        1000
+    ],
     "host_people": [
         "dina",
         "ivan",
@@ -55,12 +62,16 @@
         ]
     },
     "postgres_memory_share": 0.4,
+    "postgres_version": 17,
     "project_default_cpus": 2.0,
+    "project_default_db_conn_limit": 50,
+    "project_default_db_statement_timeout": "60s",
     "rootless_group_of": {
         "api_one": "back",
         "api_two": "back",
         "lab": "lab"
     },
+    "rootless_port_base": 40000,
     "rootless_projects": [
         "lab",
         "api_one",
