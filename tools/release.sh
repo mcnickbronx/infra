@@ -50,6 +50,6 @@ cat <<NEXT
 $T готов: коммит $(git rev-parse --short HEAD), тег подписан, записей — $n.
 Дальше:
   git push origin main $T
-  tools/rollout.sh admin@<тестовый> --scenarios        # или на тестовом: sudo infra upgrade $T
+  tools/rollout.sh admin@<тестовый> --upgrade $T       # тестовый: прежняя версия → $T тем же upgrade
   на каждом рабочем: sudo infra upgrade $T --check, затем без --check
 NEXT

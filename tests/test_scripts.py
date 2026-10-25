@@ -1051,6 +1051,196 @@ class ReleaseScript(unittest.TestCase):
         self.git("switch", "-q", "-c", "other")
         self.assertIn("main", self.assertRefused("1.0.1", "заголовок"))
 
+    def test_next_step_upgrade_on_test(self):
+        # после выпуска тестовый идёт тем же upgrade, что рабочие, а не копией
+        result = self.release("1.0.1", "заголовок")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tools/rollout.sh admin@<тестовый> --upgrade v1.0.1", result.stdout)
+
+
+@unittest.skipUnless(shutil.which("git"), "нужен git")
+class RolloutUpgrade(unittest.TestCase):
+    """tools/rollout.sh --upgrade: новая версия на тестовом сервере тем же infra upgrade, что на рабочих, — только
+    при test_server: true, версии проверены до первого ssh, шаги U0–U3 без копии rsync; обычная раскатка на тестовом
+    убирает .git. Стенд: репозиторий с тегами во временной папке, ssh и rsync — заглушки, пишут команду в журнал."""
+
+    SSH = r"""#!/bin/sh
+shift                                             # адрес сервера
+input=$(cat)
+echo "ssh $*" >> "$STUB_LOG"
+case "$*" in
+  "sudo /opt/infra/.venv/bin/python -")           # тестовый ли сервер
+    [ -n "${STUB_SERVER_YML:-}" ] || exit "$STUB_TEST_SERVER"
+    printf '%s\n' "$input" | sed "s#/etc/infra/server.yml#$STUB_SERVER_YML#" | "$STUB_PYTHON" -
+    exit ;;
+  "sudo test -d /opt/infra/.git") exit "${STUB_GIT:-1}" ;;
+  "sudo infra upgrade "*) [ "${STUB_UPGRADE_RC:-0}" = 0 ] || { echo "fatal: сбой upgrade"; exit 1; } ;;
+esac
+case " $* " in
+  *" infra apply "*|*" infra upgrade "*) echo "PLAY RECAP"; echo "srv : ok=1 changed=${STUB_CHANGED:-0} failed=0" ;;
+esac
+exit 0
+"""
+    UPGRADE = ["ssh sudo /opt/infra/.venv/bin/python -", "ssh sudo bash -s -- v1.0.0 v1.1.0",
+               "ssh sudo /opt/infra/install.sh", "ssh sudo infra apply -y", "ssh sudo infra upgrade v1.1.0 -y",
+               "ssh sudo infra apply -y"]
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.repo, stubs = self.dir / "repo", self.dir / "bin"
+        (self.repo / "tools").mkdir(parents=True)
+        stubs.mkdir()
+        shutil.copy(ROOT / "tools/rollout.sh", self.repo / "tools/rollout.sh")
+        for name, text in (("ssh", self.SSH), ("rsync", '#!/bin/sh\necho "rsync $*" >> "$STUB_LOG"\n')):
+            (stubs / name).write_text(text)
+            (stubs / name).chmod(0o755)
+        self.log = self.dir / "stub.log"
+        self.env = {**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}", "TMPDIR": str(self.dir),
+                    "STUB_LOG": str(self.log), "STUB_PYTHON": sys.executable, "STUB_TEST_SERVER": "0",
+                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        self.git(self.repo, "init", "-q")
+        for tag in ("v1.0.0", "note", "v1.1.0"):          # note — не версия: --from его пропускает
+            (self.repo / "VERSION").write_text(tag)
+            self.git(self.repo, "add", ".")
+            self.git(self.repo, "commit", "-q", "-m", tag)
+            self.git(self.repo, "tag", tag)
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.org", *args], cwd=cwd,
+                              env=self.env, check=True, capture_output=True, text=True).stdout.strip()
+
+    def rollout(self, *args, **env):
+        self.log.unlink(missing_ok=True)
+        result = subprocess.run(["bash", str(self.repo / "tools/rollout.sh"), "admin@test", *args],
+                                env={**self.env, **env}, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        return result, self.log.read_text().splitlines() if self.log.exists() else []
+
+    def test_only_on_test_server(self):
+        for rc, why in (("3", "на рабочем это откат"), ("1", "test_server не узнать"), ("255", "не узнать")):
+            with self.subTest(rc=rc):
+                result, calls = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0", STUB_TEST_SERVER=rc)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(why, result.stderr)
+                self.assertEqual(calls, self.UPGRADE[:1])         # после проверки — ни ssh, ни rsync
+
+    def test_upgrade_steps(self):
+        result, calls = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls, self.UPGRADE)                     # rsync нет: движок — с GitHub
+        self.assertIn("v1.0.0 → v1.1.0", result.stdout)
+
+    def test_upgrade_failure_stops(self):
+        result, calls = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0", STUB_UPGRADE_RC="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(calls, self.UPGRADE[:-1])
+        self.assertIn("fatal: сбой upgrade", result.stdout)
+        result, calls = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0", STUB_CHANGED="2")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("не идемпотентны", result.stdout)
+
+    def test_bad_arguments_before_ssh(self):
+        for args, why in ((["--upgrade", "v1.1.0", "--scenarios"], "по отдельности"),
+                          (["--scenarios", "--upgrade", "v1.1.0"], "по отдельности"),
+                          (["--upgrade", "1.1.0"], "vX.Y.Z"), (["--upgrade", "v1.1"], "vX.Y.Z"),
+                          (["--upgrade", "v1.1.0;id"], "vX.Y.Z"), (["--upgrade", "v1.1.0\nid"], "vX.Y.Z"),
+                          (["--upgrade", "$(id)"], "vX.Y.Z"), (["--upgrade", "v1.1.0 v1.0.0"], "vX.Y.Z"),
+                          (["--upgrade", "v1.1.0", "--from", "v1.0"], "vX.Y.Z"),
+                          (["--upgrade", "v1.1.0", "--from", "--scenarios"], "vX.Y.Z"),
+                          (["--from", "v1.0.0"], "вместе с --upgrade"),
+                          (["--upgrade"], "без версии"), (["--upgrade", "v1.1.0", "--from"], "без версии"),
+                          (["--upgrade", "v7.7.7"], "--from"),       # такого тега здесь нет
+                          (["--upgrade", "v1.0.0"], "--from")):      # до первой версии тегов нет
+            with self.subTest(args=args):
+                result, calls = self.rollout(*args)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(why, result.stderr)
+                self.assertEqual(calls, [])
+
+    def test_from_default(self):
+        result, calls = self.rollout("--upgrade", "v1.1.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls, self.UPGRADE)                     # прежняя — v1.0.0, «note» не версия
+
+    def test_copy_rollout_removes_git_only_on_test(self):
+        copy = ["rsync", "ssh sudo /opt/infra/install.sh", "ssh sudo infra apply --check", "ssh sudo infra apply -y",
+                "ssh sudo infra apply -y", "ssh sudo infra run tests/verify.yml"]
+        check, has_git, remove = self.UPGRADE[0], "ssh sudo test -d /opt/infra/.git", "ssh sudo rm -rf /opt/infra/.git"
+        for test, git, before in (("0", "0", [check, has_git, remove]),     # тестовый после --upgrade
+                                  ("0", "1", [check, has_git]),             # тестовый, движок — копия
+                                  ("3", "0", [check]),                      # рабочий — git не трогается
+                                  ("1", "0", [check])):                     # не узнать — тоже
+            with self.subTest(test_server=test, git=git):
+                result, calls = self.rollout(STUB_TEST_SERVER=test, STUB_GIT=git)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([c.split(" ")[0] if c.startswith("rsync") else c for c in calls], before + copy)
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "нужен PyYAML (есть в .venv движка)")
+    def test_test_server_from_server_yml(self):
+        yml = self.dir / "server.yml"
+        for text, rc, why in (("server_name: srv\ntest_server: true\n", 0, "→ v1.1.0"),
+                              ("test_server: false\n", 1, "откат"), ("server_name: srv\n", 1, "откат"),
+                              ('test_server: "true"\n', 1, "откат"), ("test_server: 1\n", 1, "откат"),
+                              ("- test_server: true\n", 1, "откат"), ("", 1, "откат"),
+                              ("test_server: [\n", 1, "не узнать"), (None, 1, "не узнать")):
+            with self.subTest(text=text):
+                yml.unlink(missing_ok=True)
+                if text is not None:
+                    yml.write_text(text)
+                result, _ = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0", STUB_SERVER_YML=str(yml))
+                self.assertEqual(result.returncode, rc, result.stdout + result.stderr)
+                self.assertIn(why, result.stdout + result.stderr)
+
+    def test_engine_script(self):
+        # U0 — скрипт для сервера из rollout.sh: на копии движка (rsync поверх) и на грязном git — чистый git
+        # на прежней версии, .venv и коллекции целы; новой версии на GitHub нет — движок не тронут
+        text = (ROOT / "tools/rollout.sh").read_text()
+        script = text.split("<<'SH'\n", 1)[1].split("\nSH\n", 1)[0]
+        origin, engine = self.dir / "origin", self.dir / "engine"
+        for old, new in (("chown -R root:root /opt/infra", ": chown"), ("/opt/infra", str(engine)),
+                         ("https://github.com/mcnickbronx/infra.git", str(origin))):
+            self.assertIn(old, script, "стенду нечего подменить")
+            script = script.replace(old, new)
+        origin.mkdir()
+        self.git(origin, "init", "-q")
+        (origin / ".gitignore").write_text(".venv/\ncollections/\n")
+        for version, files in (("v1.0.0", {"infra": "1.0.0", "gone": "был"}), ("v1.1.0", {"infra": "1.1.0", "new": "н"})):
+            for name in ("infra", "gone", "new"):
+                (origin / name).unlink(missing_ok=True)
+            for name, body in files.items():
+                (origin / name).write_text(body)
+            self.git(origin, "add", "-A")
+            self.git(origin, "commit", "-q", "-m", version)
+            self.git(origin, "tag", "-a", version, "-m", version)
+        # копия рабочей версии поверх (как rsync): новее v1.1.0, свой файл, Ansible сервера
+        shutil.copytree(origin, engine, ignore=shutil.ignore_patterns(".git"))
+        (engine / "infra").write_text("рабочая копия")
+        (engine / "local").write_text("не из git")
+        for kept in (".venv/bin/python", "collections/x"):
+            (engine / kept).parent.mkdir(parents=True)
+            (engine / kept).write_text("сервер")
+
+        def u0(new):
+            return subprocess.run(["bash", "-s", "--", "v1.0.0", new], input=script, env=self.env,
+                                  capture_output=True, text=True)
+        result = u0("v9.9.9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("на GitHub нет v9.9.9", result.stdout)
+        self.assertEqual((engine / "infra").read_text(), "рабочая копия")   # до checkout не дошло
+        for dirty in ("копия поверх", "грязный git"):
+            with self.subTest(dirty):
+                result = u0("v1.1.0")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.git(engine, "status", "--porcelain"), "")   # upgrade не откажет
+                self.assertEqual(self.git(engine, "describe", "--tags"), "v1.0.0")
+                self.assertEqual((engine / "infra").read_text(), "1.0.0")
+                self.assertEqual(sorted(p.name for p in engine.iterdir()),
+                                 [".git", ".gitignore", ".venv", "collections", "gone", "infra"])
+                self.assertEqual((engine / ".venv/bin/python").read_text(), "сервер")
+                self.assertIn("v1.1.0", self.git(engine, "tag"))               # upgrade найдёт её локально
+                (engine / "infra").write_text("правка")
+                (engine / "local").write_text("ещё")
+
 
 @unittest.skipUnless(shutil.which("git") and shutil.which("ssh-keygen"), "нужны git и ssh-keygen")
 class UpgradePreview(unittest.TestCase):
