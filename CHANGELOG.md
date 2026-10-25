@@ -10,6 +10,8 @@
 
 ## Не выпущено
 
+## v2.1.0 — 2026-10-25 — выкладка с ожиданием сборки, upgrade на тестовом, баны CrowdSec в сводке, заплатка root в выкладке, ошибки Ansible в YAML
+
 - **Проверка на GitHub — на Python 3.14, как на рабочих серверах (Ubuntu 26.04)**, а не на 3.12; действия
   `checkout` и `setup-python` — v7 на Node 24 (по-прежнему по хешу коммита): GitHub отключает у действий Node 20.
 - **`ansible.cfg`: `callback_result_format = yaml` вместо неверного `result_format`** — его Ansible молча пропускал,
