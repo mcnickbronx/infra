@@ -24,7 +24,7 @@ HOST=$(project-docker-host "$NAME" db_host)
 # Новый .env — во временном файле в папке проекта, затем на место одним mv. Папку проекта пишет только root
 # (роль project: root, 0750 — это и проверяем), web/ — и участники: временный файл там подменили бы ссылкой,
 # и root записал бы в цель ссылки и поставил ей владельца и права .env. Та же файловая система — mv переименовывает,
-# а ссылку на месте .env заменяет, не идя по ней. .env читается один раз, без перехода по ссылке (dd с nofollow);
+# а ссылку на месте .env заменяет, не идя по ней. .env читается один раз, без перехода по ссылке (dd с nofollow и nonblock);
 # владелец, права и ACL (доступ контейнеров и пользователя проекта без root) — прежние, с того же файла:
 # подменили его, пока root переписывал, — отказ
 [ "$(stat -c %u -- "$PROJ")" = "$(id -u)" ] && (( (8#$(stat -c %a -- "$PROJ") & 8#022) == 0 )) ||
@@ -37,7 +37,7 @@ read -r _ uid gid mode _ <<<"$before"
 TMP=$(mktemp "$PROJ/.env.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
 # код конвейера — от dd (pipefail): grep без строк кроме DB_* тоже даёт 1, его глушим
-dd if="$ENV_FILE" iflag=nofollow status=none | { grep -vE "^${PREFIX}DB_(HOST|PORT|NAME|USER|PASSWORD)=" || true; } > "$TMP" ||
+dd if="$ENV_FILE" iflag=nofollow,nonblock status=none | { grep -vE "^${PREFIX}DB_(HOST|PORT|NAME|USER|PASSWORD)=" || true; } > "$TMP" ||
   die "$changed"
 printf '%sDB_HOST=%s\n%sDB_PORT=5432\n%sDB_NAME=%s\n%sDB_USER=%s\n%sDB_PASSWORD=%s\n' \
   "$PREFIX" "$HOST" "$PREFIX" "$PREFIX" "$NAME" "$PREFIX" "$NAME" "$PREFIX" "$PASSWORD" >> "$TMP"

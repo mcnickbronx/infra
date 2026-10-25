@@ -1971,6 +1971,78 @@ esac
         held = self.web / ".env.held"
         self.assertEqual((self.env if not self.env.is_symlink() else held).read_text(), self.ENV)
 
+    # --- .env подменили после проверки «не ссылка» (tag_ref), перед подсчётом строк DEPLOY_IMAGE ---
+    # Крючок — первый stat прав папки проекта: он в proj_root_only из tag_ref, ровно между [ ! -L .env ] и подсчётом
+    # (второй такой stat — в switch_to, его не трогаем)
+    UNREAD = "shop: web/.env не прочитан без перехода по ссылке или в нём нет строки DEPLOY_IMAGE — ничего не менял"
+
+    def env_after_check(self, action):
+        participant_hook(self.bin, self.dir, "stat", f'"-c %a -- {self.proj}"', action)
+
+    def test_env_link_after_check_no_bit(self):
+        # ссылка на чужой файл: root его не читает — ни выкладки (одна строка DEPLOY_IMAGE), ни «несколько строк» (две):
+        # исход один и тот же, о чужом файле не узнать ничего. Так и у to --wait (tag_ref до замка)
+        victim = victim_file(self.dir)
+        self.env_after_check(f'rm -f "{self.env}" && ln -s "{victim}" "{self.env}"')
+        for text in ("DEPLOY_IMAGE=ghcr.io/example/other:main\n", "DEPLOY_IMAGE=a\nDEPLOY_IMAGE=b\n"):
+            for args in (("to", self.HASH), ("to", self.HASH, "--wait")):
+                with self.subTest(lines=text.count("\n"), args=args):
+                    self.log.unlink(missing_ok=True)
+                    (self.dir / "stat.hooked").unlink(missing_ok=True)
+                    self.env.unlink()
+                    self.env.write_text(self.ENV)
+                    victim.write_text(text + "db_password_other=s3cret\n")
+                    victim.chmod(0o600)
+                    run, lines = self.deploy(*args)
+                    self.assertEqual(run.returncode, 1, run.stderr)
+                    self.assertNotIn("несколько строк", run.stderr)
+                    self.assertEqual(run.stderr.splitlines()[-1:], [self.UNREAD])
+                    self.assertFalse([x for x in lines if x.startswith("docker pull") or " up " in x], lines)
+                    self.assertEqual((victim.read_text(), victim.stat().st_mode & 0o777),
+                                     (text + "db_password_other=s3cret\n", 0o600))
+                    self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
+
+    def test_env_fifo_link_after_check_no_hang(self):
+        # ссылка на FIFO и сам FIFO на месте .env: подсчёт не ждёт писателя — отказ за секунды (под замком выкладки
+        # таймер всё это время молча выходил бы). Страховка стенда — писатель FIFO через 10 с
+        other = self.dir / "other"
+        other.mkdir(mode=0o700)
+        fifo = other / "fifo"
+        os.mkfifo(fifo)
+        for name, action, path in (("ссылка на FIFO", f'rm -f "{self.env}" && ln -s "{fifo}" "{self.env}"', fifo),
+                                   ("FIFO", f'rm -f "{self.env}" && mkfifo "{self.env}"', self.env)):
+            with self.subTest(name):
+                self.log.unlink(missing_ok=True)
+                (self.dir / "stat.hooked").unlink(missing_ok=True)
+                self.env.unlink()
+                self.env.write_text(self.ENV)
+                self.env_after_check(action)
+                guard = threading.Timer(10, open_fifo_writer, [path])
+                guard.start()
+                self.addCleanup(guard.cancel)
+                start = time.monotonic()
+                run, lines = self.deploy("to", self.HASH)
+                self.assertLess(time.monotonic() - start, 5, "project-deploy ждал писателя FIFO")
+                guard.cancel()
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(run.stderr.splitlines()[-1:], [self.UNREAD])
+                self.assertFalse([x for x in lines if x.startswith("docker pull")], lines)
+
+    def test_env_fifo_before_read_no_hang(self):
+        # FIFO на месте .env после проверки перед чтением в to (крючок — mktemp временного .env): чтение не ждёт
+        # писателя — пустое, сверка stat видит другой файл: отказ за секунды, .env не заменён, временного файла нет
+        participant_hook(self.bin, self.dir, "mktemp", "*/.env.*", f'rm -f "{self.env}" && mkfifo "{self.env}"')
+        guard = threading.Timer(10, open_fifo_writer, [self.env])
+        guard.start()
+        self.addCleanup(guard.cancel)
+        start = time.monotonic()
+        run, _ = self.deploy("to", self.HASH)
+        self.assertLess(time.monotonic() - start, 5, "project-deploy ждал писателя FIFO")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn(f"работает {self.REPO}:{self.HASH}, но .env не записан", run.stderr)
+        self.assertTrue(self.env.is_fifo())
+        self.assertEqual(self.leftovers(), ["compose.yml"])
+
     def test_failed_to_keeps_failed_head_banned(self):
         # голова ветки уже не удалась, администратор переходит на хорошую версию — и to тоже не удался:
         # отметка остаётся, таймер упавшую голову снова не выкладывает
@@ -2512,6 +2584,21 @@ def files_with(root, text):
     return [str(p) for p in root.rglob("*") if p.is_file() and not p.is_symlink() and text in p.read_text()]
 
 
+def participant_hook(bin_dir, flag_dir, stub, when, action):
+    """Участник проекта, которому web/ открыта на запись, вмешивается посреди команды root: команда stub (заглушка стенда
+    или системная) при аргументах when (шаблон case) — только в первый раз за прогон (флаг <stub>.hooked в flag_dir) —
+    сначала выполняет action, затем — как была. Повторный вызов меняет только action"""
+    hook, real = bin_dir / stub, bin_dir / f"{stub}.real"
+    if hook.exists() and not real.exists():
+        hook.rename(real)
+    elif not real.exists():
+        real.symlink_to(shutil.which(stub))
+    flag = flag_dir / f"{stub}.hooked"
+    hook.write_text(f'#!/bin/bash\ncase "$*" in {when}) [ -e "{flag}" ] || {{ : > "{flag}"; {action}; }} ;; esac\n'
+                    f'exec "{real}" "$@"\n')
+    hook.chmod(0o755)
+
+
 class ProjectDbEnv(unittest.TestCase):
     """project-db-env <проект> [приставка]: строки DB_* в .env заменены, остальные на месте, владелец и права прежние;
     временный файл — в папке проекта, не в web/: подменённые ссылкой временный файл или .env не меняют чужой файл
@@ -2628,6 +2715,22 @@ class ProjectDbEnv(unittest.TestCase):
         self.assertEqual([p.name for p in self.proj.iterdir() if p.name != "web"], [])    # временного .env.* нет
         held = self.web / ".env.held"
         self.assertEqual((self.env if not self.env.is_symlink() else held).read_text(), self.ENV)
+
+    def test_env_fifo_before_read_no_hang(self):
+        # FIFO на месте .env после снятия stat «до» (крючок — mktemp временного файла): чтение не ждёт писателя — пустое,
+        # сверка stat видит другой файл: отказ «меняли» за секунды, .env не заменён. Страховка стенда — писатель через 10 с
+        participant_hook(self.bin, self.dir, "mktemp", "*/.env.*", f'rm -f "{self.env}" && mkfifo "{self.env}"')
+        guard = threading.Timer(10, open_fifo_writer, [self.env])
+        guard.start()
+        self.addCleanup(guard.cancel)
+        start = time.monotonic()
+        run = self.db_env()
+        self.assertLess(time.monotonic() - start, 5, "project-db-env ждал писателя FIFO")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("меняли, пока root его переписывал", run.stderr)
+        self.assertTrue(self.env.is_fifo())
+        self.assertEqual(self.leftovers(), [])
+        self.assertFalse(self.fs("mv"))
 
     def test_env_swapped_before_mv_refused(self):
         # .env подменили ссылкой после чтения, до mv (крючок в setfacl): stat перед mv видит другой файл — отказ

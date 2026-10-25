@@ -294,11 +294,18 @@ rollback() {
 # Проверки to, которым реестр не нужен (отказ — ничего не менял), и TO — тот же образ, что в DEPLOY_IMAGE, с тегом TAG
 tag_ref() {
   local repo=$IMAGE
+  # -L — только для текста: защищает nofollow
   [ ! -L .env ] || { echo "$NAME: .env — ссылка, а не файл: root по ссылке не пишет" >&2; exit 1; }
   # Временный .env — в папке проекта (to, ниже): её права — до выкладки, чтобы отказ ничего не менял
   proj_root_only "временный .env туда не кладу, ничего не менял" || exit 1
-  [ "$(grep -c '^DEPLOY_IMAGE=' .env)" = 1 ] ||
-    { echo "$NAME: в .env несколько строк DEPLOY_IMAGE — оставьте одну и повторите" >&2; exit 1; }
+  # Строки DEPLOY_IMAGE — из чтения, как у read_image: .env, подменённый после проверки ссылкой или FIFO, root не читает
+  # и не ждёт — 0 строк. Одно чтение на три исхода — case: n=$(…) при 0 строк под set -e оборвал бы скрипт без текста
+  case $(dd if=.env iflag=nofollow,nonblock status=none 2>/dev/null | grep -c '^DEPLOY_IMAGE=') in
+    1) ;;
+    0) echo "$NAME: web/.env не прочитан без перехода по ссылке или в нём нет строки DEPLOY_IMAGE — ничего не менял" >&2
+       exit 1 ;;
+    *) echo "$NAME: в .env несколько строк DEPLOY_IMAGE — оставьте одну и повторите" >&2; exit 1 ;;
+  esac
   [[ $IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._/:-]*$ ]] ||
     { echo "$NAME: DEPLOY_IMAGE=$IMAGE — to меняет только тег (ghcr.io/<владелец>/<образ>:<тег>), не дайджест @sha256" >&2; exit 1; }
   [[ ${IMAGE##*/} != *:* ]] || repo=${IMAGE%:*}         # тег — после последнего /: в registry:5000/x «:» — порт
@@ -324,7 +331,7 @@ to() {
   # Новый .env — во временном файле в папке проекта, затем на место одним mv. Папку проекта пишет только root
   # (роль project: root, 0750 — это и проверяем), web/ — и участники: временный файл там подменили бы ссылкой,
   # и root записал бы в цель ссылки и поставил ей владельца и права .env. Та же файловая система — mv переименовывает,
-  # а ссылку на месте .env заменяет, не идя по ней. .env читается один раз, без перехода по ссылке (dd с nofollow);
+  # а ссылку на месте .env заменяет, не идя по ней. .env читается один раз, без перехода по ссылке (dd с nofollow и nonblock);
   # владелец, права и ACL (доступ контейнеров и пользователя проекта без root) — прежние, с того же файла:
   # подменили его, пока root переписывал, — отказ. Выкладка шла минуты — .env мог стать ссылкой: проверка ещё раз
   local half="работает $TO, но .env не записан — таймер вернёт образ из .env; впишите DEPLOY_IMAGE=$TO сами"
@@ -335,7 +342,7 @@ to() {
   read -r _ uid gid mode _ <<<"$before"
   ENV_NEW=$(mktemp "$PROJ/.env.XXXXXX")
   trap 'rm -f "$ENV_NEW"' EXIT
-  dd if=.env iflag=nofollow status=none | sed "s|^DEPLOY_IMAGE=.*|DEPLOY_IMAGE=$TO|" > "$ENV_NEW" &&
+  dd if=.env iflag=nofollow,nonblock status=none | sed "s|^DEPLOY_IMAGE=.*|DEPLOY_IMAGE=$TO|" > "$ENV_NEW" &&
     chown "$uid:$gid" "$ENV_NEW" && getfacl -n -p -- .env | setfacl --set-file=- "$ENV_NEW" && chmod "$mode" "$ENV_NEW" &&
     [ "$(stat -c '%i %u %g %a %F' -- .env)" = "$before" ] && mv -fT "$ENV_NEW" .env ||
     { echo "$NAME: $half" >&2; exit 1; }
