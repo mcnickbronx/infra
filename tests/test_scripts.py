@@ -1195,7 +1195,8 @@ case "$*" in
     exit ;;
   "sudo test -d /opt/infra/.git") exit "${STUB_GIT:-1}" ;;
   "sudo bash -s -- "*) [ "${STUB_U0_RC:-0}" = 0 ] || { echo "infra: тег на GitHub подменён"; exit 1; } ;;
-  "sudo infra upgrade "*) [ "${STUB_UPGRADE_RC:-0}" = 0 ] || { echo "fatal: сбой upgrade"; exit 1; } ;;
+  "sudo infra upgrade "*) [ "${STUB_UPGRADE_RC:-0}" = 0 ] || { echo "fatal: сбой upgrade"; exit 1; }
+                        printf '%b' "${STUB_HEALTH:-}" ;;          # вывод задачи health-check, если задан
 esac
 case " $* " in
   *" infra apply "*|*" infra upgrade "*) echo "PLAY RECAP"; echo "srv : ok=1 changed=${STUB_CHANGED:-0} failed=0" ;;
@@ -1260,6 +1261,18 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(calls, self.UPGRADE)                     # rsync нет: движок — с GitHub
         self.assertIn("v1.0.0 → v1.1.0", result.stdout)
+
+    def test_upgrade_shows_health_check(self):
+        # вывод Ansible — YAML (ansible.cfg): строки списка health-check — в выводе раскатки, без кавычек YAML
+        health = ("TASK [Что сейчас сообщает health-check] ****\\nok: [srv] => \\n    msg:\\n    - 'Диск: 91% занято'\\n"
+                  "    - 'Сервис web''s: упал'\\n\\nTASK [infra status] ****\\nok: [srv] => \\n    msg: не отсюда\\n")
+        result, _ = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0", STUB_HEALTH=health)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = [line.strip() for line in result.stdout.splitlines() if "health-check:" in line]
+        self.assertEqual(lines, ["health-check: Диск: 91% занято", "health-check: Сервис web's: упал"])
+        result, _ = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0",
+                                 STUB_HEALTH="TASK [Что сейчас сообщает health-check] ****\\nok: [srv] => \\n    msg: проблем нет\\n")
+        self.assertIn("   health-check: проблем нет", result.stdout)
 
     def test_upgrade_failure_stops(self):
         # U0 отказал (тег прежней на GitHub подменён) — ни install.sh, ни apply

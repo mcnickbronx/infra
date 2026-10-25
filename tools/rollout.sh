@@ -91,7 +91,16 @@ unchanged() {
     exit 1
   fi
 }
-health() { grep -A3 'Что сейчас сообщает health-check' "$1" | grep -E '^\s+"' | sed 's/^/   health-check: /' || true; }
+# Что сообщает health-check (задача tests/verify.yml): вывод Ansible — YAML (ansible.cfg), строки списка «- '…'»
+# или одна «msg: проблем нет»; кавычки YAML снимаются
+health() {
+  awk -v q="'" '/Что сейчас сообщает health-check/ { on = 1; next }
+    on && /^(TASK|PLAY)/ { exit }
+    on && sub(/^ +(- |msg: )/, "") {
+      if (length($0) > 1 && substr($0, 1, 1) == q && substr($0, length($0)) == q) { $0 = substr($0, 2, length($0) - 2); gsub(q q, q) }
+      print "   health-check: " $0
+    }' "$1" || true
+}
 
 # Тестовый ли сервер: test_server: true в /etc/infra/server.yml (только код возврата, файл
 # не выводится). 0 — да, 3 — нет, другое — не узнать (связь, нет движка или server.yml)
