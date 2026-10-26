@@ -1622,12 +1622,13 @@ class ProjectDeployTo(unittest.TestCase):
     ENV = ('DEBUG=False\n#DEPLOY_IMAGE=ghcr.io/example/shop:v0\nDEPLOY_IMAGE="ghcr.io/example/shop:main"\n'
            "SITE_NAME=Магазин\n")
     # docker: в реестре — только теги из STUB_TAGS («образ:тег=дайджест») и любые @sha256; ярлык коммита образа
-    # (org.opencontainers.image.revision) — STUB_REV. STUB_TAG_AFTER «образ:тег=N» — этот тег скачивается только с N-й
+    # (org.opencontainers.image.revision) — STUB_REV, ярлык версии (org.opencontainers.image.version) — STUB_VER. STUB_TAG_AFTER «образ:тег=N» — этот тег скачивается только с N-й
     # попытки pull (CI ещё собирает; счёт — по журналу стенда)
     DOCKER = """#!/bin/bash
 echo "docker $*" >> "$STUB_LOG"
 ref=${!#}
 [[ "$*" != *image.revision* ]] || { echo "${STUB_REV:-}"; exit 0; }
+[[ "$*" != *image.version* ]] || { echo "${STUB_VER:-}"; exit 0; }
 digest=$(printf '%s\\n' $STUB_TAGS | awk -F= -v r="$ref" '$1 == r { print $2 }')
 case $1 in
   pull) [ "$ref" != "${STUB_TAG_AFTER%=*}" ] || [ "$(grep -cxF "docker $*" "$STUB_LOG")" -ge "${STUB_TAG_AFTER##*=}" ] || digest=
@@ -1857,6 +1858,49 @@ esac
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(self.notes(lines), [self.NOTE])
                 self.assertFalse([x for x in lines if "коммит" in x], lines)
+
+    def test_timer_notifies_with_version(self):
+        # ярлык версии (CI web-start, git describe --tags): между выпусками — версия, сколько коммитов после неё и коммит;
+        # на теге — одна версия. В журнале событий — как в ярлыке, и полный коммит
+        run, lines = self.timer(STUB_REV=self.HASH, STUB_VER="v2.4.0-64-gbb168cfcfe")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v2.4.0 +64, коммит bb168cf"])
+        self.assertIn(f"infra-log выкладка shop: готово, {self.REPO}@sha256:{'2' * 12}, версия v2.4.0-64-gbb168cfcfe, "
+                      f"коммит {self.HASH}", lines)
+        self.log.unlink()
+        run, lines = self.timer(digest=f"sha256:{'3' * 64}", STUB_REV=self.HASH, STUB_VER="v3.0.0")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v3.0.0"])
+        self.assertIn(f"infra-log выкладка shop: готово, {self.REPO}@sha256:{'3' * 12}, версия v3.0.0, коммит {self.HASH}",
+                      lines)
+
+    def test_timer_bad_version_dropped(self):
+        # ярлык версии тоже задаёт тот, кто собирает образ: не по образцу — отброшен, сообщение — как без него, с коммитом
+        for ver in ("v3.0.0; rm -rf /", "$(id)", "<no value>", "3.0.0", "v3.0", "v3.0.0-rc1", "v3.0.0-64-gBB168CF",
+                    "v3.0.0-64-gabc123", "v3.0.0\nx", f"v{'9' * 10}.0.0", "v3.0.0-64-g" + "a" * 41, " v3.0.0"):
+            with self.subTest(ver=ver):
+                self.log.unlink(missing_ok=True)
+                (self.states / "shop.current").write_text(f"{self.REPO}@{self.OLD}\n")
+                run, lines = self.timer(STUB_REV=self.HASH, STUB_VER=ver)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(self.notes(lines), [f"{self.NOTE}, коммит bb168cf"])
+                self.assertFalse([x for x in lines if "версия v" in x], lines)
+
+    def test_version_from_image_tag(self):
+        # ярлыка версии нет (образ собран до него), а тег образа — версия: она. Таймер — тег из DEPLOY_IMAGE,
+        # to — тег, который дали; тег не версия (main, хеш) — без версии
+        self.env.write_text(f"DEPLOY_IMAGE={self.REPO}:v3.0.0\n")
+        run, lines = self.deploy(STUB_TAGS=f"{self.REPO}:v3.0.0={self.NEW}")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v3.0.0"])
+        self.log.unlink()
+        run, lines = self.deploy("to", "v3.1.0", STUB_TAGS=f"{self.REPO}:v3.1.0=sha256:{'3' * 64}")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f"infra-log выкладка shop: готово, {self.REPO}@sha256:{'3' * 12}, версия v3.1.0", lines)
+        self.log.unlink()
+        run, lines = self.deploy("to", self.HASH)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse([x for x in lines if "версия v" in x], lines)
 
     def test_timer_telegram_down_deploy_ok(self):
         run, lines = self.timer(STUB_REV=self.HASH, STUB_NOTIFY_RC="1")

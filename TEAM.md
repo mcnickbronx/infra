@@ -104,6 +104,10 @@ jobs:
           labels: org.opencontainers.image.revision=${{ github.sha }}   # коммит — в сообщение о выкладке
 ```
 
+Версию в сообщении о выкладке («выложена v2.4.0 +64, коммит 1a2b3c4») даёт ярлык `org.opencontainers.image.version` —
+вывод `git describe --tags` (checkout с `fetch-depth: 0`): `v3.0.0` или `v2.4.0-64-g1a2b3c4`, иное не показывается.
+Образец — `.github/workflows/back.yml` web-start.
+
 Push в эту ветку — это root на сервере: compose из образа запускается от root. Право push в неё —
 только у тех, кому администратор доверяет сервер.
 

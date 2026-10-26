@@ -21,7 +21,8 @@
 # даже если его уже удалила еженедельная очистка Docker. Сбой на любом шаге — возвращаются
 # прежний образ и прежний compose.yml (при первой выкладке — те, что запускали руками),
 # а эта версия больше не пробуется (ждём следующую). Об ошибке сообщает health-check, о выложенной
-# новой версии — строка в Telegram (таймер и ручной project-deploy <проект>; не дольше 15 с).
+# новой версии — строка в Telegram с версией образа или его коммитом (таймер и ручной project-deploy <проект>;
+# не дольше 15 с).
 #
 # Состояние — файлы /var/lib/project-deploy/<проект>.*:
 #   current      версия, которая работает
@@ -88,6 +89,20 @@ revision() {
   local rev
   rev=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$1" 2>/dev/null) || rev=
   [[ $rev =~ ^[0-9a-f]{7,64}$ ]] && echo "$rev" || true
+}
+
+# Версия, из которой собран образ $1, — ярлык org.opencontainers.image.version (его ставит CI web-start, git describe
+# --tags): на теге — v3.0.0, между выпусками — v2.4.0-64-gfe590f6 (64 коммита после v2.4.0). Нет ярлыка — тег
+# образа $2, если он — версия (to v3.0.0). Ярлык и тег задаёт участник проекта, поэтому только по образцу — иначе
+# в уведомление и журнал событий попал бы любой его текст. Не по образцу — пусто
+release() {
+  local ver re='^v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(-[0-9]{1,9}-g[0-9a-f]{7,40})?$'
+  ver=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$1" 2>/dev/null) || ver=
+  if ! [[ $ver =~ $re ]]; then
+    ver=${2##*/} ver=${ver%%@*}                           # тег — после последнего / и до @дайджеста
+    [[ $ver == *:* ]] && ver=${ver##*:} || ver=
+  fi
+  [[ $ver =~ $re ]] && echo "$ver" || true
 }
 
 # Имя сервера для уведомления — как у команды infra (server_name в server.yml); нет его — имя хоста
@@ -234,13 +249,20 @@ roll_out() {
   rm -f "$STATE.failed" "$STATE.failed-ref" compose.yml.prev
   echo "$NAME: выложено"
   rev=$(revision "$NEW")
-  infra-log "выкладка $NAME: готово, $(short "$NEW")${rev:+, коммит $rev}"
+  ver=$(release "$NEW" "${TO:-$IMAGE}")                 # TO — образ у to, у таймера его нет
+  infra-log "выкладка $NAME: готово, $(short "$NEW")${ver:+, версия $ver}${rev:+, коммит $rev}"
   # Выложена новая версия (таймер или ручной project-deploy <проект>) — строка в Telegram: push дошёл до сайта
-  # (to и откат человек видит в выводе).
+  # (to и откат человек видит в выводе). Что выложено: v3.0.0; между выпусками — «v2.4.0 +64, коммит fe590f6»;
+  # версии нет — «новая версия, коммит 1a2b3c4», нет и коммита — «новая версия»
+  if [[ $ver =~ ^(v[0-9.]+)-([0-9]+)-g([0-9a-f]+)$ ]]; then
+    what="${BASH_REMATCH[1]} +${BASH_REMATCH[2]}, коммит ${BASH_REMATCH[3]:0:7}"
+  else
+    what=${ver:-новая версия${rev:+, коммит ${rev:0:7}}}
+  fi
   # timeout 15: при закрытом Telegram infra-notify ждёт минуту и дольше, а замок проекта ещё наш — rollback и to ждут
   # его 30 с (ниже); 9>&- — отправке замок не нужен. Не ушло — не повторяем: выкладка — в журнале событий
   [ "$ACTION" != deploy ] ||
-    timeout 15 infra-notify "🚀 $(server_name): $NAME — выложена новая версия${rev:+, коммит ${rev:0:7}}" >/dev/null 2>&1 9>&- || true
+    timeout 15 infra-notify "🚀 $(server_name): $NAME — выложена $what" >/dev/null 2>&1 9>&- || true
 }
 
 # Шаг $1 не удался: эту версию больше не пробовать, вернуть прежние образ и compose.yml.
