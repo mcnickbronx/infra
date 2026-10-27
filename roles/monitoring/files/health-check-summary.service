@@ -1,7 +1,14 @@
-# Управляется Ansible (роль monitoring). Утренняя сводка в Telegram: всё в порядке или проблемы
+# Управляется Ansible (роль monitoring). Утренняя сводка в Telegram: всё в порядке или проблемы.
+# Не ушла (Telegram не ответил — infra-notify с кодом 1) — повтор через 10 минут, всего до 6 попыток за 3 часа:
+# сбой связи на минуту-другую сводку не теряет. Не прошли все — служба «упавшая», о ней скажет health-check;
+# запустить руками раньше чем через 3 часа — сначала sudo systemctl reset-failed health-check-summary
 [Unit]
 Description=Daily server summary
+StartLimitIntervalSec=3h
+StartLimitBurst=6
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/health-check.sh --summary
+Restart=on-failure
+RestartSec=10min
