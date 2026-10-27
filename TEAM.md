@@ -101,12 +101,17 @@ jobs:
         with:
           push: true
           tags: ghcr.io/<владелец>/<образ>:${{ github.ref_name }}   # имя — строчными буквами
-          labels: org.opencontainers.image.revision=${{ github.sha }}   # коммит — в сообщение о выкладке
+          # revision — коммит в сообщение о выкладке; version — пусто или версия (ниже): без строки образ унаследует
+          # версию базового (у caddy:2-alpine — v2.11.7), и она попадёт в сообщение
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=
 ```
 
 Версию в сообщении о выкладке («выложена v2.4.0 +64, коммит 1a2b3c4») даёт ярлык `org.opencontainers.image.version` —
 вывод `git describe --tags` (checkout с `fetch-depth: 0`): `v3.0.0` или `v2.4.0-64-g1a2b3c4`, иное не показывается.
-Образец — `.github/workflows/back.yml` web-start.
+Образец — `.github/workflows/back.yml` web-start. Ярлыка нет — версией считается тег образа, если он вида `v3.0.0`
+(`DEPLOY_IMAGE=…:v3.0.0`, `to v3.0.0`).
 
 Push в эту ветку — это root на сервере: compose из образа запускается от root. Право push в неё —
 только у тех, кому администратор доверяет сервер.

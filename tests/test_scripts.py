@@ -1622,8 +1622,8 @@ class ProjectDeployTo(unittest.TestCase):
     ENV = ('DEBUG=False\n#DEPLOY_IMAGE=ghcr.io/example/shop:v0\nDEPLOY_IMAGE="ghcr.io/example/shop:main"\n'
            "SITE_NAME=Магазин\n")
     # docker: в реестре — только теги из STUB_TAGS («образ:тег=дайджест») и любые @sha256; ярлык коммита образа
-    # (org.opencontainers.image.revision) — STUB_REV, ярлык версии (org.opencontainers.image.version) — STUB_VER. STUB_TAG_AFTER «образ:тег=N» — этот тег скачивается только с N-й
-    # попытки pull (CI ещё собирает; счёт — по журналу стенда)
+    # (org.opencontainers.image.revision) — STUB_REV, ярлык версии (org.opencontainers.image.version) — STUB_VER.
+    # STUB_TAG_AFTER «образ:тег=N» — этот тег скачивается только с N-й попытки pull (CI ещё собирает; счёт — по журналу стенда)
     DOCKER = """#!/bin/bash
 echo "docker $*" >> "$STUB_LOG"
 ref=${!#}
@@ -1861,7 +1861,8 @@ esac
 
     def test_timer_notifies_with_version(self):
         # ярлык версии (CI web-start, git describe --tags): между выпусками — версия, сколько коммитов после неё и коммит;
-        # на теге — одна версия. В журнале событий — как в ярлыке, и полный коммит
+        # на теге — версия и коммит (ярлык version бывает унаследован от базового образа). В журнале событий — как в ярлыке
+        # и полный коммит; нет ярлыка revision — коммит из хеша в версии
         run, lines = self.timer(STUB_REV=self.HASH, STUB_VER="v2.4.0-64-gbb168cfcfe")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(self.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v2.4.0 +64, коммит bb168cf"])
@@ -1870,14 +1871,19 @@ esac
         self.log.unlink()
         run, lines = self.timer(digest=f"sha256:{'3' * 64}", STUB_REV=self.HASH, STUB_VER="v3.0.0")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(self.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v3.0.0"])
+        self.assertEqual(self.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v3.0.0, коммит bb168cf"])
         self.assertIn(f"infra-log выкладка shop: готово, {self.REPO}@sha256:{'3' * 12}, версия v3.0.0, коммит {self.HASH}",
                       lines)
+        self.log.unlink()
+        run, lines = self.timer(digest=f"sha256:{'4' * 64}", STUB_VER="v2.4.0-64-gfe590f6aa")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v2.4.0 +64, коммит fe590f6"])
 
     def test_timer_bad_version_dropped(self):
         # ярлык версии тоже задаёт тот, кто собирает образ: не по образцу — отброшен, сообщение — как без него, с коммитом
         for ver in ("v3.0.0; rm -rf /", "$(id)", "<no value>", "3.0.0", "v3.0", "v3.0.0-rc1", "v3.0.0-64-gBB168CF",
-                    "v3.0.0-64-gabc123", "v3.0.0\nx", f"v{'9' * 10}.0.0", "v3.0.0-64-g" + "a" * 41, " v3.0.0"):
+                    "v3.0.0-64-gabc123", "v3.0.0\nx", f"v{'9' * 10}.0.0", "v3.0.0-64-g" + "a" * 41, " v3.0.0",
+                    "v3.0.0-64-abcdef0", "v3.0.0-1234567890-gabcdef0"):
             with self.subTest(ver=ver):
                 self.log.unlink(missing_ok=True)
                 (self.states / "shop.current").write_text(f"{self.REPO}@{self.OLD}\n")
@@ -1887,12 +1893,18 @@ esac
                 self.assertFalse([x for x in lines if "версия v" in x], lines)
 
     def test_version_from_image_tag(self):
-        # ярлыка версии нет (образ собран до него), а тег образа — версия: она. Таймер — тег из DEPLOY_IMAGE,
-        # to — тег, который дали; тег не версия (main, хеш) — без версии
-        self.env.write_text(f"DEPLOY_IMAGE={self.REPO}:v3.0.0\n")
-        run, lines = self.deploy(STUB_TAGS=f"{self.REPO}:v3.0.0={self.NEW}")
+        # ярлыка версии нет (образ собран до него), а тег образа — версия: она. Таймер — тег из DEPLOY_IMAGE (и с @дайджестом),
+        # to — тег, который дали; ярлык важнее тега; тег не версия (main, хеш) — без версии; TO из окружения не в счёт
+        pinned = f"{self.REPO}:v3.0.0@sha256:{'5' * 64}"
+        self.env.write_text(f"DEPLOY_IMAGE={pinned}\n")
+        run, lines = self.deploy(STUB_TAGS=f"{pinned}={self.NEW}", TO=f"{self.REPO}:v9.9.9")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(self.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v3.0.0"])
+        self.log.unlink()
+        self.env.write_text(f"DEPLOY_IMAGE={self.REPO}:v3.0.0\n")
+        run, lines = self.deploy(STUB_TAGS=f"{self.REPO}:v3.0.0=sha256:{'6' * 64}", STUB_VER="v2.9.0")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v2.9.0"])
         self.log.unlink()
         run, lines = self.deploy("to", "v3.1.0", STUB_TAGS=f"{self.REPO}:v3.1.0=sha256:{'3' * 64}")
         self.assertEqual(run.returncode, 0, run.stderr)
