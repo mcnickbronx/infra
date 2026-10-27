@@ -1,7 +1,9 @@
 # Управляется Ansible (роль monitoring). Утренняя сводка в Telegram: всё в порядке или проблемы.
-# Не ушла (Telegram не ответил — infra-notify с кодом 1) — повтор через 10 минут, всего до 6 попыток за 3 часа:
-# сбой связи на минуту-другую сводку не теряет. Не прошли все — служба «упавшая», о ней скажет health-check;
-# запустить руками раньше чем через 3 часа — сначала sudo systemctl reset-failed health-check-summary
+# Не ушла (Telegram не ответил — infra-notify с кодом 1) — повтор через 10 минут, всего до 6 попыток (около часа):
+# сбой связи на минуту-другую сводку не теряет. Не прошли все — служба «упавшая», о ней скажет health-check.
+# 3 часа — окно счётчика попыток: RestartSec × StartLimitBurst должно быть заметно меньше, иначе ранние попытки
+# выпадают из окна и повторы не кончаются. Запустить руками в это окно — сначала sudo systemctl reset-failed
+# health-check-summary, иначе systemd откажет («Start request repeated too quickly» — только в журнале)
 [Unit]
 Description=Daily server summary
 StartLimitIntervalSec=3h
