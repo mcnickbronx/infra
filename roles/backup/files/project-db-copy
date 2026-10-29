@@ -129,7 +129,39 @@ if [ -n "$FILES" ]; then
       chgrp -h "$TO-dev" .
       [ -z "$new" ] || chmod 02770 .
       rsync -rlt --delete --no-perms --no-owner --no-group "$src" "$web/"
-      chgrp -hR -P "$TO-dev" .
+      # Даже chgrp -hR -P может разрешить подменённого предка во время обхода (BSD).
+      # Python3 уже ставит base. Каждый родитель закреплён fd, дочерний каталог
+      # открывается без перехода по ссылке; chown файла получает только одно имя.
+      python3 - "$TO-dev" <<'PY'
+import errno
+import grp
+import os
+import sys
+
+gid = grp.getgrnam(sys.argv[1]).gr_gid
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+def set_group(fd):
+    os.fchown(fd, -1, gid)
+    for name in os.listdir(fd):
+        try:
+            child = os.open(name, flags, dir_fd=fd)
+        except OSError as error:
+            if error.errno not in (errno.ENOTDIR, errno.ELOOP):
+                raise
+            os.chown(name, -1, gid, dir_fd=fd, follow_symlinks=False)
+        else:
+            try:
+                set_group(child)
+            finally:
+                os.close(child)
+
+fd = os.open('.', flags)
+try:
+    set_group(fd)
+finally:
+    os.close(fd)
+PY
       # find не идёт по ссылкам; между find и chmod имя всё же могут заменить.
       # Каждый выбранный каталог открываем отдельно и сверяем его физический путь.
       find -P . -type d -exec bash -c '

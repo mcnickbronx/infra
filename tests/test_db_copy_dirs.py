@@ -6,8 +6,10 @@ install моделирует переход по ссылке GNU (режим и
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -67,6 +69,20 @@ elif name == 'chmod':
 elif name == 'chgrp':
     # Реальный chgrp ОС; имя серверной группы заменено доступной группой стенда.
     mapped = [os.environ['TARGET_GID'] if a == 'shop_dev-dev' else a for a in args]
+    if hook == 'during-group' and '-hR' in args:
+        # Настоящий BSD обход уже изменил marker, но ещё не обработал nested.
+        process = subprocess.Popen(['/usr/bin/chgrp', *mapped], stderr=subprocess.DEVNULL)
+        deadline = __import__('time').monotonic() + 10
+        while pathlib.Path('marker').stat().st_gid != int(os.environ['TARGET_GID']):
+            if process.poll() is not None or __import__('time').monotonic() > deadline:
+                raise RuntimeError('recursive operation completed before marker')
+        if process.poll() is not None or pathlib.Path('nested').stat().st_gid == int(os.environ['TARGET_GID']):
+            raise RuntimeError('did not intercept pending nested during recursion')
+        swap(pathlib.Path('nested'))
+        log()
+        with (base / 'calls').open('a') as out:
+            out.write(json.dumps(['during-group', [], []]) + '\n')
+        sys.exit(process.wait())
     index = args.index('shop_dev-dev')
     log(args[index + 1:])
     subprocess.run(['/usr/bin/chgrp', *mapped], check=True)
@@ -90,6 +106,48 @@ elif name == 'rsync':
         swap(dst)
 else:
     raise RuntimeError(name)
+'''
+
+PYTHON = r'''import grp, json, os, pathlib, sys
+if sys.argv[1] != '-':
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+source = sys.stdin.read()
+base = pathlib.Path(os.environ['STAND'])
+gid = int(os.environ['TARGET_GID'])
+getgrnam = grp.getgrnam
+grp.getgrnam = lambda name: grp.getgrgid(gid) if name == 'shop_dev-dev' else getgrnam(name)
+chown, fchown, listdir = os.chown, os.fchown, os.listdir
+def record(name, targets=()):
+    with (base / 'calls').open('a') as out:
+        out.write(json.dumps([name, [], list(targets)]) + '\n')
+def fd_path(fd):
+    previous = os.open('.', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fchdir(fd)
+        return os.getcwd()
+    finally:
+        os.fchdir(previous)
+        os.close(previous)
+def checked_chown(name, *args, **kwargs):
+    parent = fd_path(kwargs['dir_fd'])
+    # Не разрешаем финальную ссылку при записи журнала: chown также её не разрешает.
+    record('fd-chown', [str(pathlib.Path(parent) / name)])
+    chown(name, *args, **kwargs)
+    if name == 'marker' and os.environ.get('HOOK') == 'during-group':
+        nested = pathlib.Path(parent) / 'nested'
+        assert nested.stat().st_gid == os.getgid()
+        nested.rename(nested.with_name('nested.saved'))
+        nested.symlink_to(base / 'foreign', target_is_directory=True)
+        record('during-group')
+def checked_fchown(fd, *args):
+    record('fd-chown', [fd_path(fd)])
+    fchown(fd, *args)
+os.chown, os.fchown = checked_chown, checked_fchown
+if os.environ.get('HOOK') == 'during-group':
+    # Порядок выбора имён определён тестом, подмена — после настоящей смены группы marker.
+    os.listdir = lambda fd: sorted(listdir(fd), key=lambda n: (n != 'marker', n))
+sys.argv = sys.argv[1:]
+exec(compile(source, '<project-db-copy group>', 'exec'))
 '''
 
 
@@ -121,6 +179,10 @@ class DbCopyDirs(unittest.TestCase):
             path = self.bin / name
             path.write_text(STUB)
             path.chmod(0o755)
+        python = self.bin / 'python3'
+        python.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) +
+                          ' -c ' + shlex.quote(PYTHON) + ' "$@"\n')
+        python.chmod(0o755)
         self.before = self.foreign_state()
         self.script = self.base / 'project-db-copy'
         self.write_script((ROOT / 'roles/backup/files/project-db-copy').read_text())
@@ -149,7 +211,7 @@ class DbCopyDirs(unittest.TestCase):
     def assert_foreign_untouched(self):
         self.assertEqual(self.foreign_state(), self.before, 'изменены данные, режим или группа foreign')
         for name, args, targets in self.calls:
-            if name in ('chmod', 'chgrp'):
+            if name in ('chmod', 'chgrp', 'fd-chown'):
                 self.assertFalse(any(p == str(self.foreign) or p.startswith(str(self.foreign) + '/')
                                      for p in targets), (name, args, targets))
 
@@ -218,6 +280,40 @@ class DbCopyDirs(unittest.TestCase):
         run = self.run_copy()
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assert_foreign_untouched()
+
+    def test_nested_link_during_group_walk(self):
+        self.dst.mkdir()
+        (self.dst / 'marker').touch()
+        # Для мутации с настоящим BSD chgrp: окно до ещё не обработанного nested.
+        for i in range(12000):
+            (self.dst / f'f{i:05d}').touch()
+        (self.dst / 'nested').mkdir()
+        (self.dst / 'nested/inside').touch()
+        run = self.run_copy('during-group')
+        self.assertTrue(any(c[0] == 'during-group' for c in self.calls), run.stderr)
+        self.assert_foreign_untouched()
+        self.assertEqual((self.dst / 'marker').stat().st_gid, self.gid)
+
+    def test_group_walk_special_names_fifo_and_depth(self):
+        self.dst.mkdir()
+        files = [self.dst / name for name in ('a b', '-R', 'line\nbreak', "'quoted$")]
+        for path in files:
+            path.write_bytes(b'kept')
+        fifo = self.dst / 'fifo'
+        os.mkfifo(fifo)
+        link = self.dst / 'link'
+        link.symlink_to(self.foreign / 'valuable')
+        deep = self.dst
+        for i in range(24):
+            deep = deep / f'd{i}'
+            deep.mkdir()
+        run = self.run_copy()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assert_foreign_untouched()
+        for path in [*files, fifo, link, deep]:
+            self.assertEqual(path.lstat().st_gid, self.gid)
+        self.assertTrue(all(path.read_bytes() == b'kept' for path in files))
+        self.assertEqual(deep.stat().st_mode & 0o2070, 0o2070)
 
     def test_project_parent_group_writable_refused(self):
         self.web.parent.chmod(0o770)
