@@ -97,6 +97,16 @@ runuser -u postgres -- pg_restore --exit-on-error --no-owner --no-acl --role="$T
   -L "$STAGE/toc-main" -d "$TO" "$STAGE/dump"
 
 if [ -n "$FILES" ]; then
+  # Папку проекта пишет только root: закрепляем её до перехода в изменяемую web/.
+  # /srv/projects — доверенный системный родитель (роль project: root, 0711).
+  # Физический путь должен совпасть с ожидаемым — ссылки в корне проекта/web не принимаем.
+  (
+  proj=/srv/projects/$TO
+  cd -P -- "$proj" && [ "$(pwd -P)" = "$proj" ] || die "папка проекта $proj идёт через ссылку"
+  [ "$(stat -c %u -- .)" = 0 ] && (( (8#$(stat -c %a -- .) & 8#022) == 0 )) ||
+    die "в папку $proj пишет не только root — файлы не копирую"
+  cd -P -- web && [ "$(pwd -P)" = "$proj/web" ] || die "web/ проекта $TO идёт через ссылку"
+  web=$(pwd -P)
   # Без прав и владельцев источника: права — из ACL по умолчанию папки «куда» (их видят его
   # контейнеры), группа — его участников; папки — с наследованием группы, как их создаёт автовыкладка.
   # web/ открыта участникам на запись: media или private там может оказаться ссылкой на чужую папку —
@@ -110,11 +120,27 @@ if [ -n "$FILES" ]; then
     fi
     [ -d "$src" ] || continue
     echo "файлы: $d/"
-    [ -d "$dst" ] || install -d -m 2770 -g "$TO-dev" "$dst"
-    rsync -rlt --delete --no-perms --no-owner --no-group "$src" "/srv/projects/$TO/web/"
-    chgrp -R "$TO-dev" "$dst"
-    find "$dst" -type d -exec chmod g+rwxs {} +
+    (
+      # mkdir без -p: возникший после проверки каталог/ссылка — отказ, без смены его прав.
+      new=
+      [ -d "$d" ] || { mkdir -- "$d" || die "не удалось создать $dst"; new=1; }
+      cd -P -- "$d" && [ "$(pwd -P)" = "$dst" ] || die "папку $dst подменили ссылкой"
+      # После cd имя могут подменить снова: права/группа — только на открытом каталоге.
+      chgrp -h "$TO-dev" .
+      [ -z "$new" ] || chmod 02770 .
+      rsync -rlt --delete --no-perms --no-owner --no-group "$src" "$web/"
+      chgrp -hR -P "$TO-dev" .
+      # find не идёт по ссылкам; между find и chmod имя всё же могут заменить.
+      # Каждый выбранный каталог открываем отдельно и сверяем его физический путь.
+      find -P . -type d -exec bash -c '
+        root=$1; shift
+        for d do
+          ( cd -P -- "$d" && [ "$(pwd -P)" = "$root${d#.}" ] && chmod g+rwxs . ) || exit 1
+        done
+      ' bash "$dst" {} + || die "каталог $dst подменили при смене прав"
+    )
   done
+  )
 fi
 
 echo "== 5. Миграции кода $TO и запуск"
