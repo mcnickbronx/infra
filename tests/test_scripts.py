@@ -2359,6 +2359,113 @@ esac
     def pin(self, repo=REPO):
         (self.states / "shop.image").write_text(repo + "\n")
 
+    # --- image: общий чтец для rootless, без Docker и состояния выкладки ---
+    def image_result(self, code, output):
+        for command in ("project-docker-host", "flock"):
+            (self.bin / command).write_text(f'#!/bin/sh\necho "{command} $*" >> "$STUB_LOG"\n')
+        before = {p.name: p.read_bytes() for p in self.states.iterdir()}
+        self.log.unlink(missing_ok=True)
+        run, lines = self.deploy("image")
+        self.assertEqual((run.returncode, run.stdout), (code, output), run.stderr)
+        self.assertEqual(lines, [])
+        self.assertEqual({p.name: p.read_bytes() for p in self.states.iterdir()}, before)
+        self.assertEqual(self.leftovers(), [])
+        return run
+
+    def test_image_reader_own_and_unpinned(self):
+        self.pin()
+        self.image_result(0, f"{self.REPO}:main\n")
+        # Убранный проект: роль project убрала .image, разрешён любой репозиторий.
+        (self.states / "shop.image").unlink()
+        self.env.write_text("DEPLOY_IMAGE=ghcr.io/example/other:main\n")
+        self.image_result(0, "ghcr.io/example/other:main\n")
+
+    def test_image_reader_missing_env_or_line(self):
+        self.pin()
+        self.env.write_text("SECRET=marker-not-an-image\n")
+        self.image_result(0, "")
+        self.env.unlink()
+        self.image_result(0, "")
+        # Даже папку состояния для чтения создавать не нужно.
+        for p in self.states.iterdir():
+            p.unlink()
+        self.states.rmdir()
+        run, lines = self.deploy("image")
+        self.assertEqual((run.returncode, run.stdout, lines), (0, "", []), run.stderr)
+        self.assertFalse(self.states.exists())
+
+    def test_image_reader_link_and_foreign_refused(self):
+        self.pin()
+        victim = self.dir / "victim"
+        victim.write_text(f"DEPLOY_IMAGE={self.REPO}:private-marker\nSECRET=secret-marker\n")
+        self.env.unlink()
+        self.env.symlink_to(victim)
+        run = self.image_result(1, "")
+        self.assertIn("web/.env — ссылка", run.stderr)
+        self.assertNotIn("marker", run.stderr)
+        self.env.unlink()
+        self.env.write_text("DEPLOY_IMAGE=ghcr.io/example/other:main\n")
+        self.assertIn("образ не этого проекта", self.image_result(1, "").stderr)
+
+    def test_image_reader_keeps_required_actions_refusals(self):
+        for args in ((), ("to", self.HASH), ("rollback",)):
+            for missing in (False, True):
+                with self.subTest(args=args, missing=missing):
+                    self.env.unlink(missing_ok=True)
+                    if not missing:
+                        self.env.write_text("SECRET=marker-not-an-image\n")
+                    run, lines = self.deploy(*args)
+                    self.assertEqual((run.returncode, run.stdout, lines), (1, "", []), run.stderr)
+                    self.assertEqual(run.stderr.strip(), "shop: нет DEPLOY_IMAGE в .env — автовыкладка не настроена")
+
+    def test_image_reader_fifo_refused_quickly(self):
+        self.env.unlink()
+        os.mkfifo(self.env)
+        guard = threading.Timer(10, open_fifo_writer, [self.env])
+        guard.start()
+        self.addCleanup(guard.cancel)
+        start = time.monotonic()
+        self.image_result(1, "")
+        self.assertLess(time.monotonic() - start, 5, "image ждал писателя FIFO")
+
+    def test_image_reader_read_error_refused(self):
+        # Отказ открытия существующего .env; chmod 000 не доказывает его при запуске теста от root.
+        (self.bin / "dd").write_text("#!/bin/sh\nexit 1\n")
+        self.image_result(1, "")
+
+    def test_rootless_uses_image_reader_before_down(self):
+        for role in ("setup", "cleanup"):
+            text = (ROOT / f"roles/rootless/tasks/{role}.yml").read_text()
+            block = text[text.index("# образ — заранее"):]
+            if role == "setup":
+                # Берём чтение, pull и ветку первого перевода с настоящим down из задачи.
+                block = block[:block.index('    else\n')]
+                block = block.replace('    if [ -z "$was" ]; then\n', '')
+                block = block.replace("{{ item.value.sock | quote }}", "unix:///stub/docker.sock")
+            else:
+                block = block[:block.index("      unset DOCKER_HOST")]
+            self.assertIn('project-deploy "$p" image', block)
+            self.assertNotIn("sed ", block)
+            for status in (0, 1):
+                with self.subTest(role=role, status=status):
+                    self.log.unlink(missing_ok=True)
+                    # Даже ошибочная команда с непустым stdout не должна дать cleanup скачать образ.
+                    (self.bin / "project-deploy").write_text(
+                        '#!/bin/sh\necho "project-deploy $*" >> "$STUB_LOG"\n'
+                        f'echo "{self.REPO}:main"\nexit {status}\n')
+                    (self.bin / "project-deploy").chmod(0o755)
+                    run = subprocess.run(["bash", "-c", 'set -euo pipefail\np=shop\n' + block],
+                                         env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
+                                              "STUB_LOG": str(self.log), "STUB_TAGS": f"{self.REPO}:main={self.OLD}"},
+                                         capture_output=True, text=True)
+                    lines = self.log.read_text().splitlines()
+                    self.assertEqual(lines[0], "project-deploy shop image")
+                    pulls = [x for x in lines if x.startswith("docker pull ")]
+                    downs = [x for x in lines if x == "docker compose -p shop down"]
+                    self.assertEqual(pulls, [f"docker pull -q {self.REPO}:main"] if status == 0 else [])
+                    self.assertEqual(downs, [] if status and role == "setup" else ["docker compose -p shop down"])
+                    self.assertEqual(run.returncode, 1 if status and role == "setup" else 0, run.stderr)
+
     def test_image_pin_own_image_rolls_out(self):
         self.pin()
         run, lines = self.deploy(STUB_TAGS=f"{self.REPO}:main={self.NEW}")
@@ -2586,7 +2693,7 @@ esac
                 self.log.unlink(missing_ok=True)
                 run, lines = self.deploy(*args)
                 self.assertEqual(run.returncode, 1, run.stderr)
-                self.assertIn("project-deploy <проект> [rollback | to <тег> [--wait]]", run.stderr)
+                self.assertIn("project-deploy <проект> [image | rollback | to <тег> [--wait]]", run.stderr)
                 self.assertEqual(lines, [])
         self.assertEqual(self.env.read_text(), self.ENV)
         self.assertEqual((self.state("current"), self.state("previous")),

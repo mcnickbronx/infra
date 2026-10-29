@@ -3,6 +3,7 @@
 # Автовыкладка проекта из реестра образов (autodeploy: true у проекта в server.yml):
 #   project-deploy <проект>            — выложить, если в реестре новый образ (так каждые 15 секунд
 #                                        зовёт таймер project-deploy@<проект>.timer)
+#   project-deploy <проект> image      — вывести проверенный DEPLOY_IMAGE (нет образа — пусто), без выкладки
 #   project-deploy <проект> rollback   — вернуть версию, которая стояла до последней выкладки
 #   project-deploy <проект> to <тег>   — выложить тот же образ с другим тегом (у сайтов web-start —
 #                                        версия v3.0.0 или полный хеш коммита) и записать его
@@ -36,18 +37,18 @@
 # Порядок в файле: состояние, шаги выкладки, deploy, rollback и to, запуск — в самом конце.
 set -Eeuo pipefail
 
-NAME=${1:?Использование: project-deploy <проект> [rollback | to <тег> [--wait]]}
+NAME=${1:?Использование: project-deploy <проект> [image | rollback | to <тег> [--wait]]}
 ACTION=${2:-deploy}
 TAG=${3:-}
 WAIT=${4:-}
 TO=                                                     # образ у to (tag_ref); не из окружения — версия в уведомлении
 [[ $NAME =~ ^[a-z][a-z0-9_]*$ ]] || { echo "Недопустимое имя проекта: $NAME" >&2; exit 1; }
-[[ $ACTION =~ ^(deploy|rollback|to)$ ]] ||
-  { echo "Неизвестное действие «${ACTION}»: project-deploy <проект> [rollback | to <тег> [--wait]]" >&2; exit 1; }
+[[ $ACTION =~ ^(deploy|rollback|to|image)$ ]] ||
+  { echo "Неизвестное действие «${ACTION}»: project-deploy <проект> [image | rollback | to <тег> [--wait]]" >&2; exit 1; }
 # После действия — только тег у to и за ним --wait. Лишнее — отказ, а не тихий пропуск: с опечаткой (--wiat)
 # или с --wait не у to выкладка пошла бы сразу, без ожидания
 if [ "$ACTION" = to ]; then extra=${*:4}; [ "$extra" != --wait ] || extra=; else extra=${*:3}; fi
-[ -z "$extra" ] || { echo "Лишнее «${extra}»: project-deploy <проект> [rollback | to <тег> [--wait]]" >&2; exit 1; }
+[ -z "$extra" ] || { echo "Лишнее «${extra}»: project-deploy <проект> [image | rollback | to <тег> [--wait]]" >&2; exit 1; }
 # Тег — по правилам Docker: так он не выходит за строку DEPLOY_IMAGE в .env
 [ "$ACTION" != to ] || [[ $TAG =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
   { echo "Тег образа — латиница, цифры, _ . - (до 128 знаков, первый — не . и не -): project-deploy $NAME to <тег>" >&2; exit 1; }
@@ -73,11 +74,18 @@ own_image() {
 
 # IMAGE — DEPLOY_IMAGE из .env (папка — web/ проекта). web/ пишут участники: .env — один раз и без перехода по ссылке
 # (dd с nofollow: ссылка на месте .env — отказ, проверки «до» и гонки нет, как в to); nonblock — FIFO на месте .env
-# не вешает таймер. Нет .env или не прочитан — пусто, и отказ
+# не вешает таймер. По умолчанию нет образа — прежний отказ выкладки; read_image optional разрешает
+# отсутствие .env или строки для rootless. Ошибка чтения существующего файла и FIFO — отказ и у optional.
 read_image() {
-  IMAGE=$(dd if=.env iflag=nofollow,nonblock status=none 2>/dev/null | sed -n 's/^DEPLOY_IMAGE=//p' | tail -1 | tr -d "\"'") || IMAGE=
+  local failed=
+  IMAGE=$(dd if=.env iflag=nofollow,nonblock status=none 2>/dev/null | sed -n 's/^DEPLOY_IMAGE=//p' | tail -1 | tr -d "\"'") || { IMAGE=; failed=1; }
   [ -n "$IMAGE" ] || [ ! -L .env ] ||                     # -L — только для текста: защищает nofollow
     { echo "$NAME: web/.env — ссылка: root по ссылке не читает, выкладка не идёт; замените ссылку файлом" >&2; exit 1; }
+  if [ "${1:-}" = optional ]; then
+    { [ -z "$failed" ] || [ ! -e .env ]; } && [ ! -p .env ] ||
+      { echo "$NAME: web/.env не читается или не обычный файл — образ не получен" >&2; return 1; }
+    return 0
+  fi
   [ -n "$IMAGE" ] || { echo "$NAME: нет DEPLOY_IMAGE в .env — автовыкладка не настроена" >&2; exit 1; }
 }
 
@@ -112,6 +120,17 @@ server_name() {
   name=$(sed -nE "s/^server_name:[[:space:]]*[\"']?([a-z0-9-]+).*/\1/p" /etc/infra/server.yml 2>/dev/null | head -1) || true
   echo "${name:-$(hostname)}"
 }
+
+# Только чтение для rootless — до Docker, ожидания и состояния выкладки.
+if [ "$ACTION" = image ]; then
+  cd "$WEB"
+  read_image optional
+  if [ -n "$IMAGE" ]; then
+    own_image "$IMAGE" "DEPLOY_IMAGE=$IMAGE" || exit 1
+    printf '%s\n' "$IMAGE"
+  fi
+  exit 0
+fi
 
 # ---------- Шаги выкладки ----------
 compose() { project-compose "$NAME" "$@"; }

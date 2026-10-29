@@ -56,14 +56,8 @@
         exit 1
       fi
       # образ — заранее в общий Docker: простой — только на перезапуск
-      image=""; [ ! -f "$w/.env" ] || image=$(sed -n 's/^DEPLOY_IMAGE=//p' "$w/.env" | tail -1 | tr -d "\"'")
-      {% if item in projects and projects[item].image is defined %}
-      # image у проекта — чужой образ заранее не скачивается (как в project-deploy); автовыкладка его тоже не возьмёт
-      allowed={{ projects[item].image | quote }} repo=${image%%@*}
-      [[ ${repo##*/} != *:* ]] || repo=${repo%:*}
-      [ -z "$image" ] || [ "$repo" = "$allowed" ] ||
-        { echo "$p: DEPLOY_IMAGE=$image — образ не этого проекта (image в server.yml: $allowed); заранее не скачиваю"; image=""; }
-      {% endif %}
+      # При отказе общего чтеца перевод продолжается, но образ заранее не скачивается
+      image=$(project-deploy "$p" image) || image=""
       [ -z "$image" ] || env -u DOCKER_HOST docker pull -q "$image" >/dev/null || true
       docker compose -p "$p" down 2>&1 | tail -n 3
       unset DOCKER_HOST
