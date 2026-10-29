@@ -487,6 +487,20 @@
   when: watch_sites | length > 0 and secrets.telegram_bot_token | default('', true) == ''
   register: preflight_watch_no_telegram
 
+# URL содержит идентификатор проверки — показываем только заданные ключи. Register — для tests/invalid.yml
+- name: Healthchecks — пинги уходят в v3.0.0
+  vars:
+    healthcheck_keys: "{{ (['backup_healthcheck_url'] if backup_healthcheck_url != '' else [])
+                         + (['monitor_healthcheck_url'] if monitor_healthcheck_url != '' else []) }}"
+  ansible.builtin.debug:
+    msg: >-
+      Пинг healthchecks уходит в v3.0.0 — уведомления идут в Telegram;
+      уберите {{ healthcheck_keys | join(' и ') }} из {{ infra_dir }}/server.yml.
+      До v3.0.0 пинги работают. Если Telegram ещё не настроен — настройте его
+      по ADMIN.md, «Уведомления в Telegram»
+  when: backup_healthcheck_url != '' or monitor_healthcheck_url != ''
+  register: preflight_healthchecks_deprecated
+
 # Заготовка в адресе уведомлений молча выключила бы мониторинг
 - name: Нет незаполненных заготовок («замените», example.com) в адресах, email и ключах S3
   vars:

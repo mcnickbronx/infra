@@ -79,12 +79,12 @@ projects:
 # Ключи — s3_access_key и s3_secret_key в secrets.yml
 # restic_s3_repository_base: "s3:https://s3.example.org/my-bucket"
 
-# --- Уведомления (ADMIN.md, «Уведомления»)
+# --- Уведомления (ADMIN.md, «Уведомления в Telegram»)
 # В Telegram: бот, чат и прокси — в secrets.yml. Пороги и время сводки — умолчания движка, свои — так:
 # disk_alert_percent: 80        # диск заполнен (с backup_disk_stop_percent: 90 — «КРИТИЧНО»)
 # memory_alert_percent: 10      # свободной памяти меньше
 # notify_summary_time: "09:00"  # утренняя сводка: всё в порядке или проблемы
-# Вдобавок — пинг своего healthchecks (облачный не принимает российские IP):
+# Вдобавок — пинг своего healthchecks (уходит в v3.0.0; настройка Telegram — в ADMIN.md):
 # backup_healthcheck_url: "https://hc.example.org/ping/..."
 # monitor_healthcheck_url: "https://hc.example.org/ping/..."
 # Страницы сайтов другого сервера: не открылись два раза подряд — сообщение отсюда (тот лёг целиком, его

@@ -148,3 +148,81 @@
         that: preflight_watch_no_telegram is skipped
         fail_msg: "Ждали без напоминания (watch_sites пуст), а получили: {{ preflight_watch_no_telegram }}"
         quiet: true
+
+# Пинги пока работают: предупреждение об удалении не останавливает весь preflight.
+# Синтетические URL без example.com проходят и последнюю проверку заготовок; в сообщении их нет
+- name: Healthchecks — предупреждение об удалении без URL
+  hosts: fixture
+  gather_facts: false
+  vars:
+    backup_url: "https://hc.fixture.test/ping/backup-private-id"
+    monitor_url: "https://hc.fixture.test/ping/monitor-private-id"
+  tasks:
+    - name: Факты сервера
+      ansible.builtin.import_tasks: facts.yml
+
+    - name: Проверки инвентаря — оба healthcheck_url пусты
+      ansible.builtin.include_role:
+        name: preflight
+      vars:
+        backup_healthcheck_url: ""
+        monitor_healthcheck_url: ""
+
+    - name: Без healthchecks предупреждения нет
+      ansible.builtin.assert:
+        that: preflight_healthchecks_deprecated is skipped
+        quiet: true
+
+    - name: Проверки инвентаря — только пинг бэкапа
+      ansible.builtin.include_role:
+        name: preflight
+      vars:
+        backup_healthcheck_url: "{{ backup_url }}"
+        monitor_healthcheck_url: ""
+
+    - name: Предупреждение называет только ключ бэкапа, без URL
+      ansible.builtin.assert:
+        that:
+          - preflight_healthchecks_deprecated is not skipped
+          - "'v3.0.0' in preflight_healthchecks_deprecated.msg"
+          - "'backup_healthcheck_url' in preflight_healthchecks_deprecated.msg"
+          - "'monitor_healthcheck_url' not in preflight_healthchecks_deprecated.msg"
+          - backup_url not in preflight_healthchecks_deprecated.msg
+          - "'ADMIN.md' in preflight_healthchecks_deprecated.msg"
+        quiet: true
+
+    - name: Проверки инвентаря — только пинг мониторинга
+      ansible.builtin.include_role:
+        name: preflight
+      vars:
+        backup_healthcheck_url: ""
+        monitor_healthcheck_url: "{{ monitor_url }}"
+
+    - name: Предупреждение называет только ключ мониторинга, без URL
+      ansible.builtin.assert:
+        that:
+          - preflight_healthchecks_deprecated is not skipped
+          - "'v3.0.0' in preflight_healthchecks_deprecated.msg"
+          - "'backup_healthcheck_url' not in preflight_healthchecks_deprecated.msg"
+          - "'monitor_healthcheck_url' in preflight_healthchecks_deprecated.msg"
+          - monitor_url not in preflight_healthchecks_deprecated.msg
+        quiet: true
+
+    - name: Проверки инвентаря — оба пинга
+      ansible.builtin.include_role:
+        name: preflight
+      vars:
+        backup_healthcheck_url: "{{ backup_url }}"
+        monitor_healthcheck_url: "{{ monitor_url }}"
+
+    - name: Одно предупреждение называет оба ключа, без URL
+      ansible.builtin.assert:
+        that:
+          - preflight_healthchecks_deprecated is not skipped
+          - preflight_healthchecks_deprecated.results is not defined
+          - "'v3.0.0' in preflight_healthchecks_deprecated.msg"
+          - "'backup_healthcheck_url' in preflight_healthchecks_deprecated.msg"
+          - "'monitor_healthcheck_url' in preflight_healthchecks_deprecated.msg"
+          - backup_url not in preflight_healthchecks_deprecated.msg
+          - monitor_url not in preflight_healthchecks_deprecated.msg
+        quiet: true
