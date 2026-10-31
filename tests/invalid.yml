@@ -46,6 +46,7 @@
         content: |
           #!/bin/sh
           [ "$1 $2" = "image inspect" ] || exit 2
+          printf '%s\n' "$STUB_LABEL" >> {{ (stub.path ~ "/calls") | quote }}
           [ "$STUB_LABEL" != нет ] || { echo "Error response from daemon: No such image" >&2; exit 1; }
           echo "$STUB_LABEL"
 
@@ -94,6 +95,72 @@
             that: "'без ярлыка версии' in ansible_failed_result.msg and 'sudo infra update' in ansible_failed_result.msg"
             fail_msg: "Ждали остановку «без ярлыка версии», а получили: {{ ansible_failed_result.msg }}"
             quiet: true
+
+    - name: Журнал обычной проверки убран
+      ansible.builtin.file:
+        path: "{{ stub.path }}/calls"
+        state: absent
+
+    # Только image tasks получают --check: создание заглушки остаётся настоящим.
+    - name: Проверка образа в предпросмотре
+      check_mode: true
+      block:
+        - name: Образ ровно нужный, новее или его нет — дальше
+          ansible.builtin.include_role:
+            name: traefik
+            tasks_from: image
+            apply:
+              environment: {PATH: "{{ stub_path }}", STUB_LABEL: "{{ item }}"}
+          loop: [v3.7.12, v3.10.0, нет]
+
+        - name: Образ старше нужного
+          block:
+            - name: Проверка образа Traefik
+              ansible.builtin.include_role:
+                name: traefik
+                tasks_from: image
+                apply:
+                  environment: {PATH: "{{ stub_path }}", STUB_LABEL: v3.7.11}
+
+            - name: Ошибка не поймана
+              ansible.builtin.fail:
+                msg: "образ Traefik v3.7.11 не остановил предпросмотр"
+          rescue:
+            - name: Остановились с советом infra update
+              ansible.builtin.assert:
+                that: "'Traefik v3.7.11' in ansible_failed_result.msg and 'sudo infra update' in ansible_failed_result.msg"
+                fail_msg: "Ждали остановку с «sudo infra update», а получили: {{ ansible_failed_result.msg }}"
+                quiet: true
+
+        - name: Образ без ярлыка версии
+          block:
+            - name: Проверка образа Traefik
+              ansible.builtin.include_role:
+                name: traefik
+                tasks_from: image
+                apply:
+                  environment: {PATH: "{{ stub_path }}", STUB_LABEL: ""}
+
+            - name: Ошибка не поймана
+              ansible.builtin.fail:
+                msg: "образ Traefik без ярлыка версии не остановил предпросмотр"
+          rescue:
+            - name: Остановились — версию не узнать
+              ansible.builtin.assert:
+                that: "'без ярлыка версии' in ansible_failed_result.msg and 'sudo infra update' in ansible_failed_result.msg"
+                fail_msg: "Ждали остановку «без ярлыка версии», а получили: {{ ansible_failed_result.msg }}"
+                quiet: true
+
+    - name: Вызовы docker в предпросмотре
+      ansible.builtin.slurp:
+        src: "{{ stub.path }}/calls"
+      register: inspect_calls
+
+    - name: В предпросмотре inspect действительно прочитал каждый образ
+      ansible.builtin.assert:
+        that:
+          - (inspect_calls.content | b64decode).splitlines() == ['v3.7.12', 'v3.10.0', 'нет', 'v3.7.11', '']
+        quiet: true
 
     - name: Заглушка убрана
       ansible.builtin.file:
