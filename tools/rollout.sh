@@ -67,14 +67,25 @@ if [ -n "$NEW$FROM" ]; then
 fi
 
 LOGS=$(mktemp -d "${TMPDIR:-/tmp}/rollout.XXXXXX")
+# Один transport для прямых вызовов и rsync; это keepalive, а не таймаут операции.
+SSH=(ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=4)
+remote() {
+  local rc=0
+  "${SSH[@]}" "$DEST" "$@" || rc=$?
+  if [ "$rc" -eq 255 ]; then
+    echo "!! SSH: код 255 — возможна потеря связи или другая ошибка SSH; удалённая команда тоже может вернуть 255." >&2
+    echo "   Итог операции на сервере неизвестен: проверьте /var/lib/infra/last-run.log и /var/log/infra.log. Логи раскатки: $LOGS" >&2
+  fi
+  return "$rc"
+}
 recap() { sed -n '/PLAY RECAP/,$p' "$1" | grep -E 'ok=' || true; }
 
 # run <шаг> <лог> <команда на сервере...>
 run() {
   local name=$1 log=$LOGS/$2; shift 2
   echo "== $name"
-  if ! ssh "$DEST" "$@" > "$log" 2>&1; then
-    grep -E 'fatal:|FAILED!|ERROR|Ждали|msg|infra:' "$log" | tail -20
+  if ! remote "$@" > "$log" 2>&1; then
+    grep -E 'fatal:|FAILED!|ERROR|Ждали|msg|infra:|SSH:|Итог операции' "$log" | tail -20 || true
     recap "$log"
     echo "!! $name — не прошло. Полный вывод: $log"
     exit 1
@@ -112,7 +123,7 @@ health() {
 # Тестовый ли сервер: test_server: true в /etc/infra/server.yml (только код возврата, файл
 # не выводится). 0 — да, 3 — нет, другое — не узнать (связь, нет движка или server.yml)
 test_server() {
-  ssh "$DEST" sudo /opt/infra/.venv/bin/python - 2>/dev/null <<'PY'
+  remote sudo /opt/infra/.venv/bin/python - <<'PY'
 import sys
 
 import yaml
@@ -154,7 +165,7 @@ git rev-parse -q --verify "refs/tags/$2" >/dev/null ||
 git -c advice.detachedHead=false checkout -q -f "$3"
 git clean -q -fd
 SH
-  ssh "$DEST" sudo /opt/infra/install.sh
+  remote sudo /opt/infra/install.sh
   run "U1. infra apply — прежняя $FROM, как на рабочих до выпуска" apply.log sudo infra apply -y
   run "U2. infra upgrade $NEW — та же команда, что на рабочих" upgrade.log sudo infra upgrade "$NEW" -y
   health "$LOGS/upgrade.log"
@@ -165,16 +176,30 @@ SH
 fi
 
 echo "== 0. Копия движка на $DEST"
-if test_server && ssh "$DEST" sudo test -d /opt/infra/.git; then
-  echo "   движок тестового — снова копия: git после --upgrade убран"
-  ssh "$DEST" sudo rm -rf /opt/infra/.git
+rc=0
+test_server || rc=$?
+[ "$rc" -ne 255 ] || exit "$rc"
+if [ "$rc" -eq 0 ]; then
+  rc=0
+  remote sudo test -d /opt/infra/.git || rc=$?
+  [ "$rc" -ne 255 ] || exit "$rc"
+  if [ "$rc" -eq 0 ]; then
+    echo "   движок тестового — снова копия: git после --upgrade убран"
+    remote sudo rm -rf /opt/infra/.git
+  fi
 fi
 # .gitignore — чтобы не уехало локальное (.vault_pass и т.п.). .venv и коллекции сервера — ещё и
 # явно: rsync в macOS (openrsync) исключённое через .gitignore на сервере при --delete удаляет
-rsync -a --delete --rsync-path="sudo rsync" \
+rc=0
+rsync -e "${SSH[*]}" -a --delete --rsync-path="sudo rsync" \
   --exclude=/.git --exclude=/tests/golden --exclude=/.venv --exclude=/collections \
-  --filter=':- .gitignore' ./ "$DEST:/opt/infra/"
-ssh "$DEST" sudo /opt/infra/install.sh
+  --filter=':- .gitignore' ./ "$DEST:/opt/infra/" || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "!! rsync: код $rc — копирование не прошло; причина в выводе выше." >&2
+  echo "   Код rsync может отличаться от кода SSH: возможен сбой связи, протокола или файлов. Итог копирования на сервере неизвестен. Логи раскатки: $LOGS" >&2
+  exit "$rc"
+fi
+remote sudo /opt/infra/install.sh
 
 run "1. infra apply --check" check.log sudo infra apply --check
 run "2. infra apply" apply.log sudo infra apply -y

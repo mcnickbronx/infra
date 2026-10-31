@@ -1185,9 +1185,23 @@ class RolloutUpgrade(unittest.TestCase):
     во временной папке, ssh и rsync — заглушки, пишут команду в журнал."""
 
     SSH = r"""#!/bin/sh
-shift                                             # адрес сервера
+"$STUB_PYTHON" -c 'import json, os, sys; open(os.environ["STUB_ARGV_LOG"], "a").write(json.dumps(sys.argv[1:]) + "\n")' "$@"
+[ "$1" = -o ] && [ "$2" = ServerAliveInterval=30 ] &&
+  [ "$3" = -o ] && [ "$4" = ServerAliveCountMax=4 ] || exit 97
+shift 4
+[ "$1" = "${STUB_DEST:-admin@test}" ] || exit 98
+shift                                             # проверенный адрес сервера
 input=$(cat)
+if [ "$*" = rsync-transport ]; then
+  echo "transport $*" >> "$STUB_TRANSPORT_LOG"
+  [ "${STUB_TRANSPORT_RC:-0}" = 0 ] || echo "stub: transport SSH $STUB_TRANSPORT_RC" >&2
+  exit "${STUB_TRANSPORT_RC:-0}"
+fi
 echo "ssh $*" >> "$STUB_LOG"
+if [ "$*" = "${STUB_FAIL_COMMAND:-}" ]; then
+  echo "stub: remote failure" >&2
+  exit "$STUB_FAIL_RC"
+fi
 case "$*" in
   "sudo /opt/infra/.venv/bin/python -")           # тестовый ли сервер
     [ -n "${STUB_SERVER_YML:-}" ] || exit "$STUB_TEST_SERVER"
@@ -1202,6 +1216,27 @@ case " $* " in
   *" infra apply "*|*" infra upgrade "*) echo "PLAY RECAP"; echo "srv : ok=1 changed=${STUB_CHANGED:-0} failed=0" ;;
 esac
 exit 0
+"""
+    RSYNC = r"""#!/bin/sh
+# Разобрать transport, затем действительно передать его опции заглушке SSH.
+[ "$1" = -e ] || exit 97
+transport=$2
+shift 2
+[ "$transport" = 'ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=4' ] || exit 97
+"$STUB_PYTHON" - "$transport" "$@" <<'PYTRANSPORT' || exit $?
+import os, shlex, subprocess, sys
+command = shlex.split(sys.argv[1])
+assert sys.argv[-2:] == ['./', os.environ.get('STUB_DEST', 'admin@test') + ':/opt/infra/']
+assert command == ['ssh', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4']
+# SSH не запускается: путь заглушки задан стендом, никакого поиска сетевого клиента.
+assert os.path.realpath(os.environ['PATH'].split(os.pathsep)[0] + '/ssh') == os.path.realpath(os.environ['STUB_SSH'])
+rc = subprocess.run([os.environ['STUB_SSH'], *command[1:], os.environ.get('STUB_DEST', 'admin@test'),
+                     'rsync-transport'], stdin=subprocess.DEVNULL).returncode
+sys.exit(12 if rc == 255 else rc)  # rsync может сообщить об обрыве как об ошибке потока протокола
+PYTRANSPORT
+echo "rsync $*" >> "$STUB_LOG"
+[ "${STUB_RSYNC_RC:-0}" = 0 ] || echo "stub: rsync failure" >&2
+exit "${STUB_RSYNC_RC:-0}"
 """
     UPGRADE = ["ssh sudo /opt/infra/.venv/bin/python -", "ssh sudo bash -s -- v1.0.0 v1.1.0 {from_commit}",
                "ssh sudo /opt/infra/install.sh", "ssh sudo infra apply -y", "ssh sudo infra upgrade v1.1.0 -y",
@@ -1221,12 +1256,14 @@ exit 0
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", who, "-f", self.keys[who]], check=True)
         public = pathlib.Path(f"{self.keys['author']}.pub").read_text().split()
         (self.repo / "SIGNERS").write_text(f'author namespaces="git" {public[0]} {public[1]}\n')
-        for name, text in (("ssh", self.SSH), ("rsync", '#!/bin/sh\necho "rsync $*" >> "$STUB_LOG"\n')):
+        for name, text in (("ssh", self.SSH), ("rsync", self.RSYNC)):
             (stubs / name).write_text(text)
             (stubs / name).chmod(0o755)
         self.log = self.dir / "stub.log"
         self.env = {**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}", "TMPDIR": str(self.dir),
-                    "STUB_LOG": str(self.log), "STUB_PYTHON": sys.executable, "STUB_TEST_SERVER": "0",
+                    "STUB_ARGV_LOG": str(self.dir / "argv.log"),
+                    "STUB_LOG": str(self.log), "STUB_TRANSPORT_LOG": str(self.dir / "transport.log"),
+                    "STUB_SSH": str(stubs / "ssh"), "STUB_PYTHON": sys.executable, "STUB_TEST_SERVER": "0",
                     "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
         self.git(self.repo, "init", "-q")
         for tag in ("v1.0.0", "note", "v1.1.0"):          # note — не версия: --from его пропускает
@@ -1244,7 +1281,11 @@ exit 0
 
     def rollout(self, *args, **env):
         self.log.unlink(missing_ok=True)
-        result = subprocess.run(["bash", str(self.repo / "tools/rollout.sh"), "admin@test", *args],
+        (self.dir / "argv.log").unlink(missing_ok=True)
+        (self.dir / "transport.log").unlink(missing_ok=True)
+        self.assertEqual(shutil.which("ssh", path=self.env["PATH"]), self.env["STUB_SSH"])
+        self.assertEqual(shutil.which("rsync", path=self.env["PATH"]), str(self.dir / "bin/rsync"))
+        result = subprocess.run(["bash", str(self.repo / "tools/rollout.sh"), env.get("STUB_DEST", "admin@test"), *args],
                                 env={**self.env, **env}, stdin=subprocess.DEVNULL, capture_output=True, text=True)
         return result, self.log.read_text().splitlines() if self.log.exists() else []
 
@@ -1357,6 +1398,84 @@ exit 0
                 result, _ = self.rollout("--upgrade", "v1.1.0", "--from", "v1.0.0", STUB_SERVER_YML=str(yml))
                 self.assertEqual(result.returncode, rc, result.stdout + result.stderr)
                 self.assertIn(why, result.stdout + result.stderr)
+
+    def test_keepalive_every_call_and_scenarios(self):
+        for args in ([], ["--scenarios"], ["--upgrade", "v1.1.0", "--from", "v1.0.0"]):
+            with self.subTest(args=args):
+                result, calls = self.rollout(*args, STUB_GIT="0")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                records = [json.loads(line) for line in (self.dir / "argv.log").read_text().splitlines()]
+                self.assertEqual(len(records), len(calls))  # rsync заменён своим SSH transport
+                for record in records:
+                    self.assertEqual(record[:5], ["-o", "ServerAliveInterval=30", "-o",
+                                                  "ServerAliveCountMax=4", "admin@test"])
+                if "--upgrade" in args:
+                    self.assertEqual(calls, self.UPGRADE)
+                    self.assertFalse((self.dir / "transport.log").exists())
+                else:
+                    self.assertEqual((self.dir / "transport.log").read_text(), "transport rsync-transport\n")
+                    if args:
+                        self.assertEqual(calls[-1], "ssh sudo infra run tests/scenarios.yml")
+
+    def test_transport_failure_and_remote_failure_differ(self):
+        for command in ("sudo /opt/infra/install.sh", "sudo infra apply --check",
+                        "sudo infra run tests/scenarios.yml", "sudo infra upgrade v1.1.0 -y"):
+            args = ["--upgrade", "v1.1.0", "--from", "v1.0.0"] if "upgrade" in command else ["--scenarios"]
+            for rc in ("1", "255"):
+                with self.subTest(command=command, rc=rc):
+                    result, calls = self.rollout(*args, STUB_FAIL_COMMAND=command, STUB_FAIL_RC=rc)
+                    self.assertNotEqual(result.returncode, 0)
+                    output = result.stdout + result.stderr
+                    self.assertEqual("SSH: код 255" in output, rc == "255", output)
+                    self.assertEqual(calls[-1], "ssh " + command)  # после сбоя нет следующего шага
+                    if "install.sh" in command:
+                        self.assertIn("stub: remote failure", output)
+                    else:
+                        log = pathlib.Path(output.split("Полный вывод: ", 1)[1].splitlines()[0])
+                        self.assertIn("stub: remote failure", log.read_text())
+                        self.assertIn(str(log), output)
+                    if rc == "255":
+                        self.assertIn("Итог операции на сервере неизвестен", output)
+                        self.assertIn("/var/lib/infra/last-run.log", output)
+
+    def test_early_connection_failure_stops_copy(self):
+        for command in ("sudo /opt/infra/.venv/bin/python -", "sudo test -d /opt/infra/.git",
+                        "sudo rm -rf /opt/infra/.git"):
+            with self.subTest(command=command):
+                result, calls = self.rollout(STUB_FAIL_COMMAND=command, STUB_FAIL_RC="255", STUB_GIT="0")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("SSH: код 255", result.stderr)
+                self.assertEqual(calls[-1], "ssh " + command)
+                self.assertFalse(any(c.startswith("rsync") for c in calls))
+
+    def test_rsync_failure_is_not_assumed_ssh_255(self):
+        for rc in ("1", "12", "255"):
+            with self.subTest(rc=rc):
+                result, calls = self.rollout(STUB_RSYNC_RC=rc)
+                self.assertEqual(result.returncode, int(rc))
+                self.assertIn("rsync: код " + rc, result.stderr)
+                self.assertIn("stub: rsync failure", result.stderr)
+                self.assertIn("Код rsync может отличаться от кода SSH", result.stderr)
+                self.assertNotIn("SSH: код 255", result.stderr)
+                self.assertTrue(calls[-1].startswith("rsync "))
+
+    def test_rsync_child_ssh_255_can_return_12(self):
+        result, calls = self.rollout(STUB_TRANSPORT_RC="255")
+        self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
+        self.assertIn("stub: transport SSH 255", result.stderr)
+        self.assertIn("rsync: код 12", result.stderr)
+        self.assertIn("Код rsync может отличаться от кода SSH", result.stderr)
+        self.assertFalse(any("install.sh" in call for call in calls))
+
+    def test_destination_stays_one_argument(self):
+        marker = self.dir / "must-not-exist"
+        dest = f"admin@example.com ; touch '{marker}'; $(touch '{marker}')"
+        result, _ = self.rollout("--scenarios", STUB_DEST=dest)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        records = [json.loads(line) for line in (self.dir / "argv.log").read_text().splitlines()]
+        self.assertTrue(records)
+        self.assertTrue(all(record[4] == dest for record in records))
+        self.assertFalse(marker.exists())
 
     def test_engine_script(self):
         # U0 — скрипт для сервера из rollout.sh: на копии движка (rsync поверх) и на грязном git — чистый git
