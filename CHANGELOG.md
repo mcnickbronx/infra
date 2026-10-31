@@ -10,6 +10,8 @@
 
 ## Не выпущено
 
+- Из тестовых вызовов health-check убраны перекрываемые пустые `HC_URL`; поведение пингов прежнее.
+
 - Роли rootless получают образ через `project-deploy <проект> image`; обратный перевод не читает `.env` по ссылке.
 
 - **Preflight предупреждает об удалении `backup_healthcheck_url` и `monitor_healthcheck_url` в v3.0.0.**

@@ -511,7 +511,7 @@
         echo "DEPLOY_IMAGE=localhost:5000/verify:test" > .env
         put() { docker tag localhost:5000/verify:$1 localhost:5000/verify:test && docker push -q localhost:5000/verify:test >/dev/null; }
         page() { project-compose shop exec -T web wget -q -O- http://127.0.0.1:8080/ 2>&1; }
-        alerts() { HC_URL= /usr/local/bin/health-check.sh | grep -c 'Автовыкладка shop'; }
+        alerts() { /usr/local/bin/health-check.sh | grep -c 'Автовыкладка shop'; }
         failed() { cut -d' ' -f3- /var/lib/project-deploy/shop.failed; }
         # Проект запущен руками (до автовыкладки) — v0
         docker tag localhost:5000/verify:v0 localhost:5000/verify:test
