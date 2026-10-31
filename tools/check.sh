@@ -48,8 +48,20 @@ shellcheck_files() { scripts | xargs shellcheck -S warning -e SC1090,SC1091; }
 # Шаблоны рендерятся на тестовом инвентаре и сравниваются с эталоном в git.
 # Изменение ожидаемое — посмотрите git diff tests/golden и добавьте: git add tests/golden
 golden() {
-  ansible-playbook -i tests/inventory tests/render.yml >/dev/null || {
-    ansible-playbook -i tests/inventory tests/render.yml | grep -E 'fatal|failed:|msg' | head -20; return 1; }
+  local render_log
+  render_log=$(mktemp) || return 1
+  if ! ansible-playbook -i tests/inventory tests/render.yml >"$render_log" 2>&1; then
+    # Предупреждения preflight — в полном журнале; сначала причина отказа с контекстом.
+    # Нет обычных маркеров Ansible — покажем конец вывода, не спрячем нестандартный сбой.
+    awk '
+      /^\[ERROR\]:|^(fatal|failed):/ { found = 1 }
+      found && shown++ < 20 { print }
+      END { exit !found }
+    ' "$render_log" || tail -20 "$render_log"
+    printf 'Полный вывод рендера (включая предупреждения): %s\n' "$render_log"
+    return 1
+  fi
+  rm -f "$render_log"
   local new
   new=$(git ls-files --others --exclude-standard -- tests/golden)
   if ! git diff --quiet -- tests/golden || [ -n "$new" ]; then
