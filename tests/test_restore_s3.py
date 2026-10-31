@@ -21,7 +21,9 @@ if ! type -t mapfile >/dev/null; then
     while IFS= read -r line || [ -n "$line" ]; do SNAP[${#SNAP[@]}]=$line; done
   }
 fi
-source "$1" "${@:2}"
+restore_script=$1
+shift
+source "$restore_script" "$@"
 '''
 STUB = r'''
 import json, os, pathlib, shutil, subprocess, sys, tempfile
@@ -34,10 +36,13 @@ def inside(value):
     assert p.is_relative_to(root), ('выход из стенда', value)
     return p
 record([name, args, os.environ.get('RESTIC_REPOSITORY'), os.environ.get('MARKER')])
+# Дескриптор замка остаётся открытым до последней команды восстановления.
+if name in ('docker', 'restic', 'rsync', 'project-db-empty', 'runuser', 'infra-log'):
+    assert os.fstat(9).st_ino == (root / 'var/lib/project-deploy/shop.lock').stat().st_ino
 project, dumps = root / 'srv/projects/shop', root / 'var/backups/db/shop'
 if name == 'restic':
-    assert os.environ['RESTIC_REPOSITORY'] == os.environ['EXPECTED_REPO'], 'не S3'
-    assert os.environ['MARKER'] == 's3', 'прочитан local env'
+    assert os.environ['RESTIC_REPOSITORY'] == os.environ['EXPECTED_REPO'], 'неверный репозиторий'
+    assert os.environ['MARKER'] == os.environ['EXPECTED_MARKER'], 'прочитан другой env'
     snapshots = json.loads((root / 'snapshots').read_text())
     if args[0] == 'snapshots':
         assert args[:3] == ['snapshots', '--json', '--tag']
@@ -104,8 +109,11 @@ elif name == 'project-docker-host':
     if len(args) == 2: print('shop-run')
 elif name == 'docker':
     assert args == ['ps', '-q', '--filter', 'label=com.docker.compose.project=shop']
+    if os.environ.get('FAIL') == 'docker': sys.exit(1)
+    if os.environ.get('RUNNING'): print('synthetic-container')
 elif name == 'flock':
     assert args == ['-w', '30', '9']
+    if os.environ.get('FAIL') == 'flock': sys.exit(1)
 elif name != 'infra-log':
     raise AssertionError(('неизвестная команда', name, args))
 '''
@@ -127,7 +135,7 @@ class RestoreS3(unittest.TestCase):
         (self.root / 'etc/restic/env').write_text(
             f'MARKER=local\nRESTIC_REPOSITORY=local\ntouch "{self.root / "local-read"}"\n')
         self.s3 = self.root / 'etc/restic/s3-env'
-        self.s3.write_text(f'MARKER=s3\nRESTIC_REPOSITORY={REPO}\n')
+        self.s3.write_text(f'MARKER=s3\nRESTIC_REPOSITORY={REPO}\ntouch "{self.root / "s3-read"}"\n')
         script = SCRIPT.read_text()
         # Только системные абсолютные пути, включая те же пути в metadata снимков.
         for prefix in ('/etc/restic', '/var/lib/project-deploy', '/var/tmp',
@@ -141,17 +149,24 @@ class RestoreS3(unittest.TestCase):
                                tags=['project:shop'] + (['db-only'] if i == 'c' else []))
                           for i, day in [('c', '24'), ('a', '22'), ('b', '23')]]
 
-    def restore(self, snapshot='latest', fail=''):
+    def restore(self, snapshot='latest', fail='', *, argv=None, repo=REPO, marker='s3', running=''):
+        for name in ('calls', 'local-read', 's3-read'):
+            (self.root / name).unlink(missing_ok=True)
         (self.root / 'snapshots').write_text(json.dumps(self.snapshots))
         env = {'PATH': f"{self.root / 'bin'}:{os.environ['PATH']}",
                'STAND': str(self.root), 'TMPDIR': str(self.root / 'tmp'),
-               'EXPECTED_REPO': REPO, 'FAIL': fail}
+               'EXPECTED_REPO': repo, 'EXPECTED_MARKER': marker, 'FAIL': fail, 'RUNNING': running}
+        if argv is None:
+            argv = ['shop', str(self.s3), snapshot]
         run = subprocess.run(['bash', '-c', MAPFILE, 'restore-test', str(self.script),
-                              'shop', str(self.s3), snapshot], cwd=self.root, env=env,
+                              *argv], cwd=self.root, env=env,
                              text=True, capture_output=True, timeout=20)
-        self.calls = [json.loads(line) for line in (self.root / 'calls').read_text().splitlines()]
+        calls = self.root / 'calls'
+        self.calls = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
         self.assertNotIn('Traceback', run.stderr, run.stderr)
-        self.assertFalse((self.root / 'local-read').exists(), 'прочитан local env')
+        self.assertNotIn(REPO, run.stdout + run.stderr, 'содержимое env попало в вывод')
+        if marker != 'local':
+            self.assertFalse((self.root / 'local-read').exists(), 'прочитан local env')
         self.assertEqual(list((self.root / 'tmp').iterdir()), [], run.stderr)
         self.assertEqual(list((self.root / 'var/tmp').iterdir()), [], run.stderr)
         for call in self.calls:
@@ -206,6 +221,106 @@ class RestoreS3(unittest.TestCase):
     def test_parent_component_refused_before_restore(self):
         self.snapshots[2]['paths'] = [str(self.root / 'srv/projects/shop/../other')]
         self.assert_refused('некорректный путь')
+
+    def test_named_and_positional_restore_have_same_effects(self):
+        def effects():
+            # Временные имена меняются от вызова к вызову, команды и выбранные пути — нет.
+            temps = [call[1] for call in self.calls if call[0] == 'temp']
+            result = json.dumps([call for call in self.calls if call[0] not in ('temp', 'infra-log')])
+            for i, path in enumerate(temps):
+                result = result.replace(path, f'<temp{i}>')
+            # Стороны pg_restore | psql журналируются параллельно; порядок замка проверен отдельно.
+            return sorted(json.loads(result), key=json.dumps)
+
+        cases = [([], [], 'local', 'local'),
+                 ([''], ['--snapshot', 'latest'], 'local', 'local'),
+                 (['', ''], ['--snapshot', 'latest'], 'local', 'local'),
+                 ([str(self.s3)], ['--env', str(self.s3)], REPO, 's3'),
+                 ([str(self.s3), ''], ['--env', str(self.s3)], REPO, 's3')]
+        for snapshot in ('latest', 'a' * 8, 'a' * 64, 'c' * 64):
+            cases.extend([([str(self.s3), snapshot], named, REPO, 's3') for named in
+                          (['--env', str(self.s3), '--snapshot', snapshot],
+                           ['--snapshot', snapshot, '--env', str(self.s3)])])
+            cases.append((['', snapshot], ['--snapshot', snapshot], 'local', 'local'))
+        for old, new, repo, marker in cases:
+            with self.subTest(old=old, new=new):
+                run = self.restore(argv=['shop', *old], repo=repo, marker=marker)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                before = effects()
+                run = self.restore(argv=['shop', *new], repo=repo, marker=marker)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(effects(), before)
+                self.assertTrue((self.root / f'{marker}-read').exists())
+                names = [call[0] for call in self.calls]
+                self.assertLess(names.index('flock'), names.index('docker'))
+
+    def test_named_env_path_is_literal(self):
+        path = self.s3.with_name('env space $(touch pwned);`touch pwned2` "quote"')
+        self.s3.rename(path)
+        run = self.restore(argv=['shop', '--snapshot', 'a' * 8, '--env', str(path)])
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.commands('restic')[-1][1], 'a' * 64)
+        self.assertTrue((self.root / 's3-read').exists())
+        for name in ('pwned', 'pwned2'):
+            self.assertFalse((self.root / name).exists())
+
+    def test_bad_cli_never_reads_env_or_calls_commands(self):
+        env = str(self.s3)
+        cases = [[], [''], ['--unknown'], ['shop', '--unknown'], ['shop', '--snapshot'],
+                 ['shop', '--env'], ['shop', '--snapshot', ''], ['shop', '--env', ''],
+                 ['shop', '--snapshot', '--env', env], ['shop', '--env', '--snapshot', 'latest'],
+                 ['shop', '--snapshot', 'latest', '--snapshot', 'latest'],
+                 ['shop', '--env', env, '--env', env],
+                 ['shop', env, '--snapshot', 'latest'], ['shop', '--snapshot', 'latest', env],
+                 ['shop', env, 'latest', 'extra'], ['shop', '--env', env, '--unknown'],
+                 ['shop', '--env', env, 'latest'], ['shop', env, '--unknown'],
+                 ['shop', '--snapshot=latest'], ['shop', '--env', env, '--snapshot', ''],
+                 ['shop', '--snapshot', 'latest', 'x' * 20000]]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                run = self.restore(argv=argv)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertIn('Использование:', run.stderr)
+                self.assertNotIn('unbound variable', run.stderr)
+                self.assertEqual(self.calls, [])
+                self.assertFalse((self.root / 's3-read').exists())
+                self.assertEqual(list((self.root / 'var/lib/project-deploy').iterdir()), [])
+                self.assertNotIn(REPO, run.stdout + run.stderr)
+
+    def test_snapshot_is_data_and_old_second_argument_is_still_env(self):
+        for snapshot in ('$(touch pwned)', '`touch pwned2`', 'z' * 20000):
+            with self.subTest(snapshot=snapshot):
+                run = self.restore(argv=['shop', '--env', str(self.s3), '--snapshot', snapshot])
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn('не найден', run.stderr)
+                self.assertFalse([a for a in self.commands('restic') if a[0] == 'restore'])
+                self.assertEqual(self.commands('project-db-empty'), [])
+        for name in ('pwned', 'pwned2'):
+            self.assertFalse((self.root / name).exists())
+        # Похожий на ID второй аргумент остаётся буквальным именем source-файла.
+        self.s3.rename(self.root / ('a' * 8))
+        run = self.restore(argv=['shop', 'a' * 8])
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.commands('restic')[-1][1], 'b' * 64)
+
+    def test_named_restore_preserves_guards_and_failure_cleanup(self):
+        argv = ['shop', '--env', str(self.s3), '--snapshot', 'latest']
+        for fail, running, message in (('flock', '', 'идёт выкладка'),
+                                       ('docker', '', 'Docker не ответил'),
+                                       ('', 'yes', 'Проект shop запущен')):
+            with self.subTest(fail=fail, running=running):
+                run = self.restore(argv=argv, fail=fail, running=running)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn(message, run.stderr)
+                self.assertEqual(self.commands('restic'), [])
+                self.assertEqual(self.commands('mktemp'), [])
+                if fail == 'flock': self.assertEqual(self.commands('docker'), [])
+        for fail in ('restic', 'pg_restore'):
+            with self.subTest(fail=fail):
+                run = self.restore(argv=argv, fail=fail)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(len([c for c in self.calls if c[0] == 'temp']),
+                                 1 if fail == 'restic' else 2)
 
     def assert_refused(self, message):
         run = self.restore()

@@ -5,6 +5,7 @@
 # автовыкладка проекта ждёт (тот же замок, что у project-deploy).
 # Использование:
 #   project-restore <имя> [env-файл] [снимок]
+#   project-restore <имя> [--env PATH] [--snapshot ID]
 # env-файл — настройки restic; чтобы восстановить с ДРУГОГО сервера,
 # укажите файл с его репозиторием и ключами (ADMIN.md, «Восстановление и перенос»).
 #
@@ -20,9 +21,51 @@
 # у владельцев файлов и в ACL, иначе файлы проекта достались бы чужой группе.
 set -Eeuo pipefail
 
-NAME=${1:?Использование: project-restore <имя> [env-файл] [снимок]}
-ENV_FILE=${2:-/etc/restic/env}
-SNAPSHOT=${3:-latest}
+usage_error() {
+  echo "$1" >&2
+  echo "Использование: project-restore <имя> [env-файл] [снимок]" >&2
+  echo "          или project-restore <имя> [--env PATH] [--snapshot ID]" >&2
+  echo "По умолчанию: /etc/restic/env, latest. Формы аргументов не смешиваются." >&2
+  exit 2
+}
+
+[ -n "${1:-}" ] || usage_error "Нужно имя проекта"
+NAME=$1
+case $NAME in -*) usage_error "Нужно имя проекта перед параметрами" ;; esac
+shift
+ENV_FILE=/etc/restic/env
+SNAPSHOT=latest
+# Сначала весь CLI, затем source и обработчик завершения: ошибка ввода ничего не запускает.
+case ${1:-} in
+  -*)
+    SEEN_ENV=0
+    SEEN_SNAPSHOT=0
+    while [ "$#" -gt 0 ]; do
+      case $1 in
+        --env|--snapshot)
+          [ "$#" -ge 2 ] && [ -n "$2" ] || usage_error "Для $1 нужно непустое значение"
+          case $2 in -*) usage_error "Для $1 нужно значение, а не параметр" ;; esac
+          if [ "$1" = --env ]; then
+            [ "$SEEN_ENV" = 0 ] || usage_error "Повторный параметр --env"
+            ENV_FILE=$2
+            SEEN_ENV=1
+          else
+            [ "$SEEN_SNAPSHOT" = 0 ] || usage_error "Повторный параметр --snapshot"
+            SNAPSHOT=$2
+            SEEN_SNAPSHOT=1
+          fi
+          shift 2 ;;
+        *) usage_error "Неизвестный параметр или смешение форм аргументов" ;;
+      esac
+    done ;;
+  *)
+    [ "$#" -le 2 ] || usage_error "Лишние позиционные аргументы"
+    for ARG in "$@"; do
+      case $ARG in -*) usage_error "Неизвестный параметр или смешение форм аргументов" ;; esac
+    done
+    ENV_FILE=${1:-/etc/restic/env}
+    SNAPSHOT=${2:-latest} ;;
+esac
 LIST=/etc/restic/projects.json
 STAGE=""
 PGLIST=""

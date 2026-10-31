@@ -456,12 +456,17 @@ sudo git -C /opt/infra checkout -q <версия> && sudo /opt/infra/install.sh 
 
 ```bash
 sudo project-compose shop down
-sudo project-restore shop            # последний полный снимок; другой: project-restore shop /etc/restic/env <id>
+sudo project-restore shop            # последний полный снимок; другой: project-restore shop --snapshot abc12345
 sudo project-compose shop up -d
 ```
 
 Запущенный проект `project-restore` не трогает: отказ, сначала `down`. Автовыкладка проекта на время
 восстановления ждёт.
+
+`--snapshot ID` выбирает полный/короткий номер снимка или `latest`; без `--env` источник —
+`/etc/restic/env`. Другой источник, в том числе S3, задайте явно: `project-restore shop --env /etc/restic/old-env --snapshot abc12345`.
+Порядок флагов свободный. Старые вызовы `project-restore shop [env-файл] [снимок]` работают как раньше,
+включая ручной/S3-путь ниже; позиционные аргументы с флагами не смешиваются.
 
 **Копия прод-базы в dev** — проверить миграции и код на настоящих данных. Только в проект `*_dev`
 (перепутать «откуда» и «куда» и стереть прод нельзя). Меню: проект `*_dev` → «Заменить базу копией
