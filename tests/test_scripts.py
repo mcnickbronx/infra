@@ -2376,35 +2376,125 @@ esac
         self.assertEqual((self.web / "compose.yml").read_bytes(), before)
         self.assertEqual(self.leftovers(), ["compose.yml"])
 
+    def boundary_snapshot(self, *roots):
+        """Имена, вид, inode, число ссылок, права и данные: одинаковый текст не скрывает замену файла."""
+        result = {}
+
+        def visit(path):
+            st = path.lstat()
+            data = os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None
+            result[str(path)] = (st.st_mode, st.st_ino, st.st_nlink, st.st_uid, st.st_gid, data)
+            if path.is_dir() and not path.is_symlink():
+                for child in path.iterdir():
+                    visit(child)
+
+        for root in roots:
+            visit(root)
+        return result
+
+    def loud_boundary_commands(self):
+        for command in ("project-docker-host", "flock"):
+            (self.bin / command).write_text(f'#!/bin/sh\necho "{command} $*" >> "$STUB_LOG"\n')
+
     def test_open_project_dir_refused_on_deploy(self):
-        # таймер: в папку проекта пишет группа — временный compose.yml туда не кладётся: отказ на шаге
-        # «compose.yml из образа» до скачивания версии, работает прежняя
+        # Таймер отказывает до Docker, замка и fail/restore; даже существующие отметки прежние.
         self.proj.chmod(0o770)
+        (self.web / "compose.yml").write_text("current compose\n")
+        (self.web / "compose.yml.prev").write_text("previous-marker\n")
+        (self.states / "shop.failed").write_text("old failure\n")
+        before = self.boundary_snapshot(self.proj, self.states)
+        self.loud_boundary_commands()
         run, lines = self.timer()
         self.assertEqual(run.returncode, 1, run.stderr)
-        self.assertIn(f"в папку {self.proj} пишет не только root — временный compose.yml туда не кладу", run.stderr)
-        self.assertIn("не удалось на шаге «compose.yml из образа»", run.stderr)
-        self.assertNotIn(f"docker pull -q {self.REPO}@{self.NEW}", lines)
-        self.assertEqual(self.leftovers(), [])
+        self.assertIn("пишет не только root", run.stderr)
+        self.assertIn("ничего не менял", run.stderr)
+        self.assertNotIn("возвращаю", run.stderr)
+        self.assertEqual(lines, [])
+        self.assertEqual(self.boundary_snapshot(self.proj, self.states), before)
         self.assertEqual(self.state("current"), f"{self.REPO}@{self.OLD}")
 
     def test_open_project_dir_other_compose_new_kept(self):
-        # папка проекта открыта группе, участник сделал web ссылкой на web/ другого проекта (у shop не задан image):
-        # таймер отказывает на шаге «compose.yml из образа», а compose.yml.new соседа цел — остаток версий до v2.1.0
-        # root удаляет только после proj_root_only (rm берёт имя в папке, куда ведёт web)
-        other = self.dir / "other-proj" / "web"
-        other.mkdir(parents=True)
-        (other / ".env").write_text("DEPLOY_IMAGE=ghcr.io/example/other:main\n")
-        (other / "compose.yml").write_text("services: {other: {}}\n")
-        (other / "compose.yml.new").write_text("other new\n")
-        shutil.rmtree(self.web)
-        self.web.symlink_to(other)
-        self.proj.chmod(0o770)
-        run, _ = self.deploy(STUB_TAGS=f"ghcr.io/example/other:main={self.NEW}")
-        self.assertEqual(run.returncode, 1, run.stderr)
-        self.assertIn("пишет не только root — временный compose.yml туда не кладу", run.stderr)
-        self.assertTrue((other / "compose.yml.new").is_file(), "root удалил compose.yml.new в чужой папке")
-        self.assertEqual((other / "compose.yml.new").read_text(), "other new\n")
+        # Открытая папка и web-ссылка на соседа: ни чтения .env, ни замены compose.prev, ни Docker.
+        self.unsafe_project_boundary("web-link")
+
+    def unsafe_project_boundary(self, kind):
+        other = self.dir / "other-proj"
+        other_web = other / "web"
+        other_web.mkdir(parents=True)
+        for web in (self.web, other_web):
+            repo = self.REPO if web == self.web else "ghcr.io/example/other"
+            (web / ".env").write_text(f"DEPLOY_IMAGE={repo}:main\n")
+            for name in ("compose.yml", "compose.yml.prev", "compose.yml.new"):
+                (web / name).write_text(f"{web.parent.name} {name} marker\n")
+        for name, text in (("previous", f"{self.REPO}@{self.NEW}\n"), ("failed", "old failure\n"),
+                           ("failed-ref", f"{self.REPO}@sha256:{'3' * 64}\n"), ("lock", "lock marker\n")):
+            (self.states / f"shop.{name}").write_text(text)
+        self.proj.chmod(0o750)
+        if kind == "web-link":
+            shutil.rmtree(self.web)
+            self.web.symlink_to(other_web)
+            self.proj.chmod(0o770)
+        elif kind == "project-link":
+            shutil.rmtree(self.proj)
+            other.chmod(0o750)
+            self.proj.symlink_to(other)
+        elif kind == "owner":
+            # Весь CLI и штатная stat-заглушка; другой uid моделируется только у папки проекта.
+            text = self.STUBS["stat"].replace("('%u', st.st_uid)",
+                f"('%u', st.st_uid + (os.path.realpath(path) == {str(self.proj.resolve())!r}))")
+            (self.bin / "stat").write_text(text)
+        else:
+            self.proj.chmod(0o770 if kind == "group" else 0o757)
+        self.loud_boundary_commands()
+        before = self.boundary_snapshot(self.proj, other, self.states)
+        for args in ((), ("rollback",), ("to", self.HASH), ("to", self.HASH, "--wait")):
+            with self.subTest(kind=kind, args=args):
+                self.log.unlink(missing_ok=True)
+                self.fslog.write_text("")
+                run, lines = self.deploy(*args, STUB_TAGS=f"{self.REPO}:main={self.NEW} "
+                                                         f"{self.REPO}:{self.HASH}={self.NEW} "
+                                                         f"ghcr.io/example/other:main={self.NEW} "
+                                                         f"ghcr.io/example/other:{self.HASH}={self.NEW}")
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(lines, [])       # в том числе ожидание, Docker, Compose, замок и восстановление
+                self.assertEqual(self.fs("dd", "mv", "chmod", "chown", "setfacl", "getfacl"), [])
+                self.assertEqual(self.boundary_snapshot(self.proj, other, self.states), before)
+                self.assertIn("ничего не менял", run.stderr)
+                self.assertNotIn("возвращаю", run.stderr)
+
+    def test_group_writable_project_boundary(self):
+        self.unsafe_project_boundary("group")
+
+    def test_world_writable_project_boundary(self):
+        self.unsafe_project_boundary("world")
+
+    def test_other_project_owner_boundary(self):
+        self.unsafe_project_boundary("owner")
+
+    def test_project_symlink_boundary(self):
+        self.unsafe_project_boundary("project-link")
+
+    def test_safe_project_boundary_all_actions(self):
+        self.proj.chmod(0o750)
+        for args in ((), ("rollback",), ("to", self.HASH), ("to", self.HASH, "--wait")):
+            with self.subTest(args=args):
+                self.log.unlink(missing_ok=True)
+                self.env.write_text(self.ENV)
+                (self.states / "shop.current").write_text(f"{self.REPO}@{self.OLD}\n")
+                (self.states / "shop.previous").write_text(f"{self.REPO}@{self.NEW}\n")
+                run, lines = self.deploy(*args, STUB_TAGS=f"{self.REPO}:main={self.NEW} "
+                                                         f"{self.REPO}:{self.HASH}={self.NEW}")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertTrue(any(" up " in line for line in lines), lines)
+                self.assertEqual(self.state("current"), f"{self.REPO}@{self.NEW}")
+
+    def test_image_reader_does_not_require_project_owner(self):
+        # Читатель rootless не владеет папкой: проверки изменяющих действий к image не применяются.
+        self.proj.chmod(0o750)
+        (self.bin / "id").write_text('#!/bin/sh\necho 123456\n')
+        (self.bin / "id").chmod(0o755)
+        self.pin()
+        self.image_result(0, f"{self.REPO}:main\n")
 
     def test_restore_not_into_linked_dir(self):
         # откат: участник к запуску (up) ставит на место compose.yml ссылку на чужую папку и свой compose.yml.prev,

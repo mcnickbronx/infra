@@ -132,6 +132,19 @@ if [ "$ACTION" = image ]; then
   exit 0
 fi
 
+# Папку проекта пишет только root (роль project: root, 0750), сама она — не ссылка.
+# $2 — уже открытая папка (.), иначе проверяем путь заново перед временными файлами.
+proj_root_only() {
+  local dir=${2:-$PROJ}
+  [ ! -L "$PROJ" ] && [ -d "$dir" ] && [ "$(stat -c %u -- "$dir")" = "$(id -u)" ] &&
+    (( (8#$(stat -c %a -- "$dir") & 8#022) == 0 )) ||
+    { echo "$NAME: в папку $PROJ пишет не только root или это ссылка/не папка — $1; права вернёт sudo infra apply" >&2; return 1; }
+}
+
+# Общий вход для изменяющих действий: до web/, Docker, ожидания и состояния.
+# В подоболочке проверяем открытую папку через .; рабочая папка остального скрипта прежняя.
+(cd -P -- "$PROJ" && proj_root_only "ничего не менял" .) || exit 1
+
 # ---------- Шаги выкладки ----------
 compose() { project-compose "$NAME" "$@"; }
 # Проект без root (rootless): образы и контейнеры — в его Docker. Скачивает образ root (вход в ghcr —
@@ -148,13 +161,6 @@ running_image() {
   docker ps -q --filter "label=com.docker.compose.project=$NAME" |
     xargs -r docker inspect -f '{{.Config.Image}} {{.Image}}' |
     awk -v img="$IMAGE" '$1 == img { id = $2 } END { print id }' || true
-}
-
-# Папку проекта пишет только root (роль project: root, 0750)? Временные файлы root кладёт туда, а не в web/,
-# где их подменили бы ссылкой. Нет — текст ($1 — что не кладу) и код 1
-proj_root_only() {
-  [ "$(stat -c %u -- "$PROJ")" = "$(id -u)" ] && (( (8#$(stat -c %a -- "$PROJ") & 8#022) == 0 )) ||
-    { echo "$NAME: в папку $PROJ пишет не только root — $1; права вернёт sudo infra apply" >&2; return 1; }
 }
 
 # Проект — на версию $1: образ — под именем из .env, его compose.yml — в web/
