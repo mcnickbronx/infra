@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""Проверка custom-дампа из S3 в отдельной ограниченной PostgreSQL LOGIN-сессии."""
+import argparse
+import base64
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import resource
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+OWNER_UID = 0
+PG_PORT = "5432"
+S3_ENV = Path("/etc/restic/s3-env")
+PROJECTS = Path("/etc/restic/projects.json")
+STAGE_ROOT = Path("/var/tmp")
+LOCK_ROOT = Path("/run")
+DEPLOY_ROOT = Path("/var/lib/project-deploy")
+MAX_DUMP = 512 * 1024**2
+MAX_METADATA = 16 * 1024**2
+RESERVE = 1024**3
+SHELL_STARTUP = {"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "GLOBIGNORE"}
+TERMINATING = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+
+
+class Refused(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Refused(message)
+
+
+def literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def identifier(value):
+    return '"' + value.replace('"', '""') + '"'
+
+
+def timestamp(value):
+    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    require(stamp.tzinfo is not None, "У времени снимка/дампа отсутствует часовой пояс")
+    return stamp.timestamp()
+
+
+def verifier(password):
+    salt = secrets.token_bytes(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 4096)
+    stored = hashlib.sha256(hmac.digest(key, b"Client Key", "sha256")).digest()
+    server = hmac.digest(key, b"Server Key", "sha256")
+    encoded = [base64.b64encode(value).decode() for value in (salt, stored, server)]
+    return f"SCRAM-SHA-256$4096:{encoded[0]}${encoded[1]}:{encoded[2]}"
+
+
+class Check:
+    def __init__(self, name):
+        self.name = name
+        self.stage = None
+        self.locks = []
+        self.temp = "infra_check_" + secrets.token_hex(12)
+        self.marker = "infra-restore-check:" + secrets.token_hex(24)
+        self.password = secrets.token_urlsafe(32)
+        self.role_attempted = self.db_attempted = False
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in SHELL_STARTUP and not k.startswith(("PG", "RESTIC_", "AWS_", "BASH_FUNC_"))}
+        self.env.update(LC_ALL="C", PGCONNECT_TIMEOUT="5")
+
+    def command(self, argv, *, sql=None, env=None, output=None, timeout=60,
+                acceptable=(0,), limited=False):
+        def limit():
+            maximum = MAX_DUMP if limited else MAX_METADATA
+            resource.setrlimit(resource.RLIMIT_FSIZE, (maximum, maximum))
+        with tempfile.TemporaryFile(dir=self.stage) as capture:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=output or capture,
+                                    stderr=subprocess.DEVNULL, env=env or self.env,
+                                    start_new_session=True, preexec_fn=limit)
+            try:
+                proc.communicate(None if sql is None else sql.encode(), timeout=timeout)
+            except BaseException:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+                raise
+            # Не печатаем stderr: там могут оказаться дамп/URI/пароли. Метаданные
+            # ограничены до чтения в память; анонимный файл закрывается на каждом выходе.
+            require(proc.returncode in acceptable, f"{Path(argv[0]).name}: технический сбой (код {proc.returncode})")
+            capture.seek(0)
+            return proc.returncode, capture.read(MAX_METADATA + 1).decode()
+
+    def sql(self, query, *, db="postgres", restricted=False, acceptable=(0,)):
+        argv = ["psql", "-X", "-q", "-tA", "-v", "ON_ERROR_STOP=1", "-d", db]
+        env = {k: v for k, v in self.env.items() if not k.startswith(("RESTIC_", "AWS_"))}
+        if restricted:
+            env.update(PGHOST="127.0.0.1", PGPORT=PG_PORT, PGUSER=self.temp,
+                       PGPASSWORD=self.password)
+        else:
+            argv = ["runuser", "-u", "postgres", "--", *argv]
+            env["PGOPTIONS"] = "-c log_statement=none -c log_min_duration_statement=-1 -c log_min_duration_sample=-1 -c log_min_error_statement=panic"
+        return self.command(argv, sql=query, env=env, acceptable=acceptable)[1].strip()
+
+    def lock(self, path):
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        self.locks.append(fd)
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == OWNER_UID and not info.st_mode & 0o022,
+                "Небезопасный файл блокировки")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused("Идёт другая проверка, бэкап, копирование или выкладка; повторите позже") from None
+
+    def source(self):
+        info = S3_ENV.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == OWNER_UID and not info.st_mode & 0o077,
+                "s3-env должен принадлежать root и иметь права 0600")
+        _, values = self.command(["bash", "-c", 'set -ae; source "$1"; env -0', "bash", str(S3_ENV)])
+        self.env = dict(part.split("=", 1) for part in values.split("\0") if "=" in part)
+        require(self.env.get("RESTIC_REPOSITORY", "").startswith("s3:")
+                and not self.env.get("RESTIC_REPOSITORY_FILE"), "Нужен S3-источник из s3-env")
+        for key in list(self.env):
+            if key in SHELL_STARTUP or key.startswith(("PG", "RESTIC_FROM_", "BASH_FUNC_")):
+                del self.env[key]
+        self.env.update(LC_ALL="C", PGCONNECT_TIMEOUT="5", RESTIC_CACHE_DIR=str(self.stage / "cache"),
+                        TMPDIR=str(self.stage), GOMEMLIMIT="256MiB")
+
+    def restic(self, period, *args, **kwargs):
+        env = dict(self.env, RESTIC_REPOSITORY=self.env["RESTIC_REPOSITORY"].rstrip("/") + "/" + period)
+        return self.command(["restic", "--no-cache", *args], env=env, **kwargs)
+
+    def snapshot(self):
+        now = time.time()
+        period = int(now) // (14 * 86400) * (14 * 86400)
+        candidates = []
+        for start in (period, period - 14 * 86400):
+            folder = datetime.fromtimestamp(start, timezone.utc).strftime("%F")
+            rc, text = self.restic(folder, "snapshots", "--json", "--tag", "project:" + self.name,
+                                   acceptable=(0, 10))
+            if rc == 0:
+                for item in json.loads(text):
+                    if "project:" + self.name in item.get("tags", []):
+                        stamp = timestamp(item["time"])
+                        candidates.append((stamp, folder, item))
+        require(candidates, "Снимок проекта в двух S3-периодах не найден")
+        stamp, folder, item = max(candidates, key=lambda entry: entry[0])
+        require(0 <= now - stamp <= 86400, "Снимок из будущего или старше 24 часов")
+        require(re.fullmatch(r"[0-9a-f]{64}", item["id"]), "Некорректный ID снимка")
+        dump_dir = "/var/backups/db/" + self.name
+        paths = item.get("paths", [])
+        require(dump_dir in paths, "В снимке нет точного каталога дампа проекта")
+        owner = self.command(["project-docker-host", self.name, "user"])[1].strip() or self.name + "-run"
+        require(re.fullmatch(r"[a-z][a-z0-9_-]*", owner), "Некорректный владелец Docker проекта")
+        volume = rf"(?:/var/lib/docker/(?:[0-9]+\.[0-9]+/)?|/home/{re.escape(owner)}/.local/share/docker/)volumes/{self.name}_[a-zA-Z0-9_.-]+"
+        for path in paths:
+            require(isinstance(path, str) and str(PurePosixPath(path)) == path
+                    and ".." not in PurePosixPath(path).parts
+                    and (path in (dump_dir, "/srv/projects/" + self.name) or re.fullmatch(volume, path)),
+                    "В снимке чужой или ненормализованный путь")
+        filename = dump_dir + "/" + self.name + ".pgdump"
+        _, listing = self.restic(folder, "ls", "--json", item["id"], filename)
+        files = [json.loads(line) for line in listing.splitlines()]
+        files = [node for node in files if node.get("path") == filename]
+        require(len(files) == 1 and files[0].get("type") == "file", "Дамп не является одним обычным файлом")
+        size = files[0].get("size", 0)
+        require(type(size) is int and 0 < size <= MAX_DUMP, "Размер дампа вне предела 1..512 MiB")
+        modified = timestamp(files[0]["mtime"])
+        require(0 <= now - modified <= 86400, "Файл дампа из будущего или старше 24 часов")
+        return folder, item, filename, size
+
+    def space(self, dump_size):
+        data_dir = Path(self.sql("SHOW data_directory;"))
+        db_size = int(self.sql("SELECT pg_database_size(" + literal(self.name) + ");"))
+        require(db_size <= 2 * 1024**3, "База больше предела проверки 2 GiB")
+        need = {}
+        for path, amount in ((self.stage, dump_size), (data_dir, max(db_size * 3, dump_size * 10))):
+            device = path.stat().st_dev
+            previous = need.get(device, (path, 0))[1]
+            need[device] = (path, previous + amount)
+        for path, amount in need.values():
+            require(shutil.disk_usage(path).free >= amount + RESERVE, "Недостаточно места для проверки и резерва 1 GiB")
+
+    def isolated(self):
+        name = literal(self.temp)
+        role = identifier(self.temp)
+        require(self.sql(f"SELECT count(*) FROM pg_roles WHERE rolname={name};") == "0"
+                and self.sql(f"SELECT count(*) FROM pg_database WHERE datname={name};") == "0", "Коллизия временного имени")
+        self.role_attempted = True
+        self.sql(f"BEGIN; CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS "
+                 f"CONNECTION LIMIT 2 PASSWORD {literal(verifier(self.password))} VALID UNTIL "
+                 f"{literal(datetime.fromtimestamp(time.time() + 1800, timezone.utc).isoformat())}; "
+                 f"COMMENT ON ROLE {role} IS {literal(self.marker)}; "
+                 f"ALTER ROLE {role} SET statement_timeout='30s'; "
+                 f"ALTER ROLE {role} SET lock_timeout='3s'; "
+                 f"ALTER ROLE {role} SET temp_file_limit='256MB'; COMMIT;")
+        self.db_attempted = True
+        self.sql(f"CREATE DATABASE {role} OWNER {role} TEMPLATE template0 CONNECTION LIMIT 2;")
+        self.sql(f"COMMENT ON DATABASE {role} IS {literal(self.marker)};")
+        # Только новая временная база; существующие ACL никогда не исправляются.
+        self.sql(f"REVOKE CONNECT ON DATABASE {role} FROM PUBLIC;")
+        self.verify_isolation()
+
+    def verify_isolation(self):
+        name = literal(self.temp)
+        owned = self.sql("SELECT EXISTS(SELECT 1 FROM pg_database b JOIN pg_roles r ON r.oid=b.datdba "
+                         "JOIN pg_shdescription d ON d.objoid=r.oid AND d.classoid='pg_authid'::regclass "
+                         f"WHERE datname={name} AND rolname={name} AND d.description={literal(self.marker)});")
+        require(owned == "t", "Владение временной БД/ролью изменилось")
+        identity = self.sql("SELECT current_user || ':' || session_user;", db=self.temp, restricted=True)
+        require(identity == self.temp + ":" + self.temp, "Restore требует самостоятельную LOGIN-сессию")
+        flags = self.sql(f"SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls "
+                         f"OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid) "
+                         f"FROM pg_roles r WHERE rolname={name};")
+        require(flags == "f", "У проверочной роли лишние права")
+        foreign = json.loads(self.sql("SELECT coalesce(json_agg(json_build_object('name',datname,'connect',"
+                                     f"has_database_privilege({name},oid,'CONNECT'))), '[]') FROM pg_database "
+                                     f"WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('postgres',{name});"))
+        require(self.name in [db["name"] for db in foreign], "База проекта не найдена")
+        for db in foreign:
+            require(not db["connect"], "Нарушена изоляция: проверочная роль может CONNECT к чужой базе")
+            # -d разворачивает conninfo/URI; PGDATABASE — непрозрачное имя из каталога.
+            env = dict(self.env, PGHOST="127.0.0.1", PGPORT=PG_PORT, PGUSER=self.temp,
+                       PGPASSWORD=self.password, PGDATABASE=db["name"])
+            rc, _ = self.command(["psql", "-X", "-q", "-tA", "-c", "SELECT 1;"],
+                                 env=env, acceptable=(0, 1, 2, 3))
+            require(rc != 0, "Настоящий CONNECT к чужой базе прошёл")
+        self.denied_connect = sorted(db["name"] for db in foreign)
+
+    def extensions(self, dump):
+        _, toc = self.command(["pg_restore", "--list", str(dump)])
+        names = []
+        for line in toc.splitlines():
+            if re.match(r"\d+; \d+ \d+ EXTENSION ", line):
+                entry = re.fullmatch(r"\d+; \d+ \d+ EXTENSION - ([a-zA-Z0-9_+-]+) .*", line)
+                require(entry, "Нераспознанное расширение дампа")
+                names.append(entry[1])
+        for name in names:
+            allowed = self.sql("SELECT EXISTS(SELECT 1 FROM pg_available_extension_versions WHERE name="
+                               + literal(name) + " AND trusted AND version = (SELECT default_version "
+                               "FROM pg_available_extensions WHERE name=" + literal(name) + "));",
+                               db=self.temp, restricted=True)
+            require(allowed == "t", "Расширение не установлено или не доверенное: " + name)
+
+    def metrics(self, db, restricted):
+        # \gexec сохраняет один MVCC-срез для всех точных COUNT, не создаёт функций в prod.
+        query = r"""
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL search_path = pg_catalog;
+SET LOCAL statement_timeout = '30s';
+SET LOCAL lock_timeout = '3s';
+SELECT json_build_object('kind','cut','value',transaction_timestamp());
+SELECT json_build_object('kind','structure','value',coalesce(json_agg(t ORDER BY schema, name),'[]'))
+FROM (SELECT n.nspname AS schema, c.relname AS name, c.relkind,
+ (SELECT json_agg(json_build_array(a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,
+          pg_get_expr(d.adbin,d.adrelid)) ORDER BY a.attnum)
+  FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+  WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns,
+ (SELECT json_agg(pg_get_constraintdef(oid) ORDER BY conname) FROM pg_constraint WHERE conrelid=c.oid) AS constraints,
+ (SELECT json_agg(pg_get_indexdef(indexrelid) ORDER BY indexrelid::regclass::text)
+  FROM pg_index WHERE indrelid=c.oid) AS indexes
+ FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+ WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema')
+ AND n.nspname NOT LIKE 'pg_toast%') t;
+SELECT format('SELECT json_build_object(''kind'',''rows'',''schema'',%L,''name'',%L,''value'',count(*)) FROM ONLY %I.%I;',
+              n.nspname,c.relname,n.nspname,c.relname)
+FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema')
+AND n.nspname NOT LIKE 'pg_toast%' ORDER BY n.nspname,c.relname
+\gexec
+SELECT CASE WHEN to_regclass('public.django_migrations') IS NULL
+ THEN $q$SELECT json_build_object('kind','migrations','value',NULL);$q$
+ ELSE $q$SELECT json_build_object('kind','migrations','value',coalesce(json_agg(t ORDER BY app),'[]'))
+ FROM (SELECT DISTINCT ON (app) app,name,applied FROM public.django_migrations ORDER BY app,applied DESC,id DESC) t;$q$ END
+\gexec
+COMMIT;
+"""
+        text = self.sql(query, db=db, restricted=restricted)
+        values = []
+        decoder = json.JSONDecoder()
+        while text:
+            value, end = decoder.raw_decode(text)
+            values.append(value)
+            text = text[end:].lstrip()
+        require(values and values[0].get("kind") == "cut", "Неполный результат SQL-сверки")
+        return values[0]["value"], values[1:]
+
+    def run(self):
+        require(os.geteuid() == OWNER_UID, "Команда требует root")
+        require(any(p.get("name") == self.name and p.get("db") == "postgres"
+                    for p in json.loads(PROJECTS.read_text())), "У проекта нет настроенной PostgreSQL-базы")
+        self.lock(LOCK_ROOT / "restore-check.lock")
+        self.lock(LOCK_ROOT / "restic-backup.lock")
+        if DEPLOY_ROOT.exists() or DEPLOY_ROOT.is_symlink():
+            info = DEPLOY_ROOT.lstat()
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == OWNER_UID and not info.st_mode & 0o022,
+                    "Небезопасный каталог блокировок выкладки")
+            self.lock(DEPLOY_ROOT / (self.name + ".lock"))
+        self.stage = Path(tempfile.mkdtemp(prefix="restore-check-", dir=STAGE_ROOT))
+        self.source()
+        folder, snap, filename, size = self.snapshot()
+        self.space(size)
+        self.isolated()
+        dump = self.stage / "dump.pgdump"
+        with dump.open("xb") as output:
+            self.restic(folder, "dump", snap["id"], filename, output=output, timeout=600, limited=True)
+        require(dump.stat().st_size == size, "Размер загруженного дампа не совпал с metadata")
+        self.extensions(dump)
+        self.verify_isolation()
+        env = dict(self.env, PGHOST="127.0.0.1", PGPORT=PG_PORT, PGUSER=self.temp, PGPASSWORD=self.password)
+        self.command(["pg_restore", "--no-owner", "--no-acl", "--no-comments", "--no-security-labels",
+                      "--no-tablespaces", "--exit-on-error", "-d", self.temp, str(dump)], env=env, timeout=600)
+        restored_cut, restored = self.metrics(self.temp, True)
+        current_cut, current = self.metrics(self.name, False)
+        return dict(project=self.name, source="S3", period=folder, snapshot=snap["id"], snapshot_time=snap["time"],
+                    restored_cut=restored_cut, current_cut=current_cut, restored=restored, current=current,
+                    comparison="equal" if restored == current else "different",
+                    isolation=dict(login=self.temp, denied_connect=self.denied_connect,
+                                   phases=["before-download", "before-restore"], service_db_excluded="postgres"),
+                    migrations="not-checked" if restored[-1]["value"] is None or current[-1]["value"] is None else "checked",
+                    limits="Таблицы, колонки, ограничения, индексы, числа строк и последние Django-миграции. "
+                           "Значения строк, функции, триггеры, файлы и приложение не сверялись. "
+                           "Текущая база и снимок относятся к разным моментам времени.")
+
+    def cleanup(self):
+        errors = []
+        if self.role_attempted:
+            try:
+                owned = self.sql("SELECT EXISTS(SELECT 1 FROM pg_roles r JOIN pg_shdescription d "
+                                 "ON d.objoid=r.oid AND d.classoid='pg_authid'::regclass WHERE rolname="
+                                 + literal(self.temp) + " AND d.description=" + literal(self.marker) + ");") == "t"
+                exists = self.sql("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=" + literal(self.temp) + ");") == "t"
+                require(not exists or owned, "Маркер временной роли изменился; автоматическое удаление запрещено")
+                if owned:
+                    if self.db_attempted:
+                        own_db = self.sql("SELECT EXISTS(SELECT 1 FROM pg_database b JOIN pg_roles r ON r.oid=b.datdba "
+                                          f"WHERE datname={literal(self.temp)} AND rolname={literal(self.temp)});") == "t"
+                        if own_db:
+                            self.sql(f"DROP DATABASE {identifier(self.temp)} WITH (FORCE);")
+                    self.sql(f"DROP ROLE {identifier(self.temp)};")
+            except Exception:
+                errors.append("PostgreSQL: проверьте остатки " + self.temp)
+        if self.stage:
+            try:
+                shutil.rmtree(self.stage)
+            except OSError:
+                errors.append("stage: " + str(self.stage))
+        for fd in self.locks:
+            os.close(fd)
+        require(not errors, "Ошибка уборки; " + "; ".join(errors))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("project")
+    args = parser.parse_args()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", args.project):
+        parser.error("Недопустимое имя проекта")
+    check = Check(args.project)
+    def interrupted(signum, _frame):
+        raise Refused("Проверка прервана сигналом " + str(signum))
+    for signum in TERMINATING:
+        signal.signal(signum, interrupted)
+    result = None
+    error = None
+    try:
+        result = check.run()
+    except (Exception, KeyboardInterrupt) as exc:
+        error = str(exc) if isinstance(exc, Refused) else "Техническая ошибка проверки; результат не подтверждён"
+    finally:
+        for signum in TERMINATING:
+            signal.signal(signum, signal.SIG_IGN)
+        try:
+            check.cleanup()
+        except Exception as exc:
+            error = str(exc)
+    if error:
+        print(error, file=sys.stderr)
+        return 1
+    result["cleanup"] = "done"
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["comparison"] == "equal" else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

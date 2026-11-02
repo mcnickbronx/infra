@@ -48,7 +48,7 @@
     src: "{{ item }}"
     dest: "/usr/local/bin/{{ item }}"
     mode: "0700"
-  loop: [project-backup, project-restore, project-db-copy, project-db-dump, project-db-empty, backup-s3-copy]
+  loop: [project-backup, project-restore, project-restore-check, project-db-copy, project-db-dump, project-db-empty, backup-s3-copy]
 
 - name: Скрипт ночного бэкапа
   ansible.builtin.template:

@@ -1292,3 +1292,19 @@
         fail_msg: "{{ r | to_nice_json(ensure_ascii=false) }}"
         quiet: true
       when: "'lab' in rootless_projects"
+
+    # Отдельный кластер и синтетический restic: настоящие SQL/restore/отказы/уборка
+    # на Linux, без чтения server secrets, S3 и изменения существующих баз сервера.
+    - name: "11. Проверка восстановления: синтетический S3, отдельный PostgreSQL, отказы и уборка"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/test_restore_check.py"
+          - -v
+        chdir: /tmp
+      become: true
+      become_user: postgres
+      environment:
+        RESTORE_CHECK_PG_BIN: "/usr/lib/postgresql/{{ postgres_version }}/bin"
+        PYTHONDONTWRITEBYTECODE: "1"
+      changed_when: true
