@@ -25,6 +25,7 @@ import unittest
 SCRIPT = Path(__file__).resolve().parents[1] / "roles/backup/files/project-restore-check"
 STUB = r'''
 import json, os, pathlib, signal, subprocess, sys, time
+assert not set(signal.pthread_sigmask(signal.SIG_BLOCK, [])) & {signal.SIGINT,signal.SIGTERM,signal.SIGHUP,signal.SIGQUIT}, 'child inherited blocked terminating signals'
 root = pathlib.Path(os.environ['STAND'])
 name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
 config = json.loads((root / 'config').read_text())
@@ -85,6 +86,31 @@ elif name in ('psql','pg_restore'):
     if name == 'pg_restore': action = 'toc' if '--list' in args else 'restore'
     record(action); failed(action)
     cmd = [str(pathlib.Path(os.environ['SQL_BIN']) / name), *args]
+    if config.get('signal-inflight') == action:
+        assert action in ('create-role','create-db')
+        app = os.environ['PGAPPNAME']
+        pending = sql.replace('COMMENT ON ROLE', 'SELECT pg_sleep(30); COMMENT ON ROLE',1) if action == 'create-role' else sql+'SELECT pg_sleep(30);'
+        producer = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        producer.stdin.write(pending.encode()); producer.stdin.close()
+        control = dict(os.environ, PGHOST=os.environ['SQL_SOCKET'], PGPORT=os.environ['SQL_PORT'],
+                       PGUSER='probe_admin', PGDATABASE='postgres', PGAPPNAME='a2-signal-controller')
+        query = "SELECT pid FROM pg_stat_activity WHERE application_name='"+app+"' AND usename=current_user AND pid<>pg_backend_pid() AND wait_event='PgSleep';"
+        deadline = time.monotonic()+8
+        while time.monotonic() < deadline:
+            check = subprocess.run([str(pathlib.Path(os.environ['SQL_BIN'])/'psql'),'-X','-q','-tA','-c',query],
+                                   env=control, capture_output=True, text=True)
+            if check.returncode == 0 and check.stdout.strip():
+                catalog='pg_roles' if action=='create-role' else 'pg_database'
+                column='rolname' if action=='create-role' else 'datname'
+                visible=subprocess.check_output([str(pathlib.Path(os.environ['SQL_BIN'])/'psql'),'-X','-q','-tA','-c',
+                                                  "SELECT count(*) FROM "+catalog+" WHERE "+column+"='"+app+"';"],env=control,text=True).strip()
+                (root/'inflight-observed').write_text(json.dumps(dict(pid=int(check.stdout.strip()),app=app,action=action,visible=int(visible))))
+                os.kill(int(os.environ['CHECK_PID']), signal.SIGTERM)
+                break
+            time.sleep(.02)
+        else: raise AssertionError('real SQL did not reach PgSleep')
+        producer.wait(timeout=35)
+        sys.exit(producer.returncode)
     result = subprocess.run(cmd, input=raw, capture_output=True)
     if action == 'toc' and config.get('recreate-plpgsql'):
         env=dict(os.environ, PGHOST=os.environ['SQL_SOCKET'], PGPORT=os.environ['SQL_PORT'], PGUSER='probe_admin')
@@ -116,7 +142,7 @@ elif name == 'bash':
 else: raise AssertionError(name)
 '''
 RUNNER = r'''
-import importlib.machinery, importlib.util, json, os, pathlib, shutil, sys
+import importlib.machinery, importlib.util, json, os, pathlib, shutil, signal, sys, time
 root = pathlib.Path(os.environ['STAND'])
 loader = importlib.machinery.SourceFileLoader('check', str(root / 'command'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -132,7 +158,48 @@ if config.get('no-space'):
 if config.get('cleanup-stage'):
     def failure(path): raise OSError('synthetic cleanup failure')
     mod.shutil.rmtree=failure
-sys.exit(mod.main())
+acquired_fds=[]; children=[]
+window=config.get('acquisition-window')
+if window == 'stage':
+    original=mod.tempfile.mkdtemp
+    def create(*args,**kwargs):
+        created=original(*args,**kwargs)
+        if kwargs.get('prefix')=='restore-check-': os.kill(os.getpid(),config['signal-number'])
+        return created
+    mod.tempfile.mkdtemp=create
+elif window == 'fd':
+    original=mod.os.open
+    def create(path,*args,**kwargs):
+        fd=original(path,*args,**kwargs)
+        if pathlib.Path(path).parent == root/'locks':
+            acquired_fds.append(fd); os.kill(os.getpid(),config['signal-number'])
+        return fd
+    mod.os.open=create
+elif window == 'process':
+    original=mod.subprocess.Popen
+    def create(argv,**kwargs):
+        if argv[0] != 'bash': return original(argv,**kwargs)
+        code='import os,pathlib,json,signal,time; pathlib.Path(os.environ["STAND"],"child-mask").write_text(json.dumps([int(s) for s in signal.pthread_sigmask(signal.SIG_BLOCK,[])])); time.sleep(30)'
+        proc=original([sys.executable,'-c',code],**kwargs); children.append(proc)
+        deadline=time.monotonic()+5
+        while not (root/'child-mask').exists() and time.monotonic()<deadline: time.sleep(.01)
+        assert (root/'child-mask').exists(), 'child did not start'
+        os.kill(os.getpid(),config['signal-number'])
+        return proc
+    mod.subprocess.Popen=create
+rc=mod.main(); leaked=[]
+for fd in acquired_fds:
+    try: os.fstat(fd)
+    except OSError: pass
+    else: leaked.append('fd'); os.close(fd)
+for proc in children:
+    if proc.poll() is None:
+        leaked.append('process'); os.killpg(proc.pid,signal.SIGKILL); proc.wait()
+if (root/'child-mask').exists():
+    assert not set(json.loads((root/'child-mask').read_text())) & set(mod.TERMINATING), 'child inherited blocked signals'
+if leaked:
+    print('unregistered resources: '+','.join(leaked),file=sys.stderr); rc=99
+sys.exit(rc)
 '''
 
 
@@ -555,6 +622,59 @@ class RestoreCheckSQL(unittest.TestCase):
                     self.config["signal"] = action
                     self.config["signal-number"] = signum
                     self.execute(1)
+
+    def test_signals_inside_resource_acquisition(self):
+        for window in ('stage','fd','process'):
+            for signum in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP,signal.SIGQUIT):
+                with self.subTest(window=window,signum=signum):
+                    self.config['acquisition-window']=window
+                    self.config['signal-number']=signum
+                    (self.root/'child-mask').unlink(missing_ok=True)
+                    try:
+                        self.execute(1)
+                    finally:
+                        # Только каталоги собственного тестового стенда, чтобы отрицательный
+                        # before-case не мешал следующим самостоятельным случаям.
+                        for stage in (self.root/'stage').iterdir(): shutil.rmtree(stage)
+
+    def test_signal_while_admin_sql_has_not_returned(self):
+        for action in ('create-role','create-db'):
+            with self.subTest(action=action):
+                self.config['signal-inflight']=action
+                self.config['fixed']=True
+                observed=self.root/'inflight-observed'; observed.unlink(missing_ok=True)
+                tag='infra_check_'+'c'*24
+                foreign=[]
+                try:
+                    for user,app,db in [('probe_admin',tag+'-foreign','postgres'),('neighbor',tag,'neighbor')]:
+                        env=dict(self.sqlenv,PGUSER=user,PGAPPNAME=app)
+                        if user=='neighbor': env.update(PGHOST='127.0.0.1',PGPASSWORD='synthetic-only')
+                        proc=subprocess.Popen([str(self.pg/'psql'),'-X','-q','-tA','-d',db,'-c','SELECT pg_sleep(30);'],
+                                              env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+                        self.active.append(proc)
+                        deadline=time.monotonic()+8
+                        while time.monotonic()<deadline:
+                            pid=self.query(f"SELECT pid FROM pg_stat_activity WHERE application_name='{app}' AND usename='{user}' AND wait_event='PgSleep';")
+                            if pid: break
+                            time.sleep(.02)
+                        self.assertTrue(pid,'foreign control session did not start')
+                        foreign.append((proc,int(pid)))
+                    self.execute(1)
+                    self.assertTrue(observed.exists(),'signal did not interrupt real pending SQL')
+                    item=json.loads(observed.read_text())
+                    self.assertEqual(item['visible'],0 if action=='create-role' else 1,'wrong SQL interruption point')
+                    active=self.query(f"SELECT count(*) FROM pg_stat_activity WHERE pid={item['pid']} AND application_name='{item['app']}';")
+                    self.assertEqual(active,'0','administrative producer outlived cleanup')
+                    for _proc,pid in foreign:
+                        self.assertEqual(self.query(f'SELECT count(*) FROM pg_stat_activity WHERE pid={pid};'),'1','foreign session was terminated')
+                finally:
+                    if observed.exists():
+                        item=json.loads(observed.read_text())
+                        self.query(f"SELECT pg_terminate_backend(pid,5000) FROM pg_stat_activity WHERE pid={item['pid']} AND application_name='{item['app']}';")
+                    for proc,pid in foreign:
+                        self.query(f'SELECT pg_terminate_backend(pid,5000) FROM pg_stat_activity WHERE pid={pid};')
+                        if proc.poll() is None: proc.kill()
+                        proc.communicate(timeout=5)
 
     def test_cleanup_failure_visible_and_owned_residue(self):
         for action in ("drop-db", "drop-role"):

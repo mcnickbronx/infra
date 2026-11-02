@@ -2,6 +2,7 @@
 """Проверка custom-дампа из S3 в отдельной ограниченной PostgreSQL LOGIN-сессии."""
 import argparse
 import base64
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -66,6 +67,15 @@ def verifier(password):
     return f"SCRAM-SHA-256$4096:{encoded[0]}${encoded[1]}:{encoded[2]}"
 
 
+@contextmanager
+def acquiring():
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, TERMINATING)
+    try:
+        yield previous
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
 class Check:
     def __init__(self, name):
         self.name = name
@@ -81,21 +91,25 @@ class Check:
 
     def command(self, argv, *, sql=None, env=None, output=None, timeout=60,
                 acceptable=(0,), limited=False):
-        def limit():
-            maximum = MAX_DUMP if limited else MAX_METADATA
-            resource.setrlimit(resource.RLIMIT_FSIZE, (maximum, maximum))
         with tempfile.TemporaryFile(dir=self.stage) as capture:
-            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=output or capture,
-                                    stderr=subprocess.DEVNULL, env=env or self.env,
-                                    start_new_session=True, preexec_fn=limit)
+            proc = None
             try:
+                with acquiring() as previous:
+                    def limit():
+                        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+                        maximum = MAX_DUMP if limited else MAX_METADATA
+                        resource.setrlimit(resource.RLIMIT_FSIZE, (maximum, maximum))
+                    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=output or capture,
+                                            stderr=subprocess.DEVNULL, env=env or self.env,
+                                            start_new_session=True, preexec_fn=limit)
                 proc.communicate(None if sql is None else sql.encode(), timeout=timeout)
             except BaseException:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait()
+                if proc is not None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait()
                 raise
             # Не печатаем stderr: там могут оказаться дамп/URI/пароли. Метаданные
             # ограничены до чтения в память; анонимный файл закрывается на каждом выходе.
@@ -106,6 +120,7 @@ class Check:
     def sql(self, query, *, db="postgres", restricted=False, acceptable=(0,)):
         argv = ["psql", "-X", "-q", "-tA", "-v", "ON_ERROR_STOP=1", "-d", db]
         env = {k: v for k, v in self.env.items() if not k.startswith(("RESTIC_", "AWS_"))}
+        env["PGAPPNAME"] = self.temp
         if restricted:
             env.update(PGHOST="127.0.0.1", PGPORT=PG_PORT, PGUSER=self.temp,
                        PGPASSWORD=self.password)
@@ -115,8 +130,9 @@ class Check:
         return self.command(argv, sql=query, env=env, acceptable=acceptable)[1].strip()
 
     def lock(self, path):
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        self.locks.append(fd)
+        with acquiring():
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            self.locks.append(fd)
         info = os.fstat(fd)
         require(stat.S_ISREG(info.st_mode) and info.st_uid == OWNER_UID and not info.st_mode & 0o022,
                 "Небезопасный файл блокировки")
@@ -309,7 +325,8 @@ COMMIT;
             require(stat.S_ISDIR(info.st_mode) and info.st_uid == OWNER_UID and not info.st_mode & 0o022,
                     "Небезопасный каталог блокировок выкладки")
             self.lock(DEPLOY_ROOT / (self.name + ".lock"))
-        self.stage = Path(tempfile.mkdtemp(prefix="restore-check-", dir=STAGE_ROOT))
+        with acquiring():
+            self.stage = Path(tempfile.mkdtemp(prefix="restore-check-", dir=STAGE_ROOT))
         self.source()
         folder, snap, filename, size = self.snapshot()
         self.space(size)
@@ -339,6 +356,12 @@ COMMIT;
         errors = []
         if self.role_attempted:
             try:
+                # Убитый клиент не гарантирует, что сервер уже закончил CREATE/COMMIT.
+                # Сначала остановить только собственных административных исполнителей.
+                stopped = self.sql("SELECT coalesce(bool_and(pg_terminate_backend(pid,5000)),true) "
+                                   "FROM pg_stat_activity WHERE application_name=" + literal(self.temp)
+                                   + " AND usename=current_user AND pid<>pg_backend_pid();")
+                require(stopped == "t", "Не удалось остановить собственную административную сессию")
                 owned = self.sql("SELECT EXISTS(SELECT 1 FROM pg_roles r JOIN pg_shdescription d "
                                  "ON d.objoid=r.oid AND d.classoid='pg_authid'::regclass WHERE rolname="
                                  + literal(self.temp) + " AND d.description=" + literal(self.marker) + ");") == "t"
