@@ -296,3 +296,9 @@
     state: enabled
     default: deny
     direction: incoming
+
+- name: Служба файрвола включена и запущена
+  ansible.builtin.systemd:
+    name: ufw
+    enabled: true
+    state: started
