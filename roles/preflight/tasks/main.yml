@@ -36,6 +36,13 @@
       первая — не -){% endif %}
     quiet: true
 
+- name: acme_email — непустая строка контактного email
+  ansible.builtin.assert:
+    that: acme_email is string and acme_email | trim | length > 0
+    fail_msg: >-
+      В {{ infra_dir }}/server.yml заполните acme_email непустой строкой контактного email
+    quiet: true
+
 # Опечатка в ключе молча значила бы «настройки нет» — то есть умолчание движка, иногда
 # разрушительное: docker_user: вместо docker_users: убрала бы людей из группы docker,
 # restic_s3_repository: — выключила бы копию в S3. Известны обязательные ключи, test_server
