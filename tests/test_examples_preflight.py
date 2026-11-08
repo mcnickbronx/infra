@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from ansible.parsing.dataloader import DataLoader
 
@@ -101,9 +102,13 @@ class ExamplesPreflight(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 self.fail("server.yml.example: preflight превысил 90 секунд")
             finally:
-                if process.poll() is None:
+                # Лидер мог уже выйти, пока потомок держит stdout открытым.
+                # Группа принадлежит только этому запуску (start_new_session=True).
+                try:
                     os.killpg(process.pid, signal.SIGKILL)
-                    process.communicate()
+                except ProcessLookupError:
+                    pass
+                process.communicate()
             return process.returncode, output
 
     def test_unfilled_ssh_placeholder_is_rejected(self):
@@ -121,3 +126,46 @@ class ExamplesPreflight(unittest.TestCase):
     def test_filled_example_passes_preflight(self):
         code, output = self.run_preflight(self.prepared(email=True))
         self.assertEqual(code, 0, f"server.yml.example: preflight отклонил заполненный образец\n{output}")
+
+
+class PreflightProcessCleanup(unittest.TestCase):
+    def test_timeout_cleans_descendant_after_leader_exit(self):
+        real_popen = subprocess.Popen
+        launched = []
+        with tempfile.TemporaryDirectory(prefix="infra-example-cleanup-") as temporary:
+            pidfile = pathlib.Path(temporary) / "child.pid"
+            code = ("import os,pathlib,time\n"
+                    "child = os.fork()\n"
+                    "if child:\n"
+                    f"    pathlib.Path({str(pidfile)!r}).write_text(str(child))\n"
+                    "else:\n"
+                    "    time.sleep(60)\n")
+
+            def launch(arguments, **kwargs):
+                process = real_popen([sys.executable, "-c", code], **kwargs)
+                launched.append(process)
+                # Доказанный порядок: лидер вышел, потомок ещё держит pipe.
+                self.assertEqual(process.wait(timeout=5), 0)
+                proxy = mock.Mock(wraps=process, pid=process.pid)
+                # Ускоряем только этот воспроизводитель, рабочий timeout остаётся 90.
+                proxy.communicate.side_effect = lambda timeout=None: process.communicate(
+                    timeout=0.2 if timeout is not None else None)
+                return proxy
+
+            try:
+                with mock.patch.object(subprocess, "Popen", launch):
+                    with self.assertRaisesRegex(AssertionError, "preflight превысил 90 секунд"):
+                        ExamplesPreflight().run_preflight({})
+                child = int(pidfile.read_text())
+                state = subprocess.run(["ps", "-p", str(child), "-o", "stat="],
+                                       capture_output=True, text=True, timeout=5)
+                self.assertTrue(state.returncode != 0 or state.stdout.strip().startswith("Z"),
+                                f"после timeout остался живой потомок {child}: {state.stdout}")
+            finally:
+                # Регрессия должна убирать свой стенд и при сломанном helper.
+                for process in launched:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.communicate(timeout=5)
