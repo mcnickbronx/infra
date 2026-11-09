@@ -3255,6 +3255,72 @@ class ProjectRestoreGuard(unittest.TestCase):
         self.assertTrue(calls[2].startswith("restic snapshots --json --tag project:shop"), calls)
         self.assertTrue((self.locks / "shop.lock").exists())
 
+    def test_lock_held_when_reading_snapshots(self):
+        import fcntl
+
+        lock = self.locks / "shop.lock"
+        marker = self.dir / "lock-observation.json"
+        adapter = self.bin / "flock"
+        adapter.write_text("""#!/usr/bin/env python3
+import fcntl, sys
+assert sys.argv[1:] == ["-w", "30", "9"], sys.argv
+# Неконкурирующий стенд: блокировка принадлежит унаследованному open file description.
+fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+""")
+        observer = self.bin / "restic"
+        observer.write_text("""#!/usr/bin/env python3
+import fcntl, json, os, pathlib, sys
+assert sys.argv[1:] == ["snapshots", "--json", "--tag", "project:shop"], sys.argv
+result = {"same_inode": False, "held": False}
+with open(os.environ["LOCK_PATH"], "a") as independent:
+    expected = os.fstat(independent.fileno())
+    try:
+        inherited = os.fstat(9)
+        result["same_inode"] = (inherited.st_dev, inherited.st_ino) == (expected.st_dev, expected.st_ino)
+    except OSError:
+        pass
+    try:
+        fcntl.flock(independent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        result["held"] = True
+pathlib.Path(os.environ["LOCK_MARKER"]).write_text(json.dumps(result))
+print("[]")
+""")
+        env = {k: v for k, v in os.environ.items() if k != "DOCKER_HOST"}
+        env.update(PATH=f"{self.bin}:{os.environ['PATH']}", STUB_LOG=str(self.log),
+                   LOCK_PATH=str(lock), LOCK_MARKER=str(marker))
+
+        def run_and_observe(command):
+            marker.unlink(missing_ok=True)
+            # communicate в run ждёт EOF обоих каналов, в том числе от process substitution:
+            # в bash 3.2 лидер выходит на mapfile раньше, чем закончит restic.
+            run = subprocess.run(command, env=env, cwd=self.dir, capture_output=True, text=True)
+            # Сначала проверяем освобождение, также при ошибке/отсутствии маркера наблюдения.
+            with lock.open("a") as independent:
+                try:
+                    fcntl.flock(independent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self.fail("после завершения стенда замок выкладки остался занят")
+            self.assertTrue(marker.exists(), f"restic не записал наблюдение замка: {run.stderr}")
+            return run, json.loads(marker.read_text())
+
+        # Положительный контроль адаптера и отрицательный контроль независимого открытия:
+        # открытый fd сам по себе не препятствует другому владельцу захватить замок.
+        probe = 'exec 9>"$LOCK_PATH"; %s restic snapshots --json --tag project:shop'
+        control, observed = run_and_observe(["bash", "-ec", probe % "flock -w 30 9;"])
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(observed, {"same_inode": True, "held": True}, "адаптер не держит замок")
+        control, observed = run_and_observe(["bash", "-ec", probe % ""])
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(observed, {"same_inode": True, "held": False}, "независимое открытие не свободно")
+
+        run, observed = run_and_observe(["bash", str(self.script), "shop", str(self.restic_env)])
+        self.assertTrue(observed["held"], "при чтении снимков замок выкладки свободен")
+        self.assertTrue(observed["same_inode"], "при чтении снимков fd 9 не относится к замку выкладки")
+        self.assertNotEqual(run.returncode, 0, "пустой список снимков должен остановить восстановление")
+        self.assertTrue("mapfile" in run.stderr or "Снимок 'latest' проекта shop не найден" in run.stderr,
+                        run.stderr)
+
     def test_no_deploy_dir_no_lock(self):
         self.locks.rmdir()                                        # нет автовыкладки на сервере — нет и замка
         run, calls, _ = self.restore(STUB_RUNNING="abc123")
