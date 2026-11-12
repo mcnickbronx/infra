@@ -1,5 +1,6 @@
-"""site.yml применяет все роли движка и в объявленном порядке: без этой проверки пропавшую строку `- role: …`
-не видит ни одна офлайн-проверка (синтаксис, ansible-lint, эталоны берут шаблоны из roles/ напрямую)."""
+"""site.yml перечисляет все роли движка в объявленном порядке, без специального never на записи роли.
+Пропавшую строку `- role: …` не видят синтаксис, ansible-lint и эталоны: они берут шаблоны из roles/ напрямую.
+Исполнение задач ролей и прочие условия их пропуска эта офлайн-проверка не проверяет."""
 import importlib.util
 import pathlib
 import unittest
@@ -16,8 +17,14 @@ ORDER = [("preflight", "secrets"), ("docker", "traefik"), ("traefik", "crowdsec"
 class SiteRoles(unittest.TestCase):
     def test_all_roles_in_order(self):
         import yaml
-        listed = [r["role"] for r in yaml.safe_load((ROOT / "site.yml").read_text())[0]["roles"]]
+        roles = yaml.safe_load((ROOT / "site.yml").read_text())[0]["roles"]
+        listed = [r["role"] for r in roles]
         on_disk = sorted(p.parent.parent.name for p in ROOT.glob("roles/*/tasks/main.yml"))
         self.assertEqual(sorted(listed), on_disk, "роль есть в roles/, но не в site.yml (или наоборот, или дважды)")
         for before, after in ORDER:
             self.assertLess(listed.index(before), listed.index(after), f"{before} должна быть раньше {after}")
+        for role in roles:
+            tags = role.get("tags", [])
+            if isinstance(tags, str):
+                tags = [tag.strip() for tag in tags.split(",")]
+            self.assertNotIn("never", tags, f"site.yml: у обязательной роли {role['role']} запрещён тег never")
