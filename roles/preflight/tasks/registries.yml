@@ -1,0 +1,95 @@
+# Даже испорченный descriptor может содержать пароль вместо ссылки: ни item, ни выражение
+# отказа не должны попасть в callback. Наружу выходит только заранее заданная причина.
+- name: Реестры описаны безопасными ссылками на secrets.yml
+  no_log: true
+  block:
+    - name: Причина отказа — структура списка
+      ansible.builtin.set_fact:
+        registry_error: "container_registries — список записей с полями host, user_key, token_key"
+
+    - name: Список реестров
+      ansible.builtin.assert:
+        that:
+          - container_registries is sequence and container_registries is not string and container_registries is not mapping
+          - autodeploy_projects | length == 0 or container_registries | length > 0
+        quiet: true
+
+    - name: Поля записи реестра
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - item.keys() | sort == ['host', 'token_key', 'user_key']
+          - item.host is string and item.user_key is string and item.token_key is string
+        quiet: true
+      loop: "{{ container_registries }}"
+
+    - name: Причина отказа — host и имена ключей
+      ansible.builtin.set_fact:
+        registry_error: "container_registries: host — DNS или IPv4 с портом 1..65535, без схемы/пути; user_key/token_key — разные плоские имена ключей"
+
+    - name: Адреса реестров и ссылки на ключи
+      vars:
+        dns_re: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\Z'
+        ipv4_re: '^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\Z'
+        hostname: "{{ item.host.split(':')[0] }}"
+      ansible.builtin.assert:
+        that:
+          - item.host is match('^[a-z0-9.-]+(:[0-9]+)?\Z')
+          - hostname | length <= 253 and hostname is match(dns_re)
+          - hostname is not match('^[0-9.]+\Z') or hostname is match(ipv4_re)
+          - "':' not in item.host or (item.host.split(':')[1] | int >= 1 and item.host.split(':')[1] | int <= 65535)"
+          - item.user_key is match('^[a-z][a-z0-9_]{0,62}\Z') and item.token_key is match('^[a-z][a-z0-9_]{0,62}\Z')
+          - item.user_key != item.token_key
+        quiet: true
+      loop: "{{ container_registries }}"
+
+    - name: Адреса реестров не повторяются
+      ansible.builtin.assert:
+        that: container_registries | map(attribute='host') | list | unique | length == container_registries | length
+        quiet: true
+
+    - name: Причина отказа — место credentials
+      ansible.builtin.set_fact:
+        registry_error: "container_registries: логины и токены задаются только в secrets.yml, в server.yml — только ссылки user_key/token_key"
+
+    - name: В server.yml нет значений registry credentials
+      vars:
+        credential_keys: "{{ ['ghcr_user', 'ghcr_token'] + (container_registries | map(attribute='user_key') | list)
+                             + (container_registries | map(attribute='token_key') | list) }}"
+      ansible.builtin.assert:
+        that: server_settings | default({}) | list | intersect(credential_keys) | length == 0
+        quiet: true
+
+    - name: Причина отказа — пустые credentials
+      ansible.builtin.set_fact:
+        registry_error: >-
+          {% if 'container_registries' not in server_settings | default({}) %}autodeploy: true у
+          {{ autodeploy_projects | join(', ') }} — в {{ infra_dir }}/secrets.yml нужны ghcr_user и ghcr_token{% else %}container_registries:
+          при autodeploy заполните в secrets.yml непустые строковые значения user_key и token_key каждого реестра{% endif %}
+
+    - name: При автовыкладке заполнены обе ссылки каждого реестра
+      ansible.builtin.assert:
+        that:
+          - secrets[item.user_key] is defined and secrets[item.token_key] is defined
+          - secrets[item.user_key] is string and secrets[item.token_key] is string
+          - secrets[item.user_key] | trim | length > 0 and secrets[item.token_key] | trim | length > 0
+        quiet: true
+      loop: "{{ container_registries }}"
+      when: autodeploy_projects | length > 0
+  rescue:
+    - name: Безопасная причина отказа настройки реестров
+      ansible.builtin.fail:
+        msg: "{{ registry_error }}"
+      no_log: false
+
+# Умолчание GHCR — только вход: старые публичные образы другого host остаются допустимы.
+# Старый проект без image тоже совместим: .env на сервере preflight не читает.
+- name: Явный список реестров разрешает host проекта image
+  ansible.builtin.assert:
+    that: item.value.image.split('/')[0] in container_registries | map(attribute='host') | list
+    fail_msg: "Проект '{{ item.key }}': host image отсутствует в явном container_registries"
+    quiet: true
+  loop: "{{ projects | dict2items | selectattr('value.image', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: "'container_registries' in server_settings | default({})"

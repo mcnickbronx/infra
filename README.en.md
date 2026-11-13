@@ -32,8 +32,9 @@ and YAML instead of buttons.
   `compose.yml` can't give anyone root on the server (~100 MB of RAM per project).
 - **Backups (restic):** nightly per-project snapshots (files, volumes, DB dump) plus `/etc`; frequent
   snapshots every 1–60 minutes straight to S3; three levels — server, your computer, S3 with Object Lock.
-- **Deploys:** push → CI builds an image in ghcr.io → the server picks it up within 15 seconds, runs
+- **Deploys:** push → CI builds an image in GHCR or GitLab Container Registry → the server picks it up within 15 seconds, runs
   migrations, waits for the health check, rolls back on failure.
+  See the [GitLab CI recipe](docs/gitlab-ci.yml.example) and [server credentials](ADMIN.md#gitlab-container-registry-и-несколько-реестров); existing GHCR settings still work.
 - **Monitoring:** a health check every 10 minutes, Telegram alerts for new and resolved problems and for each deployed version,
   a morning summary, an audit log in `/var/log/infra.log`.
 - **Management:** one `server.yml` per server, generated passwords, `infra edit` with a diff and
@@ -85,7 +86,7 @@ above its output; you can type the same by hand.
 
 - Ubuntu 26.04 LTS. 24.04 works too (our test server runs it) but is not recommended: production
   servers and release checks are on 26.04. For 24.04 add `ubuntu_version: "24.04"` to `server.yml`.
-- A fixed stack: Docker Compose, Traefik, shared Postgres (PGDG), restic, CrowdSec; autodeploy pulls from ghcr.io.
+- A fixed stack: Docker Compose, Traefik, shared Postgres (PGDG), restic, CrowdSec; autodeploy pulls from GHCR, GitLab.com or a self-hosted Container Registry.
 - One team per server: `docker_users` are effectively root, and so is any project member once you start
   their project (`project-compose` runs the `compose.yml` they wrote as root). Different teams — different servers.
 - **Everything is in Russian:** docs, messages, task names. This page is the only English one.

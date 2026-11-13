@@ -10,6 +10,16 @@ admin_ips:                   # ваши IP: им открыт SSH и служе�
   - 203.0.113.10
 acme_email: you@example.org  # контакт Let's Encrypt; об истечении сертификатов следит health-check
 
+# ---------- Реестры автовыкладки (необязательно) ----------
+# Без этого поля: только вход ghcr.io по ghcr_user/ghcr_token, старый файл не требует правок.
+# Явный список заменяет умолчание и разрешает host у явного image проекта (без тега).
+# Только GitLab: оставьте одну его запись. Смешанный сервер: перечислите все нужные.
+# host — адрес Container Registry без https:// и пути; значения credentials только в secrets.yml.
+# container_registries:
+#   - {host: ghcr.io, user_key: ghcr_user, token_key: ghcr_token}
+#   - {host: registry.gitlab.com, user_key: registry_user_gitlab, token_key: registry_token_gitlab}
+#   - {host: registry.example.com:5050, user_key: registry_user_selfhost, token_key: registry_token_selfhost}
+
 # ---------- Люди ----------
 # key — публичный SSH-ключ (несколько — `key: |` и по ключу в строке); ключа, которого здесь нет,
 # на сервере не останется. ips — адреса, с которых человеку открыт SSH/SFTP. Человек попадает
@@ -57,9 +67,9 @@ projects:
     cpus: 2                       # CPU на весь проект
 
     # выкладка и частые снимки — по желанию
-    # autodeploy: true            # автовыкладка: сервер сам забирает новый образ из ghcr.io. Включать,
+    # autodeploy: true            # автовыкладка: сервер сам забирает новый образ из реестра. Включать,
                                   #   когда в .env проекта есть DEPLOY_IMAGE; участники — только из
-                                  #   docker_users; ghcr_user и ghcr_token — в secrets.yml (ADMIN.md)
+                                  #   docker_users; вход в реестр — в secrets.yml (ADMIN.md)
     # image: ghcr.io/<владелец>/shop   # репозиторий образа, без тега: автовыкладка и to тянут только его, чужой образ
                                   #   из .env — отказ. Проекту без root с автовыкладкой — задайте (README, «Проекты без root»)
     # backup_hourly: db            # частые снимки, сразу в S3 (ночные — как у всех): db — только база,

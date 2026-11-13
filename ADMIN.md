@@ -253,7 +253,7 @@ Postgres — короткий разрыв подключений; `daemon.json`
 
 ### Автовыкладка проекта
 
-Push в ветку → CI собирает образ в ghcr.io → сервер сам его выкладывает (TEAM.md, «Автовыкладка»).
+Push в ветку → CI собирает образ в Container Registry → сервер сам его выкладывает (TEAM.md, «Автовыкладка»).
 
 1. Один раз на сервере: токен GitHub (classic) только с правом `read:packages` — в
    `/etc/infra/secrets.yml` (`sudo infra edit secrets`):
@@ -271,6 +271,61 @@ Push в ветку → CI собирает образ в ghcr.io → серве�
    (`git describe --tags`) или из тега образа `:v3.0.0`, коммит — из ярлыка `org.opencontainers.image.revision`, а без него —
    из хеша в версии; оба ярлыка ставит бэкенду CI web-start. Версии нет — «выложена новая версия, коммит 1a2b3c4», нет
    и коммита — «выложена новая версия». В журнале событий — версия и полный коммит, коммит можно дать `to` (ниже). Сбой — уведомление health-check «Автовыкладка … не удалась».
+
+#### GitLab Container Registry и несколько реестров
+
+Старому GHCR-серверу ничего дописывать не нужно: без `container_registries` вход остаётся
+в `ghcr.io` по прежним `ghcr_user`/`ghcr_token`. Это умолчание для входа сохраняет и старые
+публичные образы других реестров. CI для GitLab — [готовый пример](docs/gitlab-ci.yml.example)
+для `main`/`dev` и полного SHA; он использует стандартные `CI_REGISTRY`/`CI_REGISTRY_IMAGE`
+как на GitLab.com, так и на своей установке. В серверный `secrets.yml` **не переносите**
+per-job `CI_REGISTRY_PASSWORD`: создайте отдельный долгоживущий deploy token с `read_registry`
+и доступом только к нужным образам. Имя пользователя deploy token и его токен впишите в
+пустые плоские ключи `registry_user_gitlab`/`registry_token_gitlab` в `secrets.yml`.
+
+Только GitLab.com — в `server.yml`:
+
+```yaml
+container_registries:
+  - {host: registry.gitlab.com, user_key: registry_user_gitlab, token_key: registry_token_gitlab}
+```
+
+Явный список заменяет умолчание целиком. Для смешанного сервера:
+
+```yaml
+container_registries:
+  - {host: ghcr.io, user_key: ghcr_user, token_key: ghcr_token}
+  - {host: registry.gitlab.com, user_key: registry_user_gitlab, token_key: registry_token_gitlab}
+  - {host: registry.example.com:5050, user_key: registry_user_selfhost, token_key: registry_token_selfhost}
+projects:
+  shop:
+    net: 42
+    rootless: true
+    autodeploy: true
+    image: registry.example.com:5050/group/subgroup/shop
+```
+
+Это фрагмент: остальные обязательные настройки сервера остаются. Новые имена ключей —
+строчные буквы, цифры и `_`, первая буква, до 63 знаков; `user_key` и `token_key` разные.
+Логины/токены в `server.yml` запрещены, записи реестров содержат только эти три поля.
+`host` — именно адрес **Container Registry**, не git URL; без схемы, пути и userinfo,
+DNS строчными или IPv4, необязательный порт 1..65535. IPv6 и insecure HTTP здесь не поддерживаются.
+Для private CA установите доверенный сертификат штатным способом в Docker до использования
+реестра; проверку TLS не отключайте. Повторяющиеся host запрещены; при автовыкладке список
+не пуст и у каждой записи заполнены оба ключа. Без автовыкладки пустые заготовки допустимы.
+
+С новым списком задавайте явный `image` без тега/дайджеста: его host должен входить в список,
+а `/group/subgroup/shop` сохраняется целиком. В `.env` проекта укажите
+`DEPLOY_IMAGE=registry.example.com:5050/group/subgroup/shop:main`. Старые проекты без `image`
+сохраняют прежний путь; preflight не читает `.env` с сервера и не определяет его реестр.
+Наличие host в списке не разрешает соседние репозитории: `image` ограничивает **точный**
+репозиторий в deploy, `to`, rollback и подготовке rootless.
+
+Вход выполняет root через Docker-модуль, credentials остаются в его закрытом Docker config
+и не копируются пользователям rootless/группам. Удаление записи из списка не делает logout
+и не отзывает токен: отзыв и очистка старого Docker auth — отдельное действие администратора.
+
+#### Откат и выбор версии
 
 Откат на предыдущую версию: `sudo project-deploy <проект> rollback` (идёт выкладка — откажет,
 повторите после неё). Выключить — убрать `autodeploy`.

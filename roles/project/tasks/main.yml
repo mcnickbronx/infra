@@ -143,13 +143,8 @@
             | difference(projects | dict2items | selectattr('value.image', 'defined') | map(attribute='key')) }}"
 
 # Образы проектов приватные: скачивает их root (таймер), вход — токеном только на чтение
-- name: Вход в реестр образов ghcr.io
-  community.docker.docker_login:
-    registry_url: ghcr.io
-    username: "{{ ghcr_user }}"
-    password: "{{ ghcr_token }}"
-  no_log: true
-  when: autodeploy_projects | length > 0
+- name: Вход в реестры образов
+  ansible.builtin.import_tasks: registries.yml
 
 # В --check на новом сервере юнитов ещё нет (их установка только показана) — тогда включение
 # и выключение пропускаются. Если они есть, предпросмотр показывает и эти изменения: иначе

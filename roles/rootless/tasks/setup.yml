@@ -222,7 +222,7 @@
       echo "$p: тома ($vols) сами не переезжают — перенесите вручную (README, «Проекты без root»)" >&2
       exit 1
     fi
-    # образ — заранее в Docker группы (вход в ghcr — у root): простой — только на перезапуск. web/ пишут участники:
+    # образ — заранее в Docker группы (вход в реестр — у root): простой — только на перезапуск. web/ пишут участники:
     # общий чтец project-deploy: ссылка, ошибка чтения или чужой образ — отказ до down
     image=$(project-deploy "$p" image)
     [ -z "$image" ] || DOCKER_HOST={{ item.value.sock | quote }} docker pull -q "$image" >/dev/null

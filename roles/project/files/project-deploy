@@ -12,7 +12,7 @@
 #                                        (до 15 минут, раз в 20 с; не дождался — ничего не менял): сразу после push
 #
 # Договорённость с проектом (TEAM.md, «Автовыкладка»):
-#   - в .env проекта DEPLOY_IMAGE=ghcr.io/<владелец>/<образ>:<ветка> — его собирает CI;
+#   - в .env проекта DEPLOY_IMAGE=registry.example.com:5050/group/shop:<ветка> — его собирает CI;
 #   - в образе /deploy/compose.yml — compose проекта, в нём image: ${DEPLOY_IMAGE};
 #   - сервис deploy (профиль deploy) готовит выкладку: миграции, статика. Нет его — шаг пропускается.
 # compose.yml из образа запускается от root без проверки: кто пушит в ветку, тот root
@@ -60,7 +60,7 @@ STATE=/var/lib/project-deploy/$NAME
 state() { cat "$STATE.$1" 2>/dev/null || true; }       # state current — версия или пусто
 set_state() { echo "$2" > "$STATE.$1"; }               # set_state current <версия>
 
-# image у проекта: образ $1 — только из этого репозитория, иначе root скачал бы своим входом в ghcr чужой приватный
+# image у проекта: образ $1 — только из этого репозитория, иначе root скачал бы своим входом в реестр чужой приватный
 # образ, вписанный участником в .env. Репозиторий — без @дайджеста и без :тега (тег — после последнего /, как в to),
 # и равен строке целиком: shop-evil и shop/x — не shop. image не задан — любой. Отказ — с текстом: $2 — что проверяли
 own_image() {
@@ -147,7 +147,7 @@ proj_root_only() {
 
 # ---------- Шаги выкладки ----------
 compose() { project-compose "$NAME" "$@"; }
-# Проект без root (rootless): образы и контейнеры — в его Docker. Скачивает образ root (вход в ghcr —
+# Проект без root (rootless): образы и контейнеры — в его Docker. Скачивает образ root (вход в реестр —
 # у root), а compose.yml из образа запускает пользователь проекта (project-compose)
 DOCKER_HOST=$(project-docker-host "$NAME")
 [ -n "$DOCKER_HOST" ] && export DOCKER_HOST || unset DOCKER_HOST
@@ -362,7 +362,7 @@ tag_ref() {
     *) echo "$NAME: в .env несколько строк DEPLOY_IMAGE — оставьте одну и повторите" >&2; exit 1 ;;
   esac
   [[ $IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._/:-]*$ ]] ||
-    { echo "$NAME: DEPLOY_IMAGE=$IMAGE — to меняет только тег (ghcr.io/<владелец>/<образ>:<тег>), не дайджест @sha256" >&2; exit 1; }
+    { echo "$NAME: DEPLOY_IMAGE=$IMAGE — to меняет только тег (registry.example.com:5050/group/shop:<тег>), не дайджест @sha256" >&2; exit 1; }
   [[ ${IMAGE##*/} != *:* ]] || repo=${IMAGE%:*}         # тег — после последнего /: в registry:5000/x «:» — порт
   TO=$repo:$TAG
 }

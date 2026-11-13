@@ -125,5 +125,8 @@ restic_password: "{{ secrets.restic_password }}"
 # Ключи, которые вписывает администратор; пустые ("" или без значения) — не заданы
 restic_aws_access_key_id: "{{ secrets.s3_access_key | default('', true) }}"
 restic_aws_secret_access_key: "{{ secrets.s3_secret_key | default('', true) }}"
-ghcr_user: "{{ secrets.ghcr_user | default('', true) }}"             # вход в ghcr.io для автовыкладки
+# Явный список в server.yml заменяет умолчание; здесь только имена ключей secrets.yml.
+container_registries:
+  - {host: ghcr.io, user_key: ghcr_user, token_key: ghcr_token}
+ghcr_user: "{{ secrets.ghcr_user | default('', true) }}"             # прежние ключи остаются совместимыми
 ghcr_token: "{{ secrets.ghcr_token | default('', true) }}"

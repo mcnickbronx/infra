@@ -2951,6 +2951,158 @@ esac
                 self.assertEqual(self.env.read_text(), text + "\n")
 
 
+    # --- Дополнительные registry-cases: прежние GHCR-тесты выше выполняются без изменений ---
+    def registry_fixture(self, repo):
+        case = ProjectDeployTo("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.REPO = repo
+        case.env.write_text(f"DEPLOY_IMAGE={repo}:main\n")
+        (case.states / "shop.current").write_text(f"{repo}@{case.OLD}\n")
+        case.pin(repo)
+        return case
+
+    REGISTRY_REPOS = ("registry.gitlab.com/group/subgroup/shop", "registry.example.com:5050/group/shop")
+
+    def test_registry_deploy_migrate_notify_and_no_new_version(self):
+        for repo in self.REGISTRY_REPOS:
+            with self.subTest(repo=repo):
+                case = self.registry_fixture(repo)
+                (case.bin / "project-compose").write_text(case.COMPOSE.replace("echo api", "printf 'api\\ndeploy\\n'"))
+                run, lines = case.timer(STUB_REV=case.HASH, STUB_VER="v2.4.0")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertLess(lines.index("project-compose shop run --rm deploy"),
+                                next(i for i, line in enumerate(lines) if line.startswith("project-compose shop up ")))
+                self.assertEqual(case.state("current"), f"{repo}@{case.NEW}")
+                self.assertEqual(case.state("previous"), f"{repo}@{case.OLD}")
+                self.assertEqual(case.notes(lines), ["infra-notify 🚀 vds-x: shop — выложена v2.4.0, коммит bb168cf"])
+                self.assertIn(f"docker pull -q {repo}:main", lines)
+                case.log.unlink()
+                run, lines = case.timer()
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertFalse(any(" up " in line or line.startswith("infra-notify") for line in lines))
+
+    def test_registry_to_wait_and_rollback(self):
+        for repo in self.REGISTRY_REPOS:
+            for wait in (False, True):
+                with self.subTest(repo=repo, wait=wait):
+                    case = self.registry_fixture(repo)
+                    args = ("to", case.HASH, "--wait") if wait else ("to", case.HASH)
+                    run, lines = case.deploy(*args, STUB_TAG_AFTER=f"{repo}:{case.HASH}=2" if wait else "")
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertEqual(case.env.read_text(), f"DEPLOY_IMAGE={repo}:{case.HASH}\n")
+                    self.assertEqual(case.state("current"), f"{repo}@{case.NEW}")
+                    self.assertIn(f"docker pull -q {repo}:{case.HASH}", lines)
+                    if wait:
+                        self.assertIn("sleep 20", lines)
+                    case.log.unlink()
+                    run, lines = case.deploy("rollback")
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertIn(f"docker pull -q {repo}@{case.OLD}", lines)
+                    self.assertEqual(case.state("current"), f"{repo}@{case.OLD}")
+
+    def test_registry_rollout_failures_keep_state(self):
+        for repo in self.REGISTRY_REPOS:
+            for failure in ("missing", "migration", "healthcheck"):
+                with self.subTest(repo=repo, failure=failure):
+                    case = self.registry_fixture(repo)
+                    before = case.env.read_bytes()
+                    stubs = {}
+                    if failure == "migration":
+                        (case.bin / "project-compose").write_text(case.COMPOSE.replace("echo api", "printf 'api\\ndeploy\\n'")
+                            .replace('case "$*" in', 'case "$*" in\n  *"run --rm deploy") exit 1 ;;'))
+                    elif failure == "healthcheck":
+                        stubs["STUB_FAIL_UP"] = "yes"
+                    tag = "absent" if failure == "missing" else case.HASH
+                    run, lines = case.deploy("to", tag, **stubs)
+                    self.assertEqual(run.returncode, 1, run.stderr)
+                    self.assertEqual(case.env.read_bytes(), before)
+                    self.assertEqual(case.state("current"), f"{repo}@{case.OLD}")
+                    self.assertIsNone(case.state("previous"))
+                    if failure == "missing":
+                        self.assertFalse(any(" up " in line for line in lines))
+                    elif failure == "migration":
+                        self.assertIn("подготовка (сервис deploy)", run.stderr)
+                        self.assertNotIn(f"docker tag {repo}@{case.NEW} {repo}:{case.HASH}", lines)
+
+    def test_registry_exact_repository_guard_all_paths(self):
+        for repo in self.REGISTRY_REPOS:
+            host, path = repo.split("/", 1)
+            foreign = ["other.example.com/" + path, host + "/other/shop", repo + "/child", repo + "-evil",
+                       host.split(":")[0] + ":5051/" + path]
+            for other in foreign:
+                for args in ((), ("to", self.HASH), ("to", self.HASH, "--wait"), ("image",), ("rollback",)):
+                    with self.subTest(repo=repo, foreign=other, args=args):
+                        case = self.registry_fixture(repo)
+                        if args == ("rollback",):
+                            (case.states / "shop.previous").write_text(f"{other}@{case.NEW}\n")
+                        else:
+                            case.env.write_text(f"DEPLOY_IMAGE={other}:main\n")
+                        run, lines = case.deploy(*args)
+                        self.assertEqual(run.returncode, 1, run.stderr)
+                        self.assertIn("образ не этого проекта", run.stderr)
+                        self.assertEqual(lines, [])
+                        self.assertEqual(case.state("current"), f"{repo}@{case.OLD}")
+
+    def test_registry_rootless_image_and_docker_host(self):
+        for repo in self.REGISTRY_REPOS:
+            with self.subTest(repo=repo):
+                case = self.registry_fixture(repo)
+                case.image_result(0, f"{repo}:main\n")
+                # Настоящий deploy выбирает сокет проекта; credentials в скрипт не добавляются.
+                (case.bin / "project-docker-host").write_text("#!/bin/sh\necho unix:///stub/project.sock\n")
+                (case.bin / "docker").write_text(case.DOCKER.replace("#!/bin/bash\n",
+                    '#!/bin/bash\necho "socket=${DOCKER_HOST-unset}" >> "$STUB_LOG"\n', 1))
+                run, lines = case.timer()
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertIn("socket=unix:///stub/project.sock", lines)
+                self.assertNotIn("socket=unset", lines)
+
+    def test_registry_rootless_prepare_checks_real_image_reader(self):
+        for repo in self.REGISTRY_REPOS:
+            host, path = repo.split("/", 1)
+            refs = [repo, "other.example.com/" + path, host + "/other/shop", repo + "/child", repo + "-evil",
+                    host.split(":")[0] + ":5051/" + path]
+            for role in ("setup", "cleanup"):
+                text = (ROOT / f"roles/rootless/tasks/{role}.yml").read_text()
+                block = text[text.index("# образ — заранее"):]
+                if role == "setup":
+                    block = block[:block.index('    else\n')].replace('    if [ -z "$was" ]; then\n', '')
+                    block = block.replace("{{ item.value.sock | quote }}", "unix:///stub/project.sock")
+                else:
+                    block = block[:block.index("      unset DOCKER_HOST")]
+                for ref in refs:
+                    with self.subTest(repo=repo, role=role, ref=ref):
+                        case = self.registry_fixture(repo)
+                        case.env.write_text(f"DEPLOY_IMAGE={ref}:main\n")
+                        (case.bin / "project-deploy").write_text(
+                            f'#!/bin/sh\nexec bash "{case.dir / "project-deploy"}" "$@"\n')
+                        (case.bin / "project-deploy").chmod(0o755)
+                        run = subprocess.run(["bash", "-c", 'set -euo pipefail\np=shop\n' + block],
+                            env={**os.environ, "PATH": f"{case.bin}:{os.environ['PATH']}", "STUB_LOG": str(case.log),
+                                 "STUB_FSLOG": str(case.fslog), "STUB_TAGS": f"{repo}:main={case.NEW}"},
+                            capture_output=True, text=True)
+                        lines = case.log.read_text().splitlines() if case.log.exists() else []
+                        pulls = [line for line in lines if line.startswith("docker pull ")]
+                        self.assertEqual(pulls, [f"docker pull -q {repo}:main"] if ref == repo else [])
+                        self.assertEqual(run.returncode, 1 if ref != repo and role == "setup" else 0, run.stderr)
+                        if ref != repo:
+                            self.assertIn("образ не этого проекта", run.stderr)
+                            if role == "setup":
+                                self.assertEqual(lines, [])
+
+    def test_registry_legacy_public_image_without_pin(self):
+        repo = "registry.example.com:5050/group/shop"
+        case = self.registry_fixture(repo)
+        (case.states / "shop.image").unlink()
+        run, lines = case.timer()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f"docker pull -q {repo}:main", lines)
+        run, lines = case.deploy("to", case.HASH)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(case.env.read_text(), f"DEPLOY_IMAGE={repo}:{case.HASH}\n")
+
+
 def open_fifo_writer(path):
     """Открыть FIFO на запись без ожидания и закрыть: читатель, который ждёт писателя, получает конец файла.
     Читателя нет — открыть нельзя (ENXIO), ждать некому"""

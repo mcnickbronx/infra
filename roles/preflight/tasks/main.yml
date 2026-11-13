@@ -217,20 +217,14 @@
       - item.value.image is not defined or (item.value.image is string and item.value.image is match(image_re))
     fail_msg: >-
       Проект '{{ item.key }}': image — репозиторий образа без тега и дайджеста, строчными:
-      ghcr.io/<владелец>/<образ>
+      registry.example.com:5050/group/shop
     quiet: true
   loop: "{{ projects | dict2items }}"
   loop_control:
     label: "{{ item.key }}"
 
-# Образы приватные — без токена таймер автовыкладки падал бы каждые 15 секунд
-- name: При автовыкладке — вход в ghcr.io в secrets.yml
-  ansible.builtin.assert:
-    that: autodeploy_projects | length == 0 or (ghcr_user != '' and ghcr_token != '')
-    fail_msg: >-
-      autodeploy: true у {{ autodeploy_projects | join(', ') }} — в {{ infra_dir }}/secrets.yml нужны
-      ghcr_user и ghcr_token (токен GitHub classic с правом read:packages)
-    quiet: true
+- name: Проверки реестров образов
+  ansible.builtin.import_tasks: registries.yml
 
 # Группа проектов без root, названная как чужой проект, — это один пользователь <имя>-run и один Docker
 # на двоих: проект оказался бы в группе, где его не ждут

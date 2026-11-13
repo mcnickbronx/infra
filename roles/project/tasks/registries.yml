@@ -1,0 +1,9 @@
+# Docker хранит вход у root; в Docker пользователей и групп эти credentials не копируются.
+- name: Вход root в реестры автовыкладки
+  community.docker.docker_login:
+    registry_url: "{{ item.host }}"
+    username: "{{ secrets[item.user_key] }}"
+    password: "{{ secrets[item.token_key] }}"
+  loop: "{{ container_registries }}"
+  no_log: true
+  when: autodeploy_projects | length > 0

@@ -1,0 +1,42 @@
+# Скопируйте в .gitlab-ci.yml приложения, а не движка infra.
+# Docker executor на отдельном CI runner: privileged=true для DinD, общий TLS-том
+# /certs/client между job и docker:dind; TLS включён. Runner не на боевом VDS.
+# Тесты приложения должны пройти до публикации (в существующем pipeline приложения).
+# Dockerfile приложения: COPY compose.yml /deploy/compose.yml
+# В compose.yml: image: ${DEPLOY_IMAGE}, сервис deploy с profiles: [deploy], healthcheck.
+# Например, заменив команды на команды своего приложения:
+# services:
+#   api:
+#     image: ${DEPLOY_IMAGE}
+#     healthcheck: {test: [CMD, /app/bin/healthcheck], interval: 10s, timeout: 5s, retries: 6}
+#   deploy:
+#     image: ${DEPLOY_IMAGE}
+#     profiles: [deploy]
+#     command: [/app/bin/migrate]
+# Публикует только main/dev и полный SHA; тегов версий vX.Y.Z этот рецепт не создаёт.
+# Требования GitLab: https://docs.gitlab.com/ci/docker/using_docker_build/#use-docker-in-docker
+stages: [build]
+
+build_image:
+  stage: build
+  image: docker:29-cli
+  services:
+    - name: docker:29-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: /certs/client
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"'
+  script:
+    - |
+      printf '%s' "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password-stdin
+      docker build --pull \
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --label "org.opencontainers.image.version=" \
+        --tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" .
+      docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+      docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+      docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
