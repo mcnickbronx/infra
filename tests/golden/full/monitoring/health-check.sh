@@ -39,6 +39,7 @@ SERVER_IP=192.0.2.1
 WATCH_SITES=(https://shop.other.test/ https://back.shop.other.test/api/health)
 
 PROBLEMS=""
+BACKUP_EVENT=""    # один итог для проверки и утренней сводки
 # problem "что" ["подробности"]: «что» без цифр — ключ проблемы для --notify
 problem() { PROBLEMS+="$1"$'\t'"${2:-}"$'\n'; }
 
@@ -443,24 +444,30 @@ check_autodeploy() {
   done
 }
 
-# Как в infra status: сначала предыдущий несжатый журнал, затем текущий.
+# Текущий журнал первым: при ротации его запись либо прочитаем из него, либо найдём в .1.
 last_backup_event() {
-  grep -hE '^[0-9-]+ [0-9:]+ [^ ]+ бэкап: ' "$EVENTS.1" "$EVENTS" 2>/dev/null | tail -1 || true
+  local pattern='^[0-9-]+ [0-9:]+ [^ ]+ бэкап: ' last
+  last=$(grep -E "$pattern" "$EVENTS" 2>/dev/null | tail -1) || true
+  if [ -n "$last" ]; then
+    printf '%s\n' "$last"
+  else
+    grep -E "$pattern" "$EVENTS.1" 2>/dev/null | tail -1 || true
+  fi
 }
 
 # Ночной бэкап — по журналу событий: последний итог не «готово» или старше 26 часов (таймер
 # не сработал). Записей ещё нет — не тревога
 check_backup() {
-  local last when
-  last=$(last_backup_event)
-  [ -n "$last" ] || return 0
-  when=$(cut -c1-16 <<<"$last")
-  case $last in
+  local when
+  BACKUP_EVENT=$(last_backup_event)
+  [ -n "$BACKUP_EVENT" ] || return 0
+  when=$(cut -c1-16 <<<"$BACKUP_EVENT")
+  case $BACKUP_EVENT in
     *"бэкап: готово"*)
       if [ $(( $(date +%s) - $(date -d "$when" +%s) )) -gt $((26 * 3600)) ]; then
         problem "Ночной бэкап не делался с $when" "sudo systemctl status backup.timer; sudo journalctl -u backup -n 30"
       fi ;;
-    *) problem "Ночной бэкап: ${last#* бэкап: }" "$when; sudo journalctl -u backup -n 50" ;;
+    *) problem "Ночной бэкап: ${BACKUP_EVENT#* бэкап: }" "$when; sudo journalctl -u backup -n 50" ;;
   esac
 }
 
@@ -640,8 +647,7 @@ summary() {
 Ошибки сайтов за сутки (5xx): $errors"
   bans=$(crowdsec_bans) && bans="
 Баны CrowdSec за сутки: $bans"
-  backup=$(last_backup_event \
-           | awk '{ t = $1 " " substr($2, 1, 5); $1 = $2 = $3 = ""; sub(/^ +/, ""); print $0 " (" t ")" }')
+  backup=$(awk 'NF { t = $1 " " substr($2, 1, 5); $1 = $2 = $3 = ""; sub(/^ +/, ""); print $0 " (" t ")" }' <<<"$BACKUP_EVENT")
   infra-notify "$head
 Диски: ${disks%, }
 Нагрузка: $load15 при $(nproc) CPU · свободно памяти $mem$errors$bans

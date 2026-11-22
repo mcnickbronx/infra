@@ -134,3 +134,59 @@ check_backup
         self.assertEqual(self.run_check("--notify", "2026-12-01 09:09"), "")
         self.assertIn(f"✅ full — прошло:\n• {STALE_PROBLEM}\n", self.run_check("--notify", "2026-12-01 09:10"))
         self.assertEqual(self.state.read_text(), "")
+
+    def during_check(self, hook):
+        self.script = self.script.replace("\ncheck_backup\n", r"""
+rotate_logs() {
+  mv "$STUB_ROOT/infra.log.1" "$STUB_ROOT/infra.log.2" &&
+    mv "$STUB_ROOT/infra.log" "$STUB_ROOT/infra.log.1" &&
+    : > "$STUB_ROOT/infra.log"
+}
+""" + hook + "\ncheck_backup\n", 1)
+
+    def test_rotation_during_read_keeps_fresh_success(self):
+        self.during_check(r"""
+tail() {
+  if [ "$*" != -1 ] || [ -e "$STUB_ROOT/infra.log.2" ]; then
+    command tail "$@"
+    return
+  fi
+  local first
+  IFS= read -r first || return 0
+  rotate_logs || return
+  { printf '%s\n' "$first"; cat; } | command tail "$@"
+}
+""")
+        # Настоящий grep на старом порядке заполнит канал совпадениями из .1.
+        # Пока потребитель переносит файлы, grep ещё не открыл текущий журнал.
+        previous = OLD_OK * (9 * 1024**2 // len(OLD_OK.encode()))
+        archived = self.dir / "infra.log.2"
+        for mode in ("--notify", "--summary"):
+            with self.subTest(mode=mode):
+                archived.unlink(missing_ok=True)
+                self.logs(previous=previous, current=NEW_OK)
+                out = self.run_check(mode)
+                self.assertEqual(archived.stat().st_size, len(previous.encode()))
+                self.assertEqual(self.previous.read_text(), NEW_OK)
+                self.assertEqual(self.current.read_text(), "")
+                if mode == "--notify":
+                    self.assertEqual(out, "")
+                    self.assertEqual(self.state.read_text(), "")
+                else:
+                    self.assertEqual(out.splitlines()[0], "✅ full: всё в порядке")
+                    self.assertTrue(out.endswith("\nБэкап: бэкап: готово (2026-12-01 03:20)\n"), out)
+
+    def test_summary_shows_the_event_used_by_check(self):
+        self.during_check(r"""
+site_errors() {
+  rotate_logs || return
+  printf '%s\n' '2026-12-01 07:55:00 система бэкап: с ошибками' > "$STUB_ROOT/infra.log"
+  return 1
+}
+""")
+        self.logs(previous=OLD_OK, current=NEW_OK)
+        out = self.run_check("--summary")
+        self.assertEqual(self.previous.read_text(), NEW_OK)
+        self.assertIn("бэкап: с ошибками", self.current.read_text())
+        self.assertEqual(out.splitlines()[0], "✅ full: всё в порядке")
+        self.assertTrue(out.endswith("\nБэкап: бэкап: готово (2026-12-01 03:20)\n"), out)
