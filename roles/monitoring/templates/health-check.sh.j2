@@ -443,11 +443,16 @@ check_autodeploy() {
   done
 }
 
+# Как в infra status: сначала предыдущий несжатый журнал, затем текущий.
+last_backup_event() {
+  grep -hE '^[0-9-]+ [0-9:]+ [^ ]+ бэкап: ' "$EVENTS.1" "$EVENTS" 2>/dev/null | tail -1 || true
+}
+
 # Ночной бэкап — по журналу событий: последний итог не «готово» или старше 26 часов (таймер
-# не сработал). Записей ещё нет (новый сервер, начало месяца после ротации) — не тревога
+# не сработал). Записей ещё нет — не тревога
 check_backup() {
   local last when
-  last=$(grep ' бэкап: ' "$EVENTS" 2>/dev/null | tail -1)
+  last=$(last_backup_event)
   [ -n "$last" ] || return 0
   when=$(cut -c1-16 <<<"$last")
   case $last in
@@ -635,7 +640,7 @@ summary() {
 Ошибки сайтов за сутки (5xx): $errors"
   bans=$(crowdsec_bans) && bans="
 Баны CrowdSec за сутки: $bans"
-  backup=$(grep ' бэкап: ' "$EVENTS" 2>/dev/null | tail -1 \
+  backup=$(last_backup_event \
            | awk '{ t = $1 " " substr($2, 1, 5); $1 = $2 = $3 = ""; sub(/^ +/, ""); print $0 " (" t ")" }')
   infra-notify "$head
 Диски: ${disks%, }
