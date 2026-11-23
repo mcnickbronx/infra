@@ -654,7 +654,7 @@ cmd_status() {
   fi
   line=$(last_event 'бэкап: ')
   if [ -n "$line" ]; then line=$(event_text "$line"); else line="ещё не было (ночью, около 03:00)"; fi
-  if filled "$CONF/server.yml" restic_s3_repository_base; then line+=", копия в S3"; else line+=", без копии в S3"; fi
+  if filled "$CONF/server.yml" restic_s3_repository_base; then line+=". S3 указан в server.yml"; else line+=". S3 не указан в server.yml"; fi
   echo "Бэкап: $line"
   hourly=$(jq -r '[.[] | select(.hourly) | .name + (if .hourly == "db" then " — база" else " — база и файлы" end)
                     + ", каждые \(.every // 60) мин"] | join("; ")' /etc/restic/projects.json 2>/dev/null || true)
@@ -662,7 +662,7 @@ cmd_status() {
     if [ -s /var/lib/backup-hourly/failed ]; then line="ошибка $(cat /var/lib/backup-hourly/failed) — journalctl -u backup-hourly"
     elif [ -f /var/lib/backup-hourly/last-ok ]; then line="последний $(date -r /var/lib/backup-hourly/last-ok '+%F %H:%M')"
     else line="ещё не было"; fi
-    if filled "$CONF/server.yml" restic_s3_repository_base; then line+=", сразу в S3"; fi
+    if filled "$CONF/server.yml" restic_s3_repository_base; then line+=". S3 указан в server.yml"; fi
     echo "Частые снимки ($hourly): $line"
   fi
   if [ -f /var/lib/update-last-run ]; then
