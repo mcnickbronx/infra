@@ -95,7 +95,7 @@
   loop: [project-compose, project-db-env, project-docker-host]
 
 # Автовыкладка (autodeploy: true у проекта): каждые 15 секунд таймер проверяет реестр образов,
-# новый образ выкладывает project-deploy. Договорённость с проектом — TEAM.md, «Автовыкладка»
+# новый образ выкладывает project-deploy. Договорённость с проектом — docs/team-reference.md, «Автовыкладка»
 - name: Автовыкладка — скрипт и юниты systemd
   ansible.builtin.copy:
     src: "{{ item.src }}"

@@ -203,8 +203,8 @@ Postgres — короткий разрыв подключений; `daemon.json`
    базу и пароль `db_password_blog` в `secrets.yml`.
 3. Войти личным логином `anna` и загрузить код, `compose.yml` и исходный `.env` в
    `/srv/projects/blog/web`, пока **не запуская контейнеры**. Способы загрузки —
-   [TEAM.md, «Как залить код»](TEAM.md#как-залить-код), шаблоны —
-   [«compose.yml»](TEAM.md#composeyml) и [«Статический сайт»](TEAM.md#статический-сайт).
+   [«Как залить код»](docs/team-reference.md#как-залить-код), шаблоны —
+   [«compose.yml»](docs/team-reference.md#composeyml) и [«Статический сайт»](docs/team-reference.md#статический-сайт).
    `.env` — обычный файл рядом с `compose.yml`, в git его не добавляйте.
    `admin` в папку проекта не войдёт: она открыта только группе `blog-dev`.
    Файлами владеет загрузивший их человек, новые файлы получают группу `blog-dev`.
@@ -223,7 +223,7 @@ Postgres — короткий разрыв подключений; `daemon.json`
    **Его `compose.yml` и `.env` вы исполняете от root — нужен человек, которому доверяете сервер.**
    Docker давайте только доверенным, отдельно через `docker_users:` («Новый человек»): это root
    на всём сервере. Такой участник может запустить `docker compose up -d` из настоящей папки
-   `/srv/projects/blog/web` ([TEAM.md](TEAM.md#как-запустить-docker-compose)).
+   `/srv/projects/blog/web` ([команды Compose](docs/team-reference.md#как-запустить-project-compose)).
 
 ### Новый человек
 
@@ -248,12 +248,16 @@ Postgres — короткий разрыв подключений; `daemon.json`
 4. Сохранить и применить — целиком, без `--tags`: IP человека не только в файрволе, но и в белом
    списке CrowdSec.
 
-Человеку отдать: как заходить (`TEAM.md`) и, если нужно, доступ к базе его проекта
-(адрес, имя, пароль из `secrets.yml`). Новая группа (`docker`) действует со следующего входа.
+Человеку отправьте личную памятку с логином, адресом и отпечатком SSH-ключа сервера,
+именами и путями проектов. За основу можно взять [TEAM.md](TEAM.md).
+Если нужна секретная ссылка доступа, передайте её лично. Если у проекта есть база,
+укажите её имя, роль и способ получить пароль (`DB_PASSWORD` в проектном `.env`,
+если он доступен участнику). Новая группа (`docker`) действует со следующего входа.
 
 ### Автовыкладка проекта
 
-Push в ветку → CI собирает образ в Container Registry → сервер сам его выкладывает (TEAM.md, «Автовыкладка»).
+Push в ветку → CI собирает образ в Container Registry → сервер сам его выкладывает.
+[Требования к проекту](docs/team-reference.md#автовыкладка).
 
 1. Один раз на сервере: токен GitHub (classic) только с правом `read:packages` — в
    `/etc/infra/secrets.yml` (`sudo infra edit secrets`):
@@ -406,7 +410,7 @@ health-check-summary`. Telegram с сервера закрыт или то от�
 | Обновить сервер (Docker, Postgres, Traefik, ядро) — раз в неделю | `sudo infra update`, сначала на тестовом («Обновления») |
 | Проекту мало памяти / CPU | `memory: 4g` / `cpus: 2` в блоке проекта → `sudo infra apply --tags project` |
 | Своя строка в `pg_hba`, своя настройка Postgres, свой роутер Traefik | «Что можно менять руками» выше |
-| Проекту нужно PostGIS или pgvector | `sudo apt-get install -y postgresql-17-postgis-3` (pgvector — `postgresql-17-pgvector`, расширение `vector`), затем `sudo -u postgres psql -d <проект> -c 'CREATE EXTENSION postgis'` — и в `<проект>_dev`, если он есть. Пакет запишите комментарием в `server.yml`: на новом сервере и при смене версии Postgres его ставят заново, иначе восстановление базы проекта остановится на расширении. Доверенные расширения (`pg_trgm`, `unaccent`…) проект ставит сам миграцией (TEAM.md, «Расширения Postgres») |
+| Проекту нужно PostGIS или pgvector | `sudo apt-get install -y postgresql-17-postgis-3` (pgvector — `postgresql-17-pgvector`, расширение `vector`), затем `sudo -u postgres psql -d <проект> -c 'CREATE EXTENSION postgis'` — и в `<проект>_dev`, если он есть. Пакет запишите комментарием в `server.yml`: на новом сервере и при смене версии Postgres его ставят заново, иначе восстановление базы проекта остановится на расширении. Доверенные расширения (`pg_trgm`, `unaccent`…) проект ставит сам [миграцией](docs/team-reference.md#база-данных). |
 | Сайт переводят на CDN | сначала доработать лимиты Traefik (комментарий в `roles/traefik/templates/middlewares.yml.j2`) и проверить на тестовой VDS: иначе все посетители сайта придут с адресов CDN и упрутся в лимит одного IP |
 | Сменился ваш IP | `admin_ips` в `server.yml` → `sudo infra apply` (со старого IP, пока пускает; иначе — консоль хостера, ниже). Полный: IP администратора — ещё в белом списке CrowdSec и в `admin-only` Traefik |
 | Хостер не пропускает публичные DNS (apt, pip, выкладка — `Temporary failure in name resolution`; health-check — «DNS сервера не отвечает») | `dns_servers` в `server.yml` — адреса DNS, которые хостер пропускает (`server.yml.example`) → `sudo infra apply --tags base`: движок кладёт `/etc/systemd/resolved.conf.d/60-infra-dns.conf` до установки пакетов и перезапускает `systemd-resolved`; проверить — `resolvectl dns` (в строке `Global` — ваши адреса). Контейнеры видят новые DNS после пересоздания: `sudo project-compose <проект> up -d --force-recreate`. Новый сервер: `install.sh` (pip) идёт раньше `apply` — сначала свой файл в `/etc/systemd/resolved.conf.d/` (`[Resolve]` и строка `DNS=<адреса через пробел>`) и `sudo systemctl restart systemd-resolved`, после `apply` с ключом — убрать его. Убрали ключ → `apply` — файла нет, DNS снова от хостера. Откат движка на версию без `dns_servers` (v1.10.0 и старше) — сначала убрать ключ из `server.yml`, иначе проверка в начале `apply` остановит на «неизвестные ключи» |
@@ -714,7 +718,7 @@ pg_restore -l shop.pgdump | grep EXTENSION
 sudo -u postgres pg_restore --no-owner --no-acl --role=shop -d shop < shop.pgdump
 sudo -u postgres psql -d shop -c '\dt'          # Owner — shop, не postgres
 # 5. Участник проекта своим входом (root в web/ не пишет), со своего компьютера, контейнеры не запуская:
-#    код, compose.yml (шаблон в TEAM.md) и .env — в web/, как в «Новый проект»; затем загрузки
+#    код, compose.yml (шаблон в docs/team-reference.md) и .env — в web/, как в «Новый проект»; затем загрузки
 rsync -rlt ~/shop/media <логин>@vds-new:/srv/projects/shop/web/
 ssh <логин>@vds-new 'find /srv/projects/shop/web/media -type d -exec chmod 02770 {} +'
 # 6. На новом: доступ к базе — в .env проекта (без .env из шага 5 команда откажет), затем запуск
@@ -805,7 +809,7 @@ root на сервере).
 | бэкап на сервере (уровень 1) `/var/backups/restic` | всё из баз и папок проектов; последний дамп базы — ещё и файлом в `/var/backups/db/<проект>/` (до следующего снимка) | удалённое на сайте — до ~6 месяцев (6 месячных снимков) | root | — |
 | S3 (уровень 3) | то же, зашифровано паролем restic | удалённое на сайте — до ~9 месяцев при правилах бакета из START.md: раз в 14 дней копия начинается в новой папке со всеми снимками сервера, файл бакет убирает через 45 + 31 день; первые 30 дней не удалить (Object Lock) | вы (панель хостера); root сервера — ключи S3 и пароль restic в `secrets.yml` | — |
 | у вас (уровень 2, `tools/fetch-backups.sh`) | то же, зашифровано паролем restic | бессрочно, пока не почистите; чистка из шапки скрипта (`forget --prune --keep-monthly 12`) оставляет до года | вы | — |
-| дамп базы к себе («Восстановление и перенос», TEAM.md) | вся база проекта | сколько хранит тот, кто выгрузил | он | — |
+| [Дамп базы к себе](docs/team-reference.md#база-данных) | вся база проекта | сколько хранит тот, кто выгрузил | он | — |
 
 - **Удалили человека на сайте** — в копиях он останется: до ~6 месяцев на сервере, до ~9 в S3,
   у вас — пока не почистите. Это срок для строки политики о резервных копиях; подходит ли он

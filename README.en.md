@@ -28,8 +28,8 @@ and YAML instead of buttons.
 - **Security:** only 80/443 open, container ports bound to 127.0.0.1 by default, userns-remap,
   CrowdSec bans in the firewall (never your IPs, your members' or the server's own address), nightly
   Ubuntu security updates.
-  Experimental: `rootless: true` per project — its own Linux user and rootless Docker, so a project's
-  `compose.yml` can't give anyone root on the server (~100 MB of RAM per project).
+  Experimental: `rootless: true` gives a project its own Linux user and rootless Docker.
+  Projects with the same named group, such as `rootless: back`, share a Linux user and Docker daemon.
 - **Backups (restic):** nightly per-project snapshots (files, volumes, DB dump) plus `/etc`; frequent
   snapshots every 1–60 minutes straight to S3; three levels — server, your computer, S3 with Object Lock.
 - **Deploys:** push → CI builds an image in GHCR or GitLab Container Registry → the server picks it up within 15 seconds, runs
@@ -84,8 +84,8 @@ above its output; you can type the same by hand.
 
 ## Limitations
 
-- Ubuntu 26.04 LTS. 24.04 works too (our test server runs it) but is not recommended: production
-  servers and release checks are on 26.04. For 24.04 add `ubuntu_version: "24.04"` to `server.yml`.
+- Ubuntu 26.04 LTS is the default for production and test servers. For 24.04 add
+  `ubuntu_version: "24.04"` to `server.yml`.
 - A fixed stack: Docker Compose, Traefik, shared Postgres (PGDG), restic, CrowdSec; autodeploy pulls from GHCR, GitLab.com or a self-hosted Container Registry.
 - One team per server: `docker_users` are effectively root, and so is any project member once you start
   their project (`project-compose` runs the `compose.yml` they wrote as root). Different teams — different servers.

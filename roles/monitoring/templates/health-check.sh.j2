@@ -234,7 +234,7 @@ check_compose_projects() {
 
 # Папка проекта web/ целиком смонтирована в контейнер на запись: взломанное приложение подменит
 # compose.yml и .env, а их запускает root (project-compose, автовыкладка). Монтировать на запись —
-# подпапки (media, private), саму web/ — только на чтение (TEAM.md, «Кто запускает контейнеры»)
+# подпапки (media, private), саму web/ — только на чтение (docs/team-reference.md, «Правила для compose»)
 check_web_mounts() {
   local rw
   rw=$(docker ps -q 2>/dev/null | xargs -r docker inspect --format \

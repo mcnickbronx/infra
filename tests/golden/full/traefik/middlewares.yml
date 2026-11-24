@@ -55,7 +55,7 @@ http:
             ipv6Subnet: 64
 
     # Ограничение частоты запросов к форме входа любого проекта:
-    # отдельный router на Path(`/login`) с middlewares=login-ratelimit@file (пример — в TEAM.md)
+    # отдельный router на Path(`/login`) с middlewares=login-ratelimit@file (пример — в docs/team-reference.md, «Домен и SSL»)
     login-ratelimit:
       rateLimit:
         average: 10

@@ -55,7 +55,7 @@ projects:
     net: 11                       # номер сети 1..254, уникален на сервере, потом НЕ менять
                                   #   (сеть proj-shop, 172.20.11.0/24; адрес базы — 172.20.11.1)
     devs: [ivan, olga, anna]      # участники: SSH/SFTP, файлы проекта
-    # домены сайта — labels Traefik в compose проекта (TEAM.md), не здесь
+    # домены сайта — labels Traefik в compose проекта (docs/team-reference.md, «Домен и SSL»), не здесь
 
     # база
     db: postgres                  # база и пользователь «shop»; без строки — без базы
