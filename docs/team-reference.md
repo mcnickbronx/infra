@@ -89,6 +89,7 @@ jobs:
           # revision — коммит в сообщение о выкладке; version — пусто или версия (ниже): без строки образ унаследует
           # версию базового (у caddy:2-alpine — v2.11.7), и она попадёт в сообщение
           labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=
 ```
@@ -97,6 +98,11 @@ jobs:
 вывод `git describe --tags` (checkout с `fetch-depth: 0`): `v3.0.0` или `v2.4.0-64-g1a2b3c4`, иное не показывается.
 Образец — `.github/workflows/back.yml` web-start. Ярлыка нет — версией считается тег образа, если он вида `v3.0.0`
 (`DEPLOY_IMAGE=…:v3.0.0`, `to v3.0.0`).
+
+Бот делает короткий хеш ссылкой на коммит, если `org.opencontainers.image.source` содержит
+HTTPS-адрес репозитория на GitHub.com, а `org.opencontainers.image.revision` — полный хеш.
+Чтобы бот показал заголовок коммита второй строкой, добавьте метку `infra.commit.subject`.
+Для сборки через `docker build` подойдёт аргумент `--label "infra.commit.subject=$(git log -1 --format=%s)"`.
 
 Доступ на push позволяет запускать Compose из образа с правами проекта. Для общего Docker
 это права root на сервере. Для rootless-проекта это права его служебного пользователя,

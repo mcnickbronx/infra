@@ -8,6 +8,7 @@
 #                                             закрыт (http://, https://, socks5://, socks5h://)
 # Не заданы — уведомлений нет (код 0): всё и так в журналах сервера.
 #   infra-notify "текст"       — отправить
+#   infra-notify "текст" --link URL "префикс" "метка" — сделать ссылкой метку после префикса
 #   infra-notify --find-chat   — id чатов, куда недавно писали боту (сначала напишите в чате)
 # Код 1 — не отправилось (нет связи с Telegram): вызывающий повторит позже.
 # INFRA_NOTIFY_DRY=<файл> — не отправлять, а дописать в файл (для проверок в tests/); не
@@ -51,8 +52,17 @@ if [ -n "${INFRA_NOTIFY_DRY:-}" ]; then
   exit
 fi
 [ -n "$TOKEN" ] && [ -n "$CHAT" ] || exit 0    # Telegram не настроен — ни одного запроса
+options=(-o /dev/null)
+# Первый аргумент остаётся полным текстом для серверов, где обновили только project-deploy.
+# Telegram считает позиции ссылок в UTF-16. Остальной текст не требует разметки.
+if [[ ${2:-} == --link && -n ${3:-} && -n ${5:-} && $text == "${4:-}$5"* ]] &&
+    entities=$(jq -cn --arg url "$3" --arg prefix "${4:-}" --arg label "$5" '
+      def utf16_length: explode | map(if . > 65535 then 2 else 1 end) | add // 0;
+      [{type:"text_link", url:$url, offset:($prefix | utf16_length), length:($label | utf16_length)}]'); then
+  options+=(--data-urlencode "entities=$entities" --data-urlencode 'link_preview_options={"is_disabled":true}')
+fi
 rc=0
 for chat in ${CHAT//,/ }; do
-  telegram sendMessage -o /dev/null --data-urlencode "chat_id=$chat" --data-urlencode "text=$text" || rc=1
+  telegram sendMessage "${options[@]}" --data-urlencode "chat_id=$chat" --data-urlencode "text=$text" || rc=1
 done
 exit "$rc"

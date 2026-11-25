@@ -92,12 +92,27 @@ read_image() {
 # Версия для журнала событий: образ и начало дайджеста (repo@sha256:0123456789ab)
 short() { sed -E 's/(sha256:[0-9a-f]{12})[0-9a-f]*/\1/' <<<"${1:-—}"; }
 
+image_label() {
+  docker image inspect -f "{{with index .Config.Labels \"$2\"}}{{.}}{{end}}" "$1" 2>/dev/null
+}
+
 # Коммит, из которого собран образ $1, — ярлык org.opencontainers.image.revision (его ставит CI web-start):
 # его, в отличие от дайджеста, можно дать to <тег>. Нет ярлыка или не похож на хеш — пусто
 revision() {
   local rev
-  rev=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$1" 2>/dev/null) || rev=
+  rev=$(image_label "$1" org.opencontainers.image.revision) || rev=
   [[ $rev =~ ^[0-9a-f]{7,64}$ ]] && echo "$rev" || true
+}
+
+commit_url() {
+  local source
+  [[ $2 =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || return 0
+  source=$(image_label "$1" org.opencontainers.image.source) || return 0
+  source=${source%/}
+  source=${source%.git}
+  if [[ $source =~ ^https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ && $source != */. && $source != */.. ]]; then
+    printf '%s/commit/%s\n' "$source" "$2"
+  fi
 }
 
 # Версия, из которой собран образ $1, — ярлык org.opencontainers.image.version (его ставит CI web-start, git describe
@@ -106,7 +121,7 @@ revision() {
 # в уведомление и журнал событий попал бы любой его текст. Не по образцу — пусто
 release() {
   local ver re='^v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(-[0-9]{1,9}-g[0-9a-f]{7,40})?$'
-  ver=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$1" 2>/dev/null) || ver=
+  ver=$(image_label "$1" org.opencontainers.image.version) || ver=
   if ! [[ $ver =~ $re ]]; then
     ver=${2##*/} ver=${ver%%@*}                           # тег — после последнего / и до @дайджеста
     [[ $ver == *:* ]] && ver=${ver##*:} || ver=
@@ -277,21 +292,24 @@ roll_out() {
   rev=$(revision "$NEW")
   ver=$(release "$NEW" "${TO:-$IMAGE}")                 # TO — образ у to, у таймера его нет
   infra-log "выкладка $NAME: готово, $(short "$NEW")${ver:+, версия $ver}${rev:+, коммит $rev}"
-  # Выложена новая версия (таймер или ручной project-deploy <проект>) — строка в Telegram: push дошёл до сайта
-  # (to и откат человек видит в выводе). Что выложено: «v3.0.0, коммит 5d77a89»; между выпусками — «v2.4.0 +64,
-  # коммит fe590f6»; версии нет — «новая версия, коммит 1a2b3c4». Коммит — и рядом с версией: ярлык version образ
-  # наследует от базового (у caddy:2-alpine — v2.11.7), если проект не ставит свой, — коммит ложная версия не спрячет.
-  # Нет ярлыка revision — коммит из хеша в версии
+  # Таймер и ручной project-deploy <проект> сообщают об успехе в Telegram, to и откат — в выводе.
+  [ "$ACTION" = deploy ] || return 0
+  # Версия может прийти из базового образа. Коммит виден и рядом с ней. Без revision — хеш из версии.
   if [[ $ver =~ ^(v[0-9.]+)-([0-9]+)-g([0-9a-f]+)$ ]]; then
     what="${BASH_REMATCH[1]} +${BASH_REMATCH[2]}" rev=${rev:-${BASH_REMATCH[3]}}
   else
     what=${ver:-новая версия}
   fi
-  what+=${rev:+, коммит ${rev:0:7}}
+  local prefix hash subject url
+  prefix="🚀 $(server_name): $NAME — выложена $what${rev:+, коммит }"
+  hash=${rev:0:7}
+  subject=$(image_label "$NEW" infra.commit.subject | jq -Rrs '(split("\n")[0] // "") | gsub("[[:cntrl:]]"; "") | .[:240]') || subject=
+  url=$(commit_url "$NEW" "$rev")
+  local args=("$prefix$hash${subject:+$'\n'$subject}")
+  [ -z "$url" ] || args+=(--link "$url" "$prefix" "$hash")
   # timeout 15: при закрытом Telegram infra-notify ждёт минуту и дольше, а замок проекта ещё наш — rollback и to ждут
   # его 30 с (ниже); 9>&- — отправке замок не нужен. Не ушло — не повторяем: выкладка — в журнале событий
-  [ "$ACTION" != deploy ] ||
-    timeout 15 infra-notify "🚀 $(server_name): $NAME — выложена $what" >/dev/null 2>&1 9>&- || true
+  timeout 15 infra-notify "${args[@]}" >/dev/null 2>&1 9>&- || true
 }
 
 # Шаг $1 не удался: эту версию больше не пробовать, вернуть прежние образ и compose.yml.

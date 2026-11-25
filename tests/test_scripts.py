@@ -1748,6 +1748,8 @@ echo "docker $*" >> "$STUB_LOG"
 ref=${!#}
 [[ "$*" != *image.revision* ]] || { echo "${STUB_REV:-}"; exit 0; }
 [[ "$*" != *image.version* ]] || { echo "${STUB_VER:-}"; exit 0; }
+[[ "$*" != *image.source* ]] || { echo "${STUB_SOURCE:-}"; exit 0; }
+[[ "$*" != *infra.commit.subject* ]] || { echo "${STUB_SUBJECT:-}"; exit 0; }
 digest=$(printf '%s\\n' $STUB_TAGS | awk -F= -v r="$ref" '$1 == r { print $2 }')
 case $1 in
   pull) [ "$ref" != "${STUB_TAG_AFTER%=*}" ] || [ "$(grep -cxF "docker $*" "$STUB_LOG")" -ge "${STUB_TAG_AFTER##*=}" ] || digest=
@@ -1959,6 +1961,39 @@ esac
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(self.notes(lines), [f"{self.NOTE}, коммит bb168cf"])
         self.assertIn(f"infra-log выкладка shop: готово, {self.REPO}@sha256:{'2' * 12}, коммит {self.HASH}", lines)
+
+    def test_timer_sends_commit_subject_and_github_link(self):
+        secrets = self.dir / "secrets.yml"
+        secrets.write_text('telegram_bot_token: "test-token"\ntelegram_chat_id: "123"\n')
+        notify = (ROOT / "roles/monitoring/files/infra-notify").read_text()
+        (self.bin / "infra-notify").write_text(notify.replace("SECRETS=/etc/infra/secrets.yml", f'SECRETS="{secrets}"'))
+        curl = self.bin / "curl"
+        curl.write_text('#!/usr/bin/env python3\nimport json, os, sys\nsys.stdin.read()\n'
+                        'with open(os.environ["STUB_LOG"], "a") as log:\n'
+                        '    print("curl " + json.dumps(sys.argv[1:]), file=log)\n')
+        curl.chmod(0o755)
+        prefix = self.NOTE.removeprefix("infra-notify ") + ", коммит "
+        subject = 'Память <товар> & "счётчик" 📦'
+        for source, expected_url, digest in (
+            ("https://github.com/example/shop.git/", f"https://github.com/example/shop/commit/{self.HASH}", self.NEW),
+            ("https://github.com@example.org/example/shop", None, f"sha256:{'3' * 64}"),
+        ):
+            with self.subTest(source=source):
+                self.log.unlink(missing_ok=True)
+                run, lines = self.timer(digest=digest, STUB_REV=self.HASH, STUB_SOURCE=source,
+                                        STUB_SUBJECT=subject + "\r\nПродолжение")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                args, = (json.loads(line.removeprefix("curl ")) for line in lines if line.startswith("curl "))
+                self.assertIn("chat_id=123", args)
+                self.assertIn(f"text={prefix}bb168cf\n{subject}", args)
+                self.assertFalse(any(arg.startswith("parse_mode=") for arg in args))
+                entities = [json.loads(arg.removeprefix("entities=")) for arg in args if arg.startswith("entities=")]
+                if expected_url:
+                    self.assertEqual(entities, [[{"type": "text_link", "url": expected_url,
+                                                 "offset": len(prefix.encode("utf-16-le")) // 2, "length": 7}]])
+                    self.assertIn('link_preview_options={"is_disabled":true}', args)
+                else:
+                    self.assertEqual(entities, [])
 
     def test_timer_notifies_without_label(self):
         # образ без ярлыка (у front.yml web-start его нет) — сообщение и журнал без коммита
