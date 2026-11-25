@@ -626,9 +626,15 @@ changes() {
 }
 
 # ---------- Состояние сервера ----------
-# Последнее событие из журнала (этого и прошлого месяца): last_event 'бэкап: '
+# Текущий журнал первым: при ротации запись либо прочитаем из него, либо найдём в .1.
 last_event() {
-  cat /var/log/infra.log.1 /var/log/infra.log 2>/dev/null | grep -E "^[0-9-]+ [0-9:]+ [^ ]+ $1" | tail -1 || true
+  local pattern="^[0-9-]+ [0-9:]+ [^ ]+ $1" last
+  last=$(grep -E "$pattern" /var/log/infra.log 2>/dev/null | tail -1) || true
+  if [ -n "$last" ]; then
+    printf '%s\n' "$last"
+  else
+    grep -E "$pattern" /var/log/infra.log.1 2>/dev/null | tail -1 || true
+  fi
 }
 # Строка журнала для людей: «2026-10-07 14:02 — готово, изменений 0 (nick@203.0.113.10)»
 event_text() {
@@ -665,10 +671,16 @@ cmd_status() {
     if filled "$CONF/server.yml" restic_s3_repository_base; then line+=". S3 указан в server.yml"; fi
     echo "Частые снимки ($hourly): $line"
   fi
-  if [ -f /var/lib/update-last-run ]; then
-    echo "Обновления: $(date -r /var/lib/update-last-run +%F) (sudo infra update — раз в неделю)"
+  line=$(last_event 'update: (готово|ошибка)')
+  if [ -n "$line" ]; then
+    echo "Последний завершённый update: $(event_text "$line")"
   else
-    echo "Обновления: ещё не ставились — sudo infra update"
+    echo "Последний завершённый update: записи нет в infra.log и infra.log.1"
+  fi
+  if [ -f /var/lib/update-last-run ]; then
+    echo "Отметка напоминания: $(date -r /var/lib/update-last-run +%F) (sudo infra update — раз в неделю)"
+  else
+    echo "Отметка напоминания: отсутствует"
   fi
   if filled "$CONF/secrets.yml" telegram_bot_token && filled "$CONF/secrets.yml" telegram_chat_id; then
     echo "Уведомления: Telegram"
